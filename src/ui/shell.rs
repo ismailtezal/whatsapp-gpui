@@ -1,22 +1,25 @@
-//! The window: title bar, rail, conversation column and the floating main panel.
+//! The window: title bar, rail, the column for the current section, and the floating
+//! main panel.
 
 use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, SharedString, Task, Window, WindowControlArea,
-    div, px,
+    AnyElement, App, Context, Entity, FontWeight, Image, ImageFormat, MouseButton, MouseDownEvent,
+    Pixels, Point, SharedString, SystemNotification, Task, Window, WindowControlArea, anchored,
+    deferred, div, point, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 
 use super::chat::ChatView;
-use super::theme::{COLUMN_W, HEADER_H, R_LG, R_XL, RAIL_W, TITLE_BAR_H, Tokens, tokens};
-use super::widgets::{avatar, count_badge, icon, icon_button, list_time, tip};
+use super::theme::{COLUMN_W, HEADER_H, R_LG, R_MD, R_XL, RAIL_W, TITLE_BAR_H, Tokens, tokens};
+use super::widgets::{avatar, count_badge, duration, icon, icon_button, list_time, tip};
 use crate::backend::Backend;
 use crate::content::preview_label;
-use crate::events::{ConnState, UiEvent};
-use crate::model::{Ack, ChatKind, ChatRow};
+use crate::events::{Command, ConnState, UiEvent};
+use crate::model::{Ack, ChatKind, ChatRow, ContactRow, MsgKind, MsgRow, display_number};
 use crate::store::Store;
+use crate::store_more::CallRow;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Section {
@@ -31,6 +34,36 @@ pub enum Section {
     Settings,
 }
 
+impl Section {
+    fn lists_chats(self) -> bool {
+        matches!(
+            self,
+            Section::Chats | Section::Unread | Section::Groups | Section::Archived | Section::Channels
+        )
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Section::Chats => "Chats",
+            Section::Unread => "Unread",
+            Section::Groups => "Groups",
+            Section::Archived => "Archived",
+            Section::Calls => "Calls",
+            Section::Status => "Status",
+            Section::Channels => "Channels",
+            Section::Starred => "Starred messages",
+            Section::Settings => "Settings",
+        }
+    }
+}
+
+/// A person's status updates, oldest first.
+struct StatusGroup {
+    sender: String,
+    name: String,
+    items: Vec<MsgRow>,
+}
+
 pub struct Shell {
     backend: Backend,
     store: Arc<Store>,
@@ -39,25 +72,48 @@ pub struct Shell {
     me_jid: Option<String>,
     section: Section,
     chats: Vec<ChatRow>,
-    archived_count: usize,
     selected: Option<String>,
     chat: Option<Entity<ChatView>>,
     search: Entity<InputState>,
     query: String,
+    hits: Vec<MsgRow>,
+    /// Choosing a contact to start a chat with.
+    picking: bool,
+    contacts: Vec<ContactRow>,
+    calls: Vec<CallRow>,
+    starred: Vec<MsgRow>,
+    statuses: Vec<StatusGroup>,
+    /// Open status: (person index, item index).
+    status_open: Option<(usize, usize)>,
+    chat_menu: Option<(String, Point<Pixels>)>,
     qr: Option<String>,
     last_error: Option<String>,
+    confirm_logout: bool,
+    window_active: bool,
     _pump: Task<()>,
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl Shell {
     pub fn new(backend: Backend, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = backend.store().clone();
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search or start a new chat"));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         cx.subscribe_in(&search, window, |this, state, event: &InputEvent, _window, cx| {
             if matches!(event, InputEvent::Change) {
                 this.query = state.read(cx).value().to_string();
+                this.run_search();
                 cx.notify();
             }
+        })
+        .detach();
+        cx.observe_window_activation(window, |this, window, _cx| {
+            this.window_active = window.is_window_active();
         })
         .detach();
 
@@ -79,39 +135,118 @@ impl Shell {
             me_jid: None,
             section: Section::Chats,
             chats: Vec::new(),
-            archived_count: 0,
             selected: None,
             chat: None,
             search,
             query: String::new(),
+            hits: Vec::new(),
+            picking: false,
+            contacts: Vec::new(),
+            calls: Vec::new(),
+            starred: Vec::new(),
+            statuses: Vec::new(),
+            status_open: None,
+            chat_menu: None,
             qr: None,
             last_error: None,
+            confirm_logout: false,
+            window_active: true,
             _pump: pump,
         };
-        shell.reload_chats();
+        shell.reload();
         // Development aid: open a chat by (part of) its title straight away.
         if let Ok(wanted) = std::env::var("WA_OPEN_CHAT") {
             let wanted = wanted.to_lowercase();
             let found = shell
                 .chats
                 .iter()
-                .find(|c| c.title.to_lowercase().contains(&wanted))
+                .find(|c| !wanted.is_empty() && c.title.to_lowercase().contains(&wanted))
                 .map(|c| c.jid.clone());
             if let Some(jid) = found {
                 shell.open_chat(&jid, window, cx);
             }
         }
+        // Development aid: start on a given section.
+        if let Ok(section) = std::env::var("WA_SECTION") {
+            shell.section = match section.as_str() {
+                "calls" => Section::Calls,
+                "status" => Section::Status,
+                "starred" => Section::Starred,
+                "settings" => Section::Settings,
+                "archived" => Section::Archived,
+                _ => Section::Chats,
+            };
+            shell.reload();
+        }
         shell
     }
 
-    fn reload_chats(&mut self) {
-        let archived = self.section == Section::Archived;
-        self.chats = self.store.chats(archived).unwrap_or_default();
-        self.archived_count = if archived {
-            self.chats.len()
+    /// Re-reads what the current section shows.
+    fn reload(&mut self) {
+        self.chats = self
+            .store
+            .chats(self.section == Section::Archived)
+            .unwrap_or_default();
+        match self.section {
+            Section::Calls => self.calls = self.store.calls(300).unwrap_or_default(),
+            Section::Starred => self.starred = self.store.starred(300).unwrap_or_default(),
+            Section::Status => self.reload_statuses(),
+            _ => {}
+        }
+        if self.picking {
+            self.contacts = self.store.contacts().unwrap_or_default();
+        }
+    }
+
+    fn reload_statuses(&mut self) {
+        // Statuses live for 24 hours.
+        let rows = self.store.status_updates(now_secs() - 24 * 3600).unwrap_or_default();
+        let mut groups: Vec<StatusGroup> = Vec::new();
+        for row in rows {
+            let sender = if row.from_me {
+                "me".to_string()
+            } else {
+                row.sender.clone().unwrap_or_default()
+            };
+            match groups.iter_mut().find(|g| g.sender == sender) {
+                Some(group) => group.items.push(row),
+                None => {
+                    let name = if sender == "me" {
+                        "My status".to_string()
+                    } else {
+                        self.store
+                            .display_name(&sender)
+                            .unwrap_or_else(|_| display_number(&sender))
+                    };
+                    groups.push(StatusGroup {
+                        sender,
+                        name,
+                        items: vec![row],
+                    });
+                }
+            }
+        }
+        groups.sort_by_key(|g| std::cmp::Reverse(g.items.last().map(|r| r.ts).unwrap_or(0)));
+        self.statuses = groups;
+    }
+
+    fn run_search(&mut self) {
+        let query = self.query.trim();
+        self.hits = if query.chars().count() >= 2 && self.section.lists_chats() && !self.picking {
+            self.store.search_messages(query, None, 40).unwrap_or_default()
         } else {
-            self.store.chats(true).map(|c| c.len()).unwrap_or(0)
+            Vec::new()
         };
+    }
+
+    fn set_section(&mut self, section: Section, cx: &mut Context<Self>) {
+        self.section = section;
+        self.picking = false;
+        self.status_open = None;
+        self.confirm_logout = false;
+        self.reload();
+        self.run_search();
+        cx.notify();
     }
 
     fn on_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
@@ -129,12 +264,41 @@ impl Shell {
                     self.me_name = push_name;
                 }
             }
-            UiEvent::ChatsChanged | UiEvent::HistoryProgress { .. } => self.reload_chats(),
+            UiEvent::ChatsChanged | UiEvent::HistoryProgress { .. } => self.reload(),
             UiEvent::ChatChanged { chat } => {
                 if self.selected.as_deref() == Some(chat.as_str())
                     && let Some(view) = &self.chat
                 {
                     view.update(cx, |view, cx| view.reload(cx));
+                }
+                if chat == "status@broadcast" && self.section == Section::Status {
+                    self.reload_statuses();
+                }
+            }
+            UiEvent::Incoming {
+                chat,
+                sender,
+                preview,
+                ..
+            } => {
+                let open_and_focused = self.window_active && self.selected.as_deref() == Some(chat.as_str());
+                let row = self.chats.iter().find(|c| c.jid == chat);
+                let muted = row.is_some_and(|c| c.mute_until != 0);
+                if !open_and_focused && !muted && chat != "status@broadcast" {
+                    let title = row.map(|c| c.title.clone()).unwrap_or_else(|| display_number(&chat));
+                    let body = match (row.map(|c| c.kind), sender) {
+                        (Some(ChatKind::User), _) | (_, None) => preview,
+                        (_, Some(sender)) => format!(
+                            "{}: {preview}",
+                            self.store.display_name(&sender).unwrap_or_default()
+                        ),
+                    };
+                    cx.show_system_notification(SystemNotification {
+                        tag: SharedString::from(chat.clone()),
+                        title: title.into(),
+                        body: body.into(),
+                        actions: Vec::new(),
+                    });
                 }
             }
             UiEvent::Activity {
@@ -171,6 +335,9 @@ impl Shell {
                 {
                     view.update(cx, |view, cx| view.media_ready(&id, path, error, cx));
                 }
+                if chat == "status@broadcast" {
+                    self.reload_statuses();
+                }
             }
             UiEvent::Error(message) => self.last_error = Some(message),
             _ => {}
@@ -179,10 +346,17 @@ impl Shell {
     }
 
     fn open_chat(&mut self, jid: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.picking = false;
+        self.status_open = None;
+        if self.section == Section::Settings || self.section == Section::Status {
+            self.section = Section::Chats;
+        }
         if self.selected.as_deref() == Some(jid) {
+            cx.notify();
             return;
         }
-        let Some(chat) = self.chats.iter().find(|c| c.jid == jid).cloned() else {
+        let known = self.chats.iter().find(|c| c.jid == jid).cloned();
+        let Some(chat) = known.or_else(|| self.store.chat(jid).ok().flatten()) else {
             return;
         };
         self.selected = Some(jid.to_string());
@@ -192,8 +366,15 @@ impl Shell {
         let view = cx.new(|cx| ChatView::new(backend, chat, me_name, me_jid, window, cx));
         view.update(cx, |view, cx| view.focus_input(window, cx));
         self.chat = Some(view);
-        self.reload_chats();
+        self.reload();
         cx.notify();
+    }
+
+    fn start_chat_with(&mut self, jid: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.store.ensure_chat(jid);
+        self.section = Section::Chats;
+        self.reload();
+        self.open_chat(jid, window, cx);
     }
 
     fn visible_chats(&self) -> Vec<&ChatRow> {
@@ -204,6 +385,7 @@ impl Shell {
                 Section::Unread => chat.unread > 0 || chat.marked_unread,
                 Section::Groups => matches!(chat.kind, ChatKind::Group | ChatKind::Community),
                 Section::Channels => chat.kind == ChatKind::Newsletter,
+                Section::Chats => chat.kind != ChatKind::Newsletter,
                 _ => true,
             })
             .filter(|chat| query.is_empty() || chat.title.to_lowercase().contains(&query))
@@ -303,9 +485,16 @@ impl Shell {
 
     fn rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = tokens(cx).clone();
-        let unread_total: i64 = self.chats.iter().filter(|c| c.mute_until == 0).map(|c| c.unread).sum();
+        let unread_total: i64 = self
+            .chats
+            .iter()
+            .filter(|c| c.mute_until == 0 && self.section != Section::Archived)
+            .map(|c| c.unread)
+            .sum();
+        let chat_sections = [Section::Chats, Section::Unread, Section::Groups];
         let tile = |section: Section, name: &'static str, label: &'static str, cx: &mut Context<Self>| {
-            let selected = self.section == section;
+            let selected =
+                self.section == section || (section == Section::Chats && chat_sections.contains(&self.section));
             let t = t.clone();
             let hover_ring = t.fg(0.15);
             div()
@@ -326,11 +515,7 @@ impl Shell {
                 })
                 .child(icon(name).size(px(18.)))
                 .tooltip(tip(label))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.section = section;
-                    this.reload_chats();
-                    cx.notify();
-                }))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_section(section, cx)))
         };
         div()
             .w(RAIL_W)
@@ -376,21 +561,107 @@ impl Shell {
                         self.me_jid.as_deref().and_then(crate::avatars::get),
                         cx,
                     ))
-                    .tooltip(tip("Profile")),
+                    .tooltip(tip("Profile"))
+                    .on_click(cx.listener(|this, _, _, cx| this.set_section(Section::Settings, cx))),
             )
     }
 
-    // ---- conversation column -----------------------------------------------------------
+    // ---- column rows -------------------------------------------------------------------
+
+    /// The two-line row every list in the column uses.
+    #[allow(clippy::too_many_arguments)]
+    fn list_row(
+        &self,
+        id: SharedString,
+        seed: &str,
+        title: &str,
+        picture_jid: Option<&str>,
+        time: String,
+        detail: AnyElement,
+        trailing: Option<AnyElement>,
+        selected: bool,
+        bold: bool,
+        cx: &App,
+    ) -> gpui::Stateful<gpui::Div> {
+        let t = tokens(cx);
+        let hover = Tokens::with_alpha(t.sidebar_accent, 0.45);
+        div()
+            .id(id)
+            .h(px(60.))
+            .mx(px(8.))
+            .px(px(8.))
+            .rounded(R_LG)
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(12.))
+            .cursor_pointer()
+            .when(selected, |this| this.bg(t.fg(0.09)))
+            .when(!selected, |this| this.hover(move |style| style.bg(hover)))
+            .child(avatar(seed, title, 40., picture_jid.and_then(crate::avatars::get), cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(14.))
+                                    .font_weight(if bold || selected {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::MEDIUM
+                                    })
+                                    .text_color(t.sidebar_foreground)
+                                    .child(SharedString::from(title.to_string())),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.))
+                                    .text_color(if bold { t.primary } else { t.muted_foreground })
+                                    .child(time),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(12.))
+                                    .text_color(if bold {
+                                        Tokens::with_alpha(t.sidebar_foreground, 0.85)
+                                    } else {
+                                        t.muted_foreground
+                                    })
+                                    .child(detail),
+                            )
+                            .children(trailing),
+                    ),
+            )
+    }
 
     fn chat_row(&self, chat: &ChatRow, cx: &mut Context<Self>) -> AnyElement {
         let t = tokens(cx).clone();
         let selected = self.selected.as_deref() == Some(chat.jid.as_str());
         let unread = chat.unread > 0 || chat.marked_unread;
         let muted = chat.mute_until != 0;
-        let jid = chat.jid.clone();
-        let hover = Tokens::with_alpha(t.sidebar_accent, 0.45);
 
-        let preview: AnyElement = if let Some(draft) = chat.draft.as_deref().filter(|d| !d.is_empty()) {
+        let detail: AnyElement = if let Some(draft) = chat.draft.as_deref().filter(|d| !d.is_empty()) {
             div()
                 .flex()
                 .gap(px(4.))
@@ -399,12 +670,10 @@ impl Shell {
                 .into_any_element()
         } else if let Some(preview) = &chat.preview {
             let text = preview_label(preview.kind, preview.text.as_deref());
-            let prefix = if preview.from_me {
+            let prefix = if preview.from_me || chat.kind == ChatKind::User {
                 None
-            } else if chat.kind != ChatKind::User {
-                preview.sender_name.clone().map(|name| format!("{name}:"))
             } else {
-                None
+                preview.sender_name.clone().map(|name| format!("{name}:"))
             };
             let tick = preview.from_me.then(|| {
                 let (name, color) = match preview.ack {
@@ -429,99 +698,255 @@ impl Shell {
             div().into_any_element()
         };
 
-        div()
-            .id(SharedString::from(format!("chat-{}", chat.jid)))
-            .h(px(60.))
-            .mx(px(8.))
-            .px(px(8.))
-            .rounded(R_LG)
+        let mut trailing = div().flex().items_center().gap(px(6.));
+        if muted {
+            trailing = trailing.child(icon("bell-off").size(px(12.)).text_color(t.muted_foreground));
+        }
+        if chat.pinned > 0 {
+            trailing = trailing.child(icon("pin").size(px(12.)).text_color(t.muted_foreground));
+        }
+        if chat.unread > 0 {
+            trailing = trailing.child(count_badge(chat.unread, muted, cx));
+        } else if chat.marked_unread {
+            trailing = trailing.child(div().size(px(10.)).rounded_full().bg(t.primary));
+        }
+
+        let jid = chat.jid.clone();
+        let menu_jid = chat.jid.clone();
+        self.list_row(
+            SharedString::from(format!("chat-{}", chat.jid)),
+            &chat.jid,
+            &chat.title,
+            Some(&chat.jid),
+            list_time(chat.last_ts),
+            detail,
+            Some(trailing.into_any_element()),
+            selected,
+            unread && !muted,
+            cx,
+        )
+        .on_click(cx.listener(move |this, _, window, cx| this.open_chat(&jid, window, cx)))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.chat_menu = Some((menu_jid.clone(), event.position));
+                cx.notify();
+            }),
+        )
+        .into_any_element()
+    }
+
+    fn message_hit_row(&self, slot: usize, row: &MsgRow, cx: &mut Context<Self>) -> AnyElement {
+        let title = self
+            .store
+            .chat(&row.chat)
+            .ok()
+            .flatten()
+            .map(|c| c.title)
+            .unwrap_or_else(|| display_number(&row.chat));
+        let who = if row.from_me { "You: " } else { "" };
+        let detail = div()
+            .truncate()
+            .child(SharedString::from(format!(
+                "{who}{}",
+                preview_label(row.kind, row.text.as_deref())
+            )))
+            .into_any_element();
+        let jid = row.chat.clone();
+        self.list_row(
+            SharedString::from(format!("hit-{slot}")),
+            &row.chat,
+            &title,
+            Some(&row.chat),
+            list_time(row.ts),
+            detail,
+            None,
+            false,
+            false,
+            cx,
+        )
+        .on_click(cx.listener(move |this, _, window, cx| this.open_chat(&jid, window, cx)))
+        .into_any_element()
+    }
+
+    fn call_row(&self, slot: usize, call: &CallRow, cx: &mut Context<Self>) -> AnyElement {
+        let t = tokens(cx).clone();
+        let title = match self.store.chat(&call.peer).ok().flatten() {
+            Some(chat) => chat.title,
+            None => self
+                .store
+                .display_name(&call.peer)
+                .unwrap_or_else(|_| display_number(&call.peer)),
+        };
+        let (glyph, color, word) = if call.missed() {
+            ("phone-missed", t.destructive, "Missed")
+        } else if call.outgoing {
+            ("phone-outgoing", t.online, "Outgoing")
+        } else {
+            ("phone-incoming", t.online, "Incoming")
+        };
+        let mut text = word.to_string();
+        if call.duration > 0 {
+            text = format!("{text} · {}", duration(call.duration as u32));
+        }
+        let detail = div()
             .flex()
             .items_center()
-            .gap(px(12.))
-            .cursor_pointer()
-            .when(selected, |this| this.bg(t.fg(0.09)))
-            .when(!selected, |this| this.hover(move |style| style.bg(hover)))
-            .on_click(cx.listener(move |this, _, window, cx| this.open_chat(&jid, window, cx)))
-            .child(avatar(&chat.jid, &chat.title, 40., crate::avatars::get(&chat.jid), cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(14.))
-                                    .font_weight(if unread || selected {
-                                        FontWeight::SEMIBOLD
-                                    } else {
-                                        FontWeight::MEDIUM
-                                    })
-                                    .text_color(t.sidebar_foreground)
-                                    .child(SharedString::from(chat.title.clone())),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(px(11.))
-                                    .text_color(if unread && !muted { t.primary } else { t.muted_foreground })
-                                    .child(list_time(chat.last_ts)),
-                            ),
+            .gap(px(4.))
+            .child(icon(glyph).size(px(13.)).text_color(color))
+            .child(text)
+            .into_any_element();
+        let trailing = icon(if call.video { "video" } else { "phone" })
+            .size(px(14.))
+            .text_color(t.muted_foreground)
+            .into_any_element();
+        let jid = call.peer.clone();
+        self.list_row(
+            SharedString::from(format!("call-{slot}")),
+            &call.peer,
+            &title,
+            Some(&call.peer),
+            list_time(call.ts),
+            detail,
+            Some(trailing),
+            false,
+            false,
+            cx,
+        )
+        .on_click(cx.listener(move |this, _, window, cx| this.start_chat_with(&jid, window, cx)))
+        .into_any_element()
+    }
+
+    fn rows(&self, cx: &mut Context<Self>) -> (Vec<AnyElement>, &'static str) {
+        let t = tokens(cx).clone();
+        let label = |text: &'static str| {
+            div()
+                .px(px(16.))
+                .pt(px(10.))
+                .pb(px(4.))
+                .flex_shrink_0()
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(Tokens::with_alpha(t.sidebar_foreground, 0.6))
+                .child(text)
+                .into_any_element()
+        };
+        if self.picking {
+            let query = self.query.trim().to_lowercase();
+            let rows = self
+                .contacts
+                .iter()
+                .filter(|c| {
+                    query.is_empty()
+                        || c.name.as_deref().unwrap_or_default().to_lowercase().contains(&query)
+                        || c.jid.contains(&query)
+                })
+                .enumerate()
+                .map(|(slot, contact)| {
+                    let name = contact.name.clone().unwrap_or_else(|| display_number(&contact.jid));
+                    let detail = div()
+                        .truncate()
+                        .child(contact.about.clone().unwrap_or_else(|| display_number(&contact.jid)))
+                        .into_any_element();
+                    let jid = contact.jid.clone();
+                    self.list_row(
+                        SharedString::from(format!("contact-{slot}")),
+                        &contact.jid,
+                        &name,
+                        Some(&contact.jid),
+                        String::new(),
+                        detail,
+                        None,
+                        false,
+                        false,
+                        cx,
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_size(px(12.))
-                                    .text_color(if unread {
-                                        Tokens::with_alpha(t.sidebar_foreground, 0.85)
-                                    } else {
-                                        t.muted_foreground
-                                    })
-                                    .child(preview),
-                            )
-                            .when(muted, |this| {
-                                this.child(icon("bell-off").size(px(12.)).text_color(t.muted_foreground))
-                            })
-                            .when(chat.pinned > 0, |this| {
-                                this.child(icon("pin").size(px(12.)).text_color(t.muted_foreground))
-                            })
-                            .when(chat.unread > 0, |this| this.child(count_badge(chat.unread, muted, cx)))
-                            .when(chat.unread == 0 && chat.marked_unread, |this| {
-                                this.child(div().size(px(10.)).rounded_full().bg(t.primary))
-                            }),
-                    ),
-            )
-            .into_any_element()
+                    .on_click(cx.listener(move |this, _, window, cx| this.start_chat_with(&jid, window, cx)))
+                    .into_any_element()
+                })
+                .collect();
+            return (rows, "No contacts match.");
+        }
+        match self.section {
+            Section::Calls => (
+                self.calls
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, call)| self.call_row(slot, call, cx))
+                    .collect(),
+                "No calls yet.",
+            ),
+            Section::Starred => (
+                self.starred
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, row)| self.message_hit_row(slot, row, cx))
+                    .collect(),
+                "No starred messages. Right-click a message and choose Star.",
+            ),
+            Section::Status => {
+                let rows = self
+                    .statuses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, group)| {
+                        let count = group.items.len();
+                        let detail = div()
+                            .truncate()
+                            .child(format!("{count} update{}", if count == 1 { "" } else { "s" }))
+                            .into_any_element();
+                        let picture = if group.sender == "me" {
+                            self.me_jid.as_deref()
+                        } else {
+                            Some(group.sender.as_str())
+                        };
+                        self.list_row(
+                            SharedString::from(format!("status-{index}")),
+                            &group.sender,
+                            &group.name,
+                            picture,
+                            group.items.last().map(|r| list_time(r.ts)).unwrap_or_default(),
+                            detail,
+                            None,
+                            self.status_open.is_some_and(|(open, _)| open == index),
+                            false,
+                            cx,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.status_open = Some((index, 0));
+                            this.request_status_media();
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                    })
+                    .collect();
+                (rows, "No status updates in the last 24 hours.")
+            }
+            Section::Settings => (Vec::new(), ""),
+            _ => {
+                let mut rows: Vec<AnyElement> = Vec::new();
+                let chats = self.visible_chats();
+                let searching = !self.query.trim().is_empty();
+                if searching && !chats.is_empty() {
+                    rows.push(label("Chats"));
+                }
+                rows.extend(chats.into_iter().map(|chat| self.chat_row(chat, cx)));
+                if !self.hits.is_empty() {
+                    rows.push(label("Messages"));
+                    rows.extend(
+                        self.hits
+                            .iter()
+                            .enumerate()
+                            .map(|(slot, row)| self.message_hit_row(slot, row, cx)),
+                    );
+                }
+                (rows, "No chats here.")
+            }
+        }
     }
 
     fn column(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = tokens(cx).clone();
-        let title = match self.section {
-            Section::Chats => "Chats",
-            Section::Unread => "Unread",
-            Section::Groups => "Groups",
-            Section::Archived => "Archived",
-            Section::Calls => "Calls",
-            Section::Status => "Status",
-            Section::Channels => "Channels",
-            Section::Starred => "Starred messages",
-            Section::Settings => "Settings",
-        };
         let filter = |section: Section, label: &'static str, cx: &mut Context<Self>| {
             let active = self.section == section;
             let t = t.clone();
@@ -542,25 +967,18 @@ impl Shell {
                         .hover(|style| style.bg(t.fg(0.09)))
                 })
                 .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.section = section;
-                    this.reload_chats();
-                    cx.notify();
-                }))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_section(section, cx)))
         };
-        let is_chat_list = matches!(
-            self.section,
-            Section::Chats | Section::Unread | Section::Groups | Section::Archived | Section::Channels
-        );
-        let rows: Vec<AnyElement> = if is_chat_list {
-            self.visible_chats()
-                .into_iter()
-                .map(|chat| self.chat_row(chat, cx))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let show_filters =
+            matches!(self.section, Section::Chats | Section::Unread | Section::Groups) && !self.picking;
+        let show_search = self.section.lists_chats() || self.picking;
+        let (rows, empty_text) = self.rows(cx);
         let empty = rows.is_empty();
+        let title = if self.picking {
+            "New chat"
+        } else {
+            self.section.title()
+        };
 
         div()
             .w(COLUMN_W)
@@ -574,7 +992,18 @@ impl Shell {
                     .mt(px(8.))
                     .px(px(16.))
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
+                    .when(self.picking, |this| {
+                        this.child(
+                            icon_button("back", "arrow-left", cx)
+                                .mr(px(4.))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.picking = false;
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -583,22 +1012,35 @@ impl Shell {
                             .text_color(t.foreground)
                             .child(title),
                     )
-                    .child(icon_button("new-chat", "square-pen", cx).tooltip(tip("New chat")))
-                    .child(icon_button("list-menu", "ellipsis-vertical", cx).tooltip(tip("Menu"))),
+                    .when(self.section.lists_chats() && !self.picking, |this| {
+                        this.child(
+                            icon_button("new-chat", "square-pen", cx)
+                                .tooltip(tip("New chat"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.picking = true;
+                                    this.reload();
+                                    this.run_search();
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
-            .child(
-                div().px(px(12.)).pb(px(8.)).child(
-                    Input::new(&self.search)
-                        .prefix(icon("search").size(px(14.)).text_color(t.muted_foreground))
-                        .cleanable(true),
-                ),
-            )
-            .when(is_chat_list, |this| {
+            .when(show_search, |this| {
+                this.child(
+                    div().px(px(12.)).pb(px(8.)).flex_shrink_0().child(
+                        Input::new(&self.search)
+                            .prefix(icon("search").size(px(14.)).text_color(t.muted_foreground))
+                            .cleanable(true),
+                    ),
+                )
+            })
+            .when(show_filters, |this| {
                 this.child(
                     div()
                         .px(px(12.))
                         .pb(px(8.))
                         .flex()
+                        .flex_shrink_0()
                         .gap(px(6.))
                         .child(filter(Section::Chats, "All", cx))
                         .child(filter(Section::Unread, "Unread", cx))
@@ -607,7 +1049,7 @@ impl Shell {
             })
             .child(
                 div()
-                    .id("chat-list")
+                    .id("column-list")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -616,39 +1058,497 @@ impl Shell {
                     .gap(px(2.))
                     .pb(px(8.))
                     .children(rows)
-                    .when(empty, |this| {
+                    .when(empty && !empty_text.is_empty(), |this| {
                         this.child(
                             div()
                                 .p(px(24.))
                                 .text_size(px(13.))
                                 .text_color(t.muted_foreground)
-                                .child(if is_chat_list {
-                                    "No chats here yet."
-                                } else {
-                                    "This section is not built yet."
-                                }),
+                                .child(empty_text),
                         )
                     }),
             )
     }
 
+    // ---- chat row menu -----------------------------------------------------------------
+
+    fn chat_menu_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (jid, at) = self.chat_menu.clone()?;
+        let chat = self.chats.iter().find(|c| c.jid == jid)?.clone();
+        let t = tokens(cx).clone();
+        let item = |slot: usize, name: &'static str, label: &'static str, danger: bool| {
+            let accent = t.accent;
+            let danger_fill = Tokens::with_alpha(t.destructive, if t.dark { 0.2 } else { 0.1 });
+            div()
+                .id(("chat-menu-item", slot))
+                .h(px(32.))
+                .px(px(8.))
+                .rounded(R_MD)
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .text_size(px(14.))
+                .cursor_pointer()
+                .text_color(if danger { t.destructive } else { t.foreground })
+                .hover(move |style| style.bg(if danger { danger_fill } else { accent }))
+                .child(icon(name).text_color(if danger { t.destructive } else { t.muted_foreground }))
+                .child(label)
+        };
+        let unread = chat.unread > 0 || chat.marked_unread;
+        let actions: Vec<(&'static str, &'static str, bool, Command)> = vec![
+            (
+                "mail-open",
+                if unread { "Mark as read" } else { "Mark as unread" },
+                false,
+                if unread {
+                    Command::MarkRead { chat: jid.clone() }
+                } else {
+                    Command::MarkUnread { chat: jid.clone() }
+                },
+            ),
+            (
+                "pin",
+                if chat.pinned > 0 { "Unpin chat" } else { "Pin chat" },
+                false,
+                Command::Pin {
+                    chat: jid.clone(),
+                    pinned: chat.pinned == 0,
+                },
+            ),
+            (
+                "bell-off",
+                if chat.mute_until != 0 { "Unmute" } else { "Mute notifications" },
+                false,
+                Command::Mute {
+                    chat: jid.clone(),
+                    until: if chat.mute_until != 0 { None } else { Some(0) },
+                },
+            ),
+            (
+                "archive",
+                if chat.archived { "Unarchive chat" } else { "Archive chat" },
+                false,
+                Command::Archive {
+                    chat: jid.clone(),
+                    archived: !chat.archived,
+                },
+            ),
+            ("trash", "Delete chat", true, Command::DeleteChat { chat: jid.clone() }),
+        ];
+        let mut panel = div()
+            .w(px(224.))
+            .p(px(6.))
+            .rounded(R_XL)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .shadow(t.shadow_popover())
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        for (slot, (glyph, label, danger, command)) in actions.into_iter().enumerate() {
+            if danger {
+                panel = panel.child(div().h(px(1.)).mx(px(-6.)).my(px(6.)).bg(t.border));
+            }
+            panel = panel.child(item(slot, glyph, label, danger).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.backend.send(command.clone());
+                    this.chat_menu = None;
+                    cx.notify();
+                },
+            )));
+        }
+
+        let size = window.viewport_size();
+        let close = cx.listener(|this, _: &MouseDownEvent, _, cx| {
+            this.chat_menu = None;
+            cx.notify();
+        });
+        let close_right = cx.listener(|this, _: &MouseDownEvent, _, cx| {
+            this.chat_menu = None;
+            cx.notify();
+        });
+        Some(
+            deferred(
+                anchored().position(point(px(0.), px(0.))).child(
+                    div()
+                        .w(size.width)
+                        .h(size.height)
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, close)
+                        .on_mouse_down(MouseButton::Right, close_right)
+                        .child(anchored().position(at).snap_to_window_with_margin(px(8.)).child(panel)),
+                ),
+            )
+            .with_priority(10)
+            .into_any_element(),
+        )
+    }
+
     // ---- main panel --------------------------------------------------------------------
+
+    fn request_status_media(&mut self) {
+        let Some((person, item)) = self.status_open else {
+            return;
+        };
+        if let Some(row) = self.statuses.get(person).and_then(|g| g.items.get(item))
+            && row.kind.is_media()
+            && row.media_path.is_none()
+        {
+            self.backend.send(Command::DownloadMedia {
+                chat: "status@broadcast".to_string(),
+                id: row.id.clone(),
+            });
+        }
+    }
+
+    fn step_status(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some((person, item)) = self.status_open else {
+            return;
+        };
+        let count = self.statuses.get(person).map(|g| g.items.len()).unwrap_or(0) as isize;
+        let next = item as isize + delta;
+        if next < 0 {
+            return;
+        }
+        if next >= count {
+            // On to the next person, or close after the last.
+            self.status_open = (person + 1 < self.statuses.len()).then_some((person + 1, 0));
+        } else {
+            self.status_open = Some((person, next as usize));
+        }
+        self.request_status_media();
+        cx.notify();
+    }
+
+    fn status_panel(&self, person: usize, item: usize, cx: &mut Context<Self>) -> AnyElement {
+        let t = tokens(cx).clone();
+        let Some(group) = self.statuses.get(person) else {
+            return self.empty_panel(cx);
+        };
+        let Some(row) = group.items.get(item) else {
+            return self.empty_panel(cx);
+        };
+        let mut bars = div().flex().gap(px(4.)).px(px(16.)).pt(px(12.));
+        for index in 0..group.items.len() {
+            bars = bars.child(
+                div()
+                    .flex_1()
+                    .h(px(3.))
+                    .rounded_full()
+                    .bg(if index <= item { t.primary } else { t.fg(0.15) }),
+            );
+        }
+        let body: AnyElement = match (row.kind, row.media_path.as_ref()) {
+            (MsgKind::Image, Some(path)) => gpui::img(std::path::PathBuf::from(path))
+                .max_w_full()
+                .max_h_full()
+                .object_fit(gpui::ObjectFit::Contain)
+                .into_any_element(),
+            (MsgKind::Text, _) => div()
+                .max_w(px(520.))
+                .text_size(px(26.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(t.foreground)
+                .child(SharedString::from(row.text.clone().unwrap_or_default()))
+                .into_any_element(),
+            (kind, Some(path)) if kind.is_media() => {
+                let path = std::path::PathBuf::from(path);
+                div()
+                    .id("status-open-media")
+                    .cursor_pointer()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(12.))
+                    .text_color(t.muted_foreground)
+                    .child(icon("play").size(px(40.)))
+                    .child("Open in the default player")
+                    .on_click(cx.listener(move |_, _, _, cx| cx.open_with_system(&path)))
+                    .into_any_element()
+            }
+            (kind, None) if kind.is_media() => div()
+                .text_color(t.muted_foreground)
+                .child("Downloading…")
+                .into_any_element(),
+            _ => div()
+                .text_color(t.muted_foreground)
+                .child(preview_label(row.kind, row.text.as_deref()))
+                .into_any_element(),
+        };
+        let caption = row
+            .text
+            .clone()
+            .filter(|text| !text.is_empty() && row.kind != MsgKind::Text);
+        let picture = if group.sender == "me" {
+            self.me_jid.as_deref().and_then(crate::avatars::get)
+        } else {
+            crate::avatars::get(&group.sender)
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(bars)
+            .child(
+                div()
+                    .px(px(16.))
+                    .py(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(avatar(&group.sender, &group.name, 32., picture, cx))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(SharedString::from(group.name.clone())),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(t.muted_foreground)
+                                    .child(super::widgets::header_time(row.ts)),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        icon_button("status-prev", "chevron-left", cx)
+                            .on_click(cx.listener(|this, _, _, cx| this.step_status(-1, cx))),
+                    )
+                    .child(
+                        icon_button("status-next", "chevron-right", cx)
+                            .on_click(cx.listener(|this, _, _, cx| this.step_status(1, cx))),
+                    )
+                    .child(
+                        icon_button("status-close", "x", cx).on_click(cx.listener(|this, _, _, cx| {
+                            this.status_open = None;
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(body),
+            )
+            .when_some(caption, |this, caption| {
+                this.child(
+                    div()
+                        .px(px(24.))
+                        .pb(px(20.))
+                        .flex()
+                        .justify_center()
+                        .text_size(px(14.))
+                        .text_color(t.fg(0.9))
+                        .child(SharedString::from(caption)),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn settings_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = tokens(cx).clone();
+        let heading = |text: &'static str, detail: &'static str| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .mb(px(12.))
+                .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(text))
+                .child(div().text_size(px(14.)).text_color(t.muted_foreground).child(detail))
+        };
+        let rule = || div().h(px(1.)).my(px(28.)).bg(t.border);
+        let dark = t.dark;
+        let choice = |id: &'static str, label: &'static str, active: bool| {
+            let rest = t.fg(0.08);
+            let hover = t.fg(0.12);
+            div()
+                .id(id)
+                .h(px(32.))
+                .px(px(14.))
+                .rounded(R_LG)
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .when(active, |this| this.bg(t.primary).text_color(t.primary_foreground))
+                .when(!active, |this| {
+                    this.bg(rest)
+                        .text_color(t.foreground)
+                        .hover(move |style| style.bg(hover))
+                })
+                .child(label)
+        };
+        let number = self.me_jid.as_deref().map(display_number).unwrap_or_default();
+        let folder = crate::paths::data_dir();
+        let folder_text = folder.display().to_string();
+        let confirm = self.confirm_logout;
+
+        div()
+            .id("settings-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .max_w(px(672.))
+                    .mx_auto()
+                    .px(px(20.))
+                    .pt(px(24.))
+                    .pb(px(64.))
+                    .flex()
+                    .flex_col()
+                    .child(heading("Profile", "How other people see you on WhatsApp."))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(14.))
+                            .child(avatar(
+                                "me",
+                                &self.me_name,
+                                56.,
+                                self.me_jid.as_deref().and_then(crate::avatars::get),
+                                cx,
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_size(px(16.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(SharedString::from(self.me_name.clone())),
+                                    )
+                                    .child(div().text_size(px(13.)).text_color(t.muted_foreground).child(number)),
+                            ),
+                    )
+                    .child(rule())
+                    .child(heading("Appearance", "The look follows diskurt's modern design."))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(choice("theme-dark", "Dark", dark).on_click(cx.listener(|_, _, _, cx| {
+                                super::theme::install(true, cx);
+                                cx.refresh_windows();
+                            })))
+                            .child(choice("theme-light", "Light", !dark).on_click(cx.listener(|_, _, _, cx| {
+                                super::theme::install(false, cx);
+                                cx.refresh_windows();
+                            }))),
+                    )
+                    .child(rule())
+                    .child(heading(
+                        "Storage",
+                        "Chats, the linked session and downloaded media are kept in this folder.",
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .text_color(t.muted_foreground)
+                                    .child(SharedString::from(folder_text)),
+                            )
+                            .child(choice("open-folder", "Open folder", false).on_click(cx.listener(
+                                move |_, _, _, cx| cx.open_with_system(&folder),
+                            ))),
+                    )
+                    .child(rule())
+                    .child(heading(
+                        "Account",
+                        "Logging out unlinks this device. Your chats stay on your phone.",
+                    ))
+                    .child(
+                        div().flex().child(
+                            div()
+                                .id("logout")
+                                .h(px(32.))
+                                .px(px(14.))
+                                .rounded(R_LG)
+                                .flex()
+                                .items_center()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .cursor_pointer()
+                                .bg(Tokens::with_alpha(t.destructive, if confirm { 1.0 } else { 0.14 }))
+                                .text_color(if confirm { gpui::white() } else { t.destructive })
+                                .child(if confirm { "Click again to log out" } else { "Log out" })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.confirm_logout {
+                                        this.backend.send(Command::Logout);
+                                        this.confirm_logout = false;
+                                    } else {
+                                        this.confirm_logout = true;
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .when_some(self.last_error.clone(), |this, error| {
+                        this.child(rule())
+                            .child(heading(
+                                "Last problem",
+                                "The most recent error reported by the connection.",
+                            ))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(t.muted_foreground)
+                                    .child(SharedString::from(error)),
+                            )
+                    }),
+            )
+            .into_any_element()
+    }
 
     fn empty_panel(&self, cx: &App) -> AnyElement {
         let t = tokens(cx);
-        let (title, detail): (&str, String) = match (&self.conn, &self.qr) {
+        let (title, detail): (&str, &str) = match (&self.conn, &self.qr) {
             (ConnState::Pairing, Some(_)) => (
                 "Link this device",
-                "On your phone: WhatsApp → Settings → Linked devices → Link a device.".to_string(),
+                "On your phone: WhatsApp → Settings → Linked devices → Link a device, then scan this code.",
             ),
             (ConnState::LoggedOut, _) => (
                 "Logged out",
-                "This device was unlinked. Restart the app to link it again.".to_string(),
+                "This device was unlinked. Restart the app to link it again.",
             ),
             _ => (
                 "WhatsApp for Windows",
-                "Select a chat to start messaging. Your messages are end-to-end encrypted.".to_string(),
+                "Select a chat to start messaging. Your messages are end-to-end encrypted.",
             ),
+        };
+        // The pairing code as a picture: black modules on a white card.
+        let qr = match (&self.conn, &self.qr) {
+            (ConnState::Pairing, Some(code)) => qrcode::QrCode::new(code.as_bytes()).ok().map(|qr| {
+                let svg = qr
+                    .render::<qrcode::render::svg::Color>()
+                    .min_dimensions(264, 264)
+                    .dark_color(qrcode::render::svg::Color("#000000"))
+                    .light_color(qrcode::render::svg::Color("#ffffff"))
+                    .build();
+                Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes()))
+            }),
+            _ => None,
         };
         div()
             .size_full()
@@ -657,8 +1557,14 @@ impl Shell {
             .items_center()
             .justify_center()
             .gap(px(16.))
-            .child(
-                div()
+            .child(match qr {
+                Some(image) => div()
+                    .p(px(14.))
+                    .rounded(R_XL)
+                    .bg(gpui::white())
+                    .child(gpui::img(image).size(px(264.)))
+                    .into_any_element(),
+                None => div()
                     .size(px(44.))
                     .rounded(R_XL)
                     .bg(t.tint(0.10))
@@ -668,8 +1574,9 @@ impl Shell {
                     .items_center()
                     .justify_center()
                     .text_color(t.primary)
-                    .child(icon("messages-square").size(px(20.))),
-            )
+                    .child(icon("messages-square").size(px(20.)))
+                    .into_any_element(),
+            })
             .child(
                 div()
                     .text_size(px(18.))
@@ -691,10 +1598,13 @@ impl Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = tokens(cx).clone();
-        let panel: AnyElement = match &self.chat {
-            Some(chat) => chat.clone().into_any_element(),
-            None => self.empty_panel(cx),
+        let panel: AnyElement = match (self.section, self.status_open, &self.chat) {
+            (Section::Settings, _, _) => self.settings_panel(cx),
+            (Section::Status, Some((person, item)), _) => self.status_panel(person, item, cx),
+            (_, _, Some(chat)) => chat.clone().into_any_element(),
+            _ => self.empty_panel(cx),
         };
+        let chat_menu = self.chat_menu_overlay(window, cx);
         div()
             .size_full()
             .flex()
@@ -732,5 +1642,6 @@ impl Render for Shell {
                             ),
                     ),
             )
+            .children(chat_menu)
     }
 }

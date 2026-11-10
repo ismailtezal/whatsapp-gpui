@@ -17,6 +17,7 @@ pub mod model;
 pub mod paths;
 pub mod richtext;
 pub mod store;
+pub mod store_more;
 pub mod system;
 pub mod ui;
 

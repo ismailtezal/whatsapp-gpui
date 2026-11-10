@@ -210,6 +210,12 @@ impl Store {
         Ok(out)
     }
 
+    /// Runs a read against the connection.
+    pub(crate) fn read<T>(&self, work: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let conn = self.lock();
+        work(&conn)
+    }
+
     fn with<T>(&self, work: impl FnOnce(&Tx<'_>) -> Result<T>) -> Result<T> {
         let conn = self.lock();
         work(&Tx { conn: &conn })
@@ -498,7 +504,7 @@ fn pick_title(
     })
 }
 
-fn msg_row(row: &rusqlite::Row<'_>) -> Result<MsgRow> {
+pub(crate) fn msg_row(row: &rusqlite::Row<'_>) -> Result<MsgRow> {
     Ok(MsgRow {
         chat: row.get(0)?,
         id: row.get(1)?,
@@ -520,7 +526,7 @@ fn msg_row(row: &rusqlite::Row<'_>) -> Result<MsgRow> {
 
 /// Write operations, usable alone or inside [`Store::batch`].
 pub struct Tx<'a> {
-    conn: &'a Connection,
+    pub(crate) conn: &'a Connection,
 }
 
 impl Tx<'_> {

@@ -317,6 +317,10 @@ fn apply_inner(store: &Store, event: &Event, out: &mut Vec<UiEvent>) -> DbResult
             jid: store.canonical(&update.jid.to_non_ad_string())?,
         }),
 
+        Event::CallLogHistory(history) => {
+            store.put_call(&history.record)?;
+        }
+
         Event::SelfPushNameUpdated(_) => {}
 
         _ => {}

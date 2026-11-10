@@ -58,6 +58,13 @@ pub fn run() {
         }
         theme::install(true, cx);
 
+        // Call logs arrive inside history blobs; older builds did not store them.
+        if store.kv("calls_imported").ok().flatten().is_none()
+            && crate::import::import_saved_history(&store).is_ok()
+        {
+            let _ = store.set_kv("calls_imported", "1");
+        }
+
         let backend = Backend::start(store.clone());
         crate::avatars::init(backend.clone());
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);

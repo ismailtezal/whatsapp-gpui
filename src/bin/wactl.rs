@@ -95,6 +95,16 @@ fn main() -> Result<()> {
                 println!("{:?} {}", msg.kind, buffa_decode::describe(&msg.proto));
             }
         }
+        Some("calls") => {
+            // Raw numbers only, to check units.
+            for call in store.calls(400)?.iter().take(12) {
+                println!("ts={} duration={} outcome={} video={} outgoing={}", call.ts, call.duration, call.outcome, call.video, call.outgoing);
+            }
+            let calls = store.calls(400)?;
+            let with_duration = calls.iter().filter(|c| c.duration > 0).count();
+            let max = calls.iter().map(|c| c.duration).max().unwrap_or(0);
+            println!("calls={} with_duration={} max_duration={}", calls.len(), with_duration, max);
+        }
         Some("kinds") => {
             let jid = args.get(1).cloned();
             let mut kinds = std::collections::BTreeMap::new();

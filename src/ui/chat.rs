@@ -102,6 +102,13 @@ pub struct ChatView {
     emoji: Option<EmojiState>,
     viewer: Option<PathBuf>,
     notice: Option<String>,
+    info_open: bool,
+    /// Group members as (JID, name, rank).
+    members: Vec<(String, String, i32)>,
+    gallery: Vec<PathBuf>,
+    search_open: bool,
+    search: Entity<gpui_component::input::InputState>,
+    search_hits: Vec<MsgRow>,
 }
 
 impl ChatView {
@@ -131,6 +138,16 @@ impl ChatView {
         })
         .detach();
 
+        let search = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx).placeholder("Search in this chat")
+        });
+        cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.run_search(cx);
+            }
+        })
+        .detach();
+
         let unread_at_open = chat.unread;
         let mut view = ChatView {
             backend,
@@ -155,6 +172,12 @@ impl ChatView {
             emoji: None,
             viewer: None,
             notice: None,
+            info_open: false,
+            members: Vec::new(),
+            gallery: Vec::new(),
+            search_open: false,
+            search,
+            search_hits: Vec::new(),
         };
         view.reload(cx);
         view.backend.send(Command::MarkRead {
@@ -981,8 +1004,8 @@ impl ChatView {
 
     // ---- header and composer ---------------------------------------------------------------
 
-    fn header(&self, cx: &App) -> impl IntoElement {
-        let t = tokens(cx);
+    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = tokens(cx).clone();
         let subtitle = match (&self.activity, &self.presence) {
             (Some((sender, activity)), _) => {
                 let verb = if *activity == Activity::Recording {
@@ -1058,10 +1081,26 @@ impl ChatView {
                     .flex()
                     .items_center()
                     .gap(px(2.))
-                    .child(icon_button("call-video", "video", cx).tooltip(tip("Video call")))
-                    .child(icon_button("call-voice", "phone", cx).tooltip(tip("Voice call")))
-                    .child(icon_button("chat-search", "search", cx).tooltip(tip("Search")))
-                    .child(icon_button("chat-more", "ellipsis-vertical", cx).tooltip(tip("Menu"))),
+                    .child(
+                        icon_button("call-video", "video", cx)
+                            .tooltip(tip("Video call"))
+                            .on_click(cx.listener(|this, _, _, cx| this.calls_unavailable(cx))),
+                    )
+                    .child(
+                        icon_button("call-voice", "phone", cx)
+                            .tooltip(tip("Voice call"))
+                            .on_click(cx.listener(|this, _, _, cx| this.calls_unavailable(cx))),
+                    )
+                    .child(
+                        icon_button("chat-search", "search", cx)
+                            .tooltip(tip("Search in chat"))
+                            .on_click(cx.listener(|this, _, window, cx| this.toggle_search(window, cx))),
+                    )
+                    .child(
+                        icon_button("chat-info", "info", cx)
+                            .tooltip(tip("Chat info"))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_info(cx))),
+                    ),
             )
     }
 
@@ -1187,13 +1226,89 @@ impl Render for ChatView {
                 this.send_files(paths.paths().to_vec(), cx);
             }))
             .child(self.header(cx))
+            .children(self.search_bar(cx))
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .flex_col()
-                    .when(older, |this| {
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .child(self.messages_area(older, view, &t, cx))
+                            .child(self.composer(cx)),
+                    )
+                    .children(self.info_panel(cx)),
+            )
+            .children(viewer)
+            .children(menu)
+            .children(emoji)
+    }
+}
+
+impl ChatView {
+    /// The message list, or the search results while a search is active.
+    fn messages_area(
+        &self,
+        older: bool,
+        view: Entity<Self>,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = t.clone();
+        if self.search_open && !self.search_hits.is_empty() {
+            let mut results = div()
+                .id("chat-search-results")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .p(px(12.));
+            for (slot, hit) in self.search_hits.iter().enumerate() {
+                let id = hit.id.clone();
+                let hover = t.fg(0.15);
+                results = results.child(
+                    div()
+                        .id(("search-hit", slot))
+                        .rounded(R_XL)
+                        .border_1()
+                        .border_color(t.border)
+                        .bg(t.card)
+                        .p(px(12.))
+                        .cursor_pointer()
+                        .hover(move |style| style.border_color(hover))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(t.muted_foreground)
+                                .child(super::widgets::header_time(hit.ts)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(14.))
+                                .text_color(t.fg(0.8))
+                                .child(SharedString::from(preview_label(hit.kind, hit.text.as_deref()))),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| this.jump_to(&id, cx))),
+                );
+            }
+            return results.into_any_element();
+        }
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .when(older, |this| {
                         this.child(
                             div().flex().justify_center().py(px(6.)).child(
                                 div()
@@ -1221,11 +1336,375 @@ impl Render for ChatView {
                         .flex_1()
                         .min_h_0()
                         .pb(px(20.)),
+                    )
+            .into_any_element()
+    }
+
+    fn calls_unavailable(&mut self, cx: &mut Context<Self>) {
+        self.notice = Some("Calls are not available in this build yet".to_string());
+        cx.notify();
+    }
+
+    fn toggle_info(&mut self, cx: &mut Context<Self>) {
+        self.info_open = !self.info_open;
+        if self.info_open {
+            let mut members = Vec::new();
+            if self.chat.kind != ChatKind::User {
+                for (jid, rank) in self.store.group_members(&self.chat.jid).unwrap_or_default() {
+                    let name = if self.me_jid.as_deref() == Some(jid.as_str()) {
+                        "You".to_string()
+                    } else {
+                        self.name_of(&jid)
+                    };
+                    members.push((jid, name, rank));
+                }
+            }
+            self.members = members;
+            self.gallery = self
+                .store
+                .photo_paths(&self.chat.jid, 9)
+                .unwrap_or_default()
+                .into_iter()
+                .map(PathBuf::from)
+                .filter(|path| path.exists())
+                .collect();
+        }
+        cx.notify();
+    }
+
+    fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_open = !self.search_open;
+        if self.search_open {
+            self.search.update(cx, |input, cx| input.focus(window, cx));
+        } else {
+            self.search_hits.clear();
+        }
+        cx.notify();
+    }
+
+    fn run_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.search.read(cx).value().to_string();
+        self.search_hits = if query.trim().chars().count() >= 2 {
+            self.store
+                .search_messages(&query, Some(&self.chat.jid), 60)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        cx.notify();
+    }
+
+    /// Scrolls to a message, loading older pages first when it is not in view yet.
+    fn jump_to(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.search_open = false;
+        self.search_hits.clear();
+        if self.row(id).is_none() {
+            match self.store.newer_than(&self.chat.jid, id).ok().flatten() {
+                Some(newer) => {
+                    self.loaded = (newer as usize + 20).max(self.loaded);
+                    self.reload(cx);
+                }
+                None => {
+                    self.notice = Some("That message is not on this device".to_string());
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        let index = self
+            .items
+            .iter()
+            .position(|item| matches!(item, Item::Msg(view) if view.row.id == id));
+        if let Some(index) = index {
+            self.list.scroll_to(gpui::ListOffset {
+                item_ix: index,
+                offset_in_item: px(0.),
+            });
+        }
+        cx.notify();
+    }
+
+    fn search_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.search_open {
+            return None;
+        }
+        let t = tokens(cx).clone();
+        let count = self.search_hits.len();
+        Some(
+            div()
+                .px(px(16.))
+                .py(px(8.))
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(8.))
+                .border_b_1()
+                .border_color(Tokens::with_alpha(t.border, t.border.a * 0.7))
+                .child(
+                    div().flex_1().child(
+                        gpui_component::input::Input::new(&self.search)
+                            .prefix(icon("search").size(px(14.)).text_color(t.muted_foreground))
+                            .cleanable(true),
                     ),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(t.muted_foreground)
+                        .child(if count == 0 {
+                            "Type to search".to_string()
+                        } else {
+                            format!("{count} result{}", if count == 1 { "" } else { "s" })
+                        }),
+                )
+                .child(
+                    icon_button("search-close", "x", cx)
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_search(window, cx))),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The contact or group details shown at the right of the conversation.
+    fn info_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.info_open {
+            return None;
+        }
+        let t = tokens(cx).clone();
+        let is_person = self.chat.kind == ChatKind::User;
+        let subtitle = if is_person {
+            crate::model::display_number(&self.chat.jid)
+        } else {
+            format!("Group · {} members", self.members.len())
+        };
+        let about = if is_person {
+            self.store
+                .contact(&self.chat.jid)
+                .ok()
+                .flatten()
+                .and_then(|contact| contact.about)
+        } else {
+            self.store
+                .chat_details(&self.chat.jid)
+                .ok()
+                .flatten()
+                .and_then(|(description, _, _)| description)
+        };
+        let section = |text: &'static str| {
+            div()
+                .px(px(8.))
+                .pt(px(16.))
+                .pb(px(6.))
+                .text_size(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(t.muted_foreground)
+                .child(text)
+        };
+        let action = |id: &'static str, glyph: &'static str, label: &'static str| {
+            let hover = t.fg(0.06);
+            div()
+                .id(id)
+                .h(px(36.))
+                .px(px(8.))
+                .rounded(R_LG)
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .text_size(px(14.))
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .child(icon(glyph).text_color(t.muted_foreground))
+                .child(label)
+        };
+        let muted = self.chat.mute_until != 0;
+        let pinned = self.chat.pinned > 0;
+        let archived = self.chat.archived;
+        let jid = self.chat.jid.clone();
+
+        let mut panel = div()
+            .id("chat-info")
+            .w(px(288.))
+            .h_full()
+            .flex_shrink_0()
+            .overflow_y_scroll()
+            .border_l_1()
+            .border_color(Tokens::with_alpha(t.border, t.border.a * 0.7))
+            .px(px(8.))
+            .pb(px(16.))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .pt(px(24.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(avatar(
+                        &self.chat.jid,
+                        &self.chat.title,
+                        96.,
+                        crate::avatars::get(&self.chat.jid),
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .px(px(8.))
+                            .text_size(px(18.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(SharedString::from(self.chat.title.clone())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(t.muted_foreground)
+                            .child(subtitle),
+                    ),
+            );
+        if let Some(about) = about.filter(|a| !a.trim().is_empty()) {
+            panel = panel
+                .child(section(if is_person { "About" } else { "Description" }))
+                .child(
+                    div()
+                        .px(px(8.))
+                        .text_size(px(14.))
+                        .text_color(t.fg(0.9))
+                        .child(SharedString::from(about)),
+                );
+        }
+        if !self.gallery.is_empty() {
+            let mut grid = div().px(px(8.)).flex().flex_wrap().gap(px(6.));
+            for (slot, path) in self.gallery.iter().enumerate() {
+                let open = path.clone();
+                grid = grid.child(
+                    div()
+                        .id(("gallery", slot))
+                        .size(px(82.))
+                        .rounded(R_MD)
+                        .overflow_hidden()
+                        .cursor_pointer()
+                        .child(
+                            gpui::img(path.clone())
+                                .size(px(82.))
+                                .object_fit(gpui::ObjectFit::Cover),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.viewer = Some(open.clone());
+                            cx.notify();
+                        })),
+                );
+            }
+            panel = panel.child(section("Photos")).child(grid);
+        }
+
+        fn send(
+            command: Command,
+            cx: &mut Context<ChatView>,
+        ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+            cx.listener(move |this: &mut ChatView, _: &gpui::ClickEvent, _, cx| {
+                // Reflect the change at once; the store and list follow from the event.
+                match &command {
+                    Command::Mute { until, .. } => this.chat.mute_until = if until.is_some() { -1 } else { 0 },
+                    Command::Pin { pinned, .. } => this.chat.pinned = i64::from(*pinned),
+                    Command::Archive { archived, .. } => this.chat.archived = *archived,
+                    _ => {}
+                }
+                this.backend.send(command.clone());
+                cx.notify();
+            })
+        }
+        panel = panel
+            .child(section("Actions"))
+            .child(
+                action("info-mute", "bell-off", if muted { "Unmute" } else { "Mute notifications" }).on_click(
+                    send(
+                        Command::Mute {
+                            chat: jid.clone(),
+                            until: if muted { None } else { Some(0) },
+                        },
+                        cx,
+                    ),
+                ),
             )
-            .child(self.composer(cx))
-            .children(viewer)
-            .children(menu)
-            .children(emoji)
+            .child(
+                action("info-pin", "pin", if pinned { "Unpin chat" } else { "Pin chat" }).on_click(send(
+                    Command::Pin {
+                        chat: jid.clone(),
+                        pinned: !pinned,
+                    },
+                    cx,
+                )),
+            )
+            .child(
+                action(
+                    "info-archive",
+                    "archive",
+                    if archived { "Unarchive chat" } else { "Archive chat" },
+                )
+                .on_click(send(
+                    Command::Archive {
+                        chat: jid.clone(),
+                        archived: !archived,
+                    },
+                    cx,
+                )),
+            );
+
+        if !self.members.is_empty() {
+            panel = panel.child(section("Members"));
+            for (slot, (member, name, rank)) in self.members.iter().enumerate() {
+                let hover = t.fg(0.06);
+                panel = panel.child(
+                    div()
+                        .id(("member", slot))
+                        .min_h(px(52.))
+                        .px(px(8.))
+                        .py(px(6.))
+                        .rounded(R_LG)
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(px(12.))
+                        .hover(move |style| style.bg(hover))
+                        .child(avatar(member, name, 38., crate::avatars::get(member), cx))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(15.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(SharedString::from(name.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(t.muted_foreground)
+                                        .child(crate::model::display_number(member)),
+                                ),
+                        )
+                        .when(*rank > 0, |this| {
+                            this.child(
+                                div()
+                                    .px(px(6.))
+                                    .h(px(18.))
+                                    .rounded(px(4.))
+                                    .bg(t.tint(0.12))
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(10.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(t.primary)
+                                    .child("Admin"),
+                            )
+                        }),
+                );
+            }
+        }
+        Some(panel.into_any_element())
     }
 }

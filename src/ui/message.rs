@@ -727,8 +727,9 @@ pub fn message_row(view: &MsgView, hooks: &RowHooks, cx: &App) -> AnyElement {
 pub fn day_separator(label: String, cx: &App) -> AnyElement {
     let t = tokens(cx);
     div()
-        .mx(px(16.))
-        .my(px(12.))
+        .w_full()
+        .px(px(16.))
+        .py(px(12.))
         .flex()
         .items_center()
         .gap(px(8.))
@@ -748,8 +749,9 @@ pub fn day_separator(label: String, cx: &App) -> AnyElement {
 pub fn unread_separator(cx: &App) -> AnyElement {
     let t = tokens(cx);
     div()
-        .mx(px(16.))
-        .my(px(4.))
+        .w_full()
+        .px(px(16.))
+        .py(px(4.))
         .flex()
         .items_center()
         .gap(px(8.))

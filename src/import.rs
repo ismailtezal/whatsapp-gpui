@@ -74,6 +74,9 @@ pub fn import_blob(store: &Store, compressed: &[u8]) -> Result<ImportStats> {
                 stats.status_messages += 1;
             }
         }
+        for call in &rest.call_log_records {
+            tx.put_call(call)?;
+        }
         stats.call_logs += rest.call_log_records.len();
         Ok(())
     })?;
