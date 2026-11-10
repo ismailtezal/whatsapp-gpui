@@ -1,0 +1,14 @@
+//! whatsapp-gpui: a native Windows WhatsApp client.
+//!
+//! - [`store`] is the local database of chats, messages and contacts.
+//! - [`content`] turns protocol messages into what the interface shows.
+//! - [`import`] loads history-sync data into the store.
+//! - [`paths`] says where everything lives on disk.
+
+pub mod content;
+pub mod import;
+pub mod model;
+pub mod paths;
+pub mod store;
+
+pub use whatsapp_rust::waproto::whatsapp as wa;

@@ -12,3 +12,4 @@ rusqlite = "0.40"
 gpui = { package = "gpui-pre", version = "=0.3.12" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12" }
 gpui-kit-assets = "0.9.1"
+anyhow = "1.0.104"
