@@ -971,3 +971,113 @@ impl Tx<'_> {
         Ok(())
     }
 }
+
+impl Tx<'_> {
+    /// The stored protocol record of a message, undecoded.
+    pub fn raw_record(&self, chat: &str, id: &str) -> Result<Option<Vec<u8>>> {
+        self.conn
+            .query_row(
+                "SELECT proto FROM messages WHERE chat = ?1 AND id = ?2 ORDER BY from_me DESC LIMIT 1",
+                params![chat, id],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    pub fn mark_edited(&self, chat: &str, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET edited = 1 WHERE chat = ?1 AND id = ?2",
+            params![chat, id],
+        )?;
+        Ok(())
+    }
+
+    /// Removes a chat and everything in it.
+    pub fn delete_chat(&self, chat: &str) -> Result<()> {
+        let chat = self.canonical(chat)?;
+        self.conn.execute("DELETE FROM messages WHERE chat = ?1", [&chat])?;
+        self.conn.execute("DELETE FROM reactions WHERE chat = ?1", [&chat])?;
+        self.conn.execute("DELETE FROM receipts WHERE chat = ?1", [&chat])?;
+        self.conn.execute("DELETE FROM chats WHERE jid = ?1", [&chat])?;
+        Ok(())
+    }
+
+    /// Empties a chat but keeps it in the list.
+    pub fn clear_chat(&self, chat: &str) -> Result<()> {
+        let chat = self.canonical(chat)?;
+        self.conn.execute("DELETE FROM messages WHERE chat = ?1", [&chat])?;
+        self.conn.execute("DELETE FROM reactions WHERE chat = ?1", [&chat])?;
+        self.conn.execute("DELETE FROM receipts WHERE chat = ?1", [&chat])?;
+        self.conn.execute(
+            "UPDATE chats SET last_rowid = NULL, unread = 0 WHERE jid = ?1",
+            [&chat],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_draft(&self, chat: &str, draft: Option<&str>) -> Result<()> {
+        let chat = self.canonical(chat)?;
+        self.conn.execute(
+            "UPDATE chats SET draft = ?2 WHERE jid = ?1",
+            params![chat, draft.filter(|d| !d.trim().is_empty())],
+        )?;
+        Ok(())
+    }
+}
+
+impl Store {
+    /// The decoded protocol record of a message.
+    pub fn record(&self, chat: &str, id: &str) -> Result<Option<wa::WebMessageInfo>> {
+        let chat = self.canonical(chat)?;
+        let raw = self.with(|tx| tx.raw_record(&chat, id))?;
+        Ok(raw.and_then(|bytes| wa::WebMessageInfo::decode_from_slice(&bytes).ok()))
+    }
+
+    /// IDs of the newest incoming messages of a chat, with their original sender JIDs,
+    /// for sending read receipts.
+    pub fn unread_incoming(&self, chat: &str, limit: usize) -> Result<Vec<(String, Option<String>)>> {
+        self.with(|tx| {
+            let mut stmt = tx.conn.prepare_cached(
+                "SELECT id, proto FROM messages WHERE chat = ?1 AND from_me = 0
+                 ORDER BY ts DESC, rowid DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![chat, limit as i64], |row| {
+                let id: String = row.get(0)?;
+                let proto: Vec<u8> = row.get(1)?;
+                Ok((id, proto))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, proto) = row?;
+                let participant = wa::WebMessageInfo::decode_from_slice(&proto).ok().and_then(|r| {
+                    r.participant
+                        .clone()
+                        .or_else(|| r.key.as_option().and_then(|k| k.participant.clone()))
+                });
+                out.push((id, participant.filter(|p| !p.is_empty())));
+            }
+            Ok(out)
+        })
+    }
+
+    pub fn unread_count(&self, chat: &str) -> Result<i64> {
+        self.with(|tx| {
+            tx.conn
+                .query_row("SELECT unread FROM chats WHERE jid = ?1", [chat], |row| row.get(0))
+                .optional()
+                .map(|v| v.unwrap_or(0))
+        })
+    }
+}
+
+impl Tx<'_> {
+    /// Sets a delivery state even when it goes backwards (a failed send).
+    pub fn force_status(&self, chat: &str, id: &str, status: Ack) -> Result<()> {
+        let chat = self.canonical(chat)?;
+        self.conn.execute(
+            "UPDATE messages SET status = ?3 WHERE chat = ?1 AND id = ?2 AND from_me = 1",
+            params![chat, id, status as i32],
+        )?;
+        Ok(())
+    }
+}

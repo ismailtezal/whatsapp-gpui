@@ -86,6 +86,15 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Some("inspect") => {
+            // Media plumbing of the newest messages of a chat, without their content.
+            use whatsapp_gpui::buffa_decode;
+            let jid = args.get(1).cloned().unwrap_or_default();
+            let limit: usize = args.get(2).and_then(|n| n.parse().ok()).unwrap_or(20);
+            for msg in store.messages(&jid, None, limit)? {
+                println!("{:?} {}", msg.kind, buffa_decode::describe(&msg.proto));
+            }
+        }
         Some("kinds") => {
             let jid = args.get(1).cloned();
             let mut kinds = std::collections::BTreeMap::new();
