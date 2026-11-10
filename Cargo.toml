@@ -15,3 +15,4 @@ gpui-kit-assets = "0.9.1"
 anyhow = "1.0.104"
 rust-embed = "8"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+ureq = "3.5"

@@ -124,6 +124,7 @@ async fn run(
             async move {
                 if matches!(&*event, Event::Connected(_)) {
                     on_connected(&client, &events).await;
+                    replay_account_state_once(client.clone(), store.clone());
                 }
                 for update in ingest::apply(&store, &event) {
                     let _ = events.send(update).await;
@@ -138,9 +139,33 @@ async fn run(
     let handle = bot.spawn();
     let client = handle.client();
 
+    // Profile pictures are fetched one at a time with a pause, so a full chat list does not
+    // turn into a burst of requests the server would throttle.
+    let (avatar_tx, mut avatar_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    {
+        let client = client.clone();
+        let events = events.clone();
+        tokio::spawn(async move {
+            while let Some(who) = avatar_rx.recv().await {
+                let outcome = crate::avatars::fetch(&client, &who).await;
+                if let Err(error) = &outcome
+                    && format!("{error:#}").contains("429")
+                {
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                }
+                let _ = events.send(UiEvent::AvatarReady { jid: who }).await;
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        });
+    }
+
     while let Some(command) = commands.recv().await {
         if matches!(command, Command::Shutdown) {
             break;
+        }
+        if let Command::FetchAvatar { jid } = command {
+            let _ = avatar_tx.send(jid);
+            continue;
         }
         let client = client.clone();
         let store = store.clone();
@@ -172,7 +197,45 @@ async fn on_connected(client: &Arc<Client>, events: &async_channel::Sender<UiEve
     }
 }
 
-fn jid(text: &str) -> Result<Jid> {
+/// Once per installation, replays the account's synced state (saved contact names, pins,
+/// mutes, archive flags, stars) so it lands in our store, not only in the session store.
+fn replay_account_state_once(client: Arc<Client>, store: Arc<Store>) {
+    const DONE: &str = "account_state_replayed";
+    if store.kv(DONE).ok().flatten().is_some() {
+        return;
+    }
+    tokio::spawn(async move {
+        use whatsapp_rust::{AppStateResyncMode, WAPatchName};
+        let collections = [
+            WAPatchName::CriticalBlock,
+            WAPatchName::CriticalUnblockLow,
+            WAPatchName::RegularHigh,
+            WAPatchName::RegularLow,
+            WAPatchName::Regular,
+        ];
+        if let Ok(report) = client
+            .resync_app_state(collections, AppStateResyncMode::Snapshot)
+            .await
+            && report.all_synced()
+        {
+            let _ = store.set_kv(DONE, "1");
+        }
+    });
+}
+
+/// The addressing a protocol operation on a stored message needs: its chat, its original
+/// author (for messages by others in groups), and whether it is ours.
+fn target_parts(record: &wa::WebMessageInfo, chat: &str) -> Result<(Jid, Option<Jid>, bool)> {
+    let key = record
+        .key
+        .as_option()
+        .ok_or_else(|| anyhow!("message has no key"))?;
+    let chat_jid = jid(key.remote_jid.as_deref().unwrap_or(chat))?;
+    let sender = original_sender(record).map(|s| jid(&s)).transpose()?;
+    Ok((chat_jid, sender, key.from_me.unwrap_or(false)))
+}
+
+pub(crate) fn jid(text: &str) -> Result<Jid> {
     Jid::from_str(text).map_err(|error| anyhow!("bad address {text}: {error}"))
 }
 
@@ -483,6 +546,54 @@ async fn execute(
         Command::Logout => {
             let _ = client.logout().await;
             let _ = events.send(UiEvent::Connection(ConnState::LoggedOut)).await;
+        }
+
+        Command::Star { chat, id, starred } => {
+            let record = store
+                .record(&chat, &id)?
+                .ok_or_else(|| anyhow!("message not found"))?;
+            let (chat_jid, sender, from_me) = target_parts(&record, &chat)?;
+            let target = MessageRef::new(&chat_jid, MessageId::new(&id)?, sender.as_ref(), from_me)?;
+            if starred {
+                client.chat_actions().star_message(&target).await?;
+            } else {
+                client.chat_actions().unstar_message(&target).await?;
+            }
+            store.batch(|tx| tx.set_starred(&chat, &id, starred))?;
+            notify(events, &chat).await;
+        }
+
+        Command::DeleteForMe { chat, id } => {
+            let record = store
+                .record(&chat, &id)?
+                .ok_or_else(|| anyhow!("message not found"))?;
+            let (chat_jid, sender, from_me) = target_parts(&record, &chat)?;
+            let target = MessageRef::new(&chat_jid, MessageId::new(&id)?, sender.as_ref(), from_me)?;
+            let sent_at = record.message_timestamp.map(|ts| ts as i64);
+            client
+                .chat_actions()
+                .delete_message_for_me(&target, true, sent_at)
+                .await?;
+            store.batch(|tx| tx.delete_message(&chat, &id))?;
+            notify(events, &chat).await;
+        }
+
+        Command::Forward {
+            from_chat,
+            id,
+            to_chats,
+        } => {
+            let record = store
+                .record(&from_chat, &id)?
+                .ok_or_else(|| anyhow!("message not found"))?;
+            let message = record
+                .message
+                .as_option()
+                .ok_or_else(|| anyhow!("message has no content"))?;
+            for to in to_chats {
+                let prepared = message.prepare_for_forward();
+                send_prepared(client, store, events, &to, prepared).await?;
+            }
         }
 
         command @ (Command::DownloadMedia { .. } | Command::SendFile { .. }) => {

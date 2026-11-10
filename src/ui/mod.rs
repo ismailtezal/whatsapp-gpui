@@ -59,6 +59,7 @@ pub fn run() {
         theme::install(true, cx);
 
         let backend = Backend::start(store.clone());
+        crate::avatars::init(backend.clone());
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         cx.open_window(
             WindowOptions {

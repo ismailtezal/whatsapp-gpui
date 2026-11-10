@@ -159,6 +159,19 @@ impl Shell {
                     view.update(cx, |view, cx| view.set_presence(online, last_seen, cx));
                 }
             }
+            UiEvent::AvatarReady { jid } => crate::avatars::refresh(&jid),
+            UiEvent::MediaReady {
+                chat,
+                id,
+                path,
+                error,
+            } => {
+                if self.selected.as_deref() == Some(chat.as_str())
+                    && let Some(view) = &self.chat
+                {
+                    view.update(cx, |view, cx| view.media_ready(&id, path, error, cx));
+                }
+            }
             UiEvent::Error(message) => self.last_error = Some(message),
             _ => {}
         }
@@ -175,7 +188,8 @@ impl Shell {
         self.selected = Some(jid.to_string());
         let backend = self.backend.clone();
         let me_name = self.me_name.clone();
-        let view = cx.new(|cx| ChatView::new(backend, chat, me_name, window, cx));
+        let me_jid = self.me_jid.clone();
+        let view = cx.new(|cx| ChatView::new(backend, chat, me_name, me_jid, window, cx));
         view.update(cx, |view, cx| view.focus_input(window, cx));
         self.chat = Some(view);
         self.reload_chats();
@@ -355,7 +369,13 @@ impl Shell {
                 div()
                     .id("rail-profile")
                     .cursor_pointer()
-                    .child(avatar("me", &self.me_name, 36., None, cx))
+                    .child(avatar(
+                        "me",
+                        &self.me_name,
+                        36.,
+                        self.me_jid.as_deref().and_then(crate::avatars::get),
+                        cx,
+                    ))
                     .tooltip(tip("Profile")),
             )
     }
@@ -422,7 +442,7 @@ impl Shell {
             .when(selected, |this| this.bg(t.fg(0.09)))
             .when(!selected, |this| this.hover(move |style| style.bg(hover)))
             .on_click(cx.listener(move |this, _, window, cx| this.open_chat(&jid, window, cx)))
-            .child(avatar(&chat.jid, &chat.title, 40., None, cx))
+            .child(avatar(&chat.jid, &chat.title, 40., crate::avatars::get(&chat.jid), cx))
             .child(
                 div()
                     .flex_1()

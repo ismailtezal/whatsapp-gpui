@@ -1,16 +1,21 @@
 //! One message, prepared for display and drawn as a flat row (avatar gutter, author line,
 //! body), following the design's "flat message rows, not bubbles".
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::prelude::*;
-use gpui::{AnyElement, App, Div, FontWeight, Image, ImageFormat, SharedString, div, px};
+use gpui::{
+    AnyElement, App, ClickEvent, Div, FontStyle, FontWeight, HighlightStyle, Image, ImageFormat,
+    InteractiveText, SharedString, StrikethroughStyle, StyledText, UnderlineStyle, Window, div, px,
+};
 use whatsapp_rust::buffa::Message as _;
 
 use super::theme::{GUTTER, R_LG, R_MD, Tokens, tokens};
 use super::widgets::{avatar, clock, duration, file_size, header_time, icon, tint_of};
 use crate::content::{self, preview_label};
 use crate::model::{Ack, MsgKind, MsgRow};
+use crate::richtext::{Rich, SpanStyle};
 use crate::system::notice_text;
 use crate::wa;
 
@@ -57,6 +62,19 @@ pub struct MsgView {
     /// Notice wording for system rows.
     pub notice: Option<String>,
     pub view_once: bool,
+    /// The text with formatting, links and mentions resolved.
+    pub rich: Option<Rich>,
+    pub avatar: Option<std::path::PathBuf>,
+}
+
+/// What a click on a part of a row does.
+pub type ClickFn = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
+/// Handlers the conversation view attaches to a row.
+#[derive(Clone, Default)]
+pub struct RowHooks {
+    /// Open (or download) the media of this message.
+    pub media: Option<ClickFn>,
 }
 
 /// Extracts what a row needs from the stored record.
@@ -271,16 +289,112 @@ fn picture(view: &MsgView, t: &Tokens, overlay: Option<&'static str>) -> Div {
     frame
 }
 
-fn body_text(text: &str, t: &Tokens) -> Div {
-    div()
+/// Message text with its formatting, clickable links and mention pills.
+fn body_text(view: &MsgView, fallback: &str, t: &Tokens) -> Div {
+    let base = div()
         .text_size(px(14.))
         .line_height(px(20.3))
-        .text_color(t.fg(0.9))
-        .child(SharedString::from(text.to_string()))
+        .text_color(t.fg(0.9));
+    let Some(rich) = view.rich.as_ref().filter(|r| !r.spans.is_empty()) else {
+        let text = view.rich.as_ref().map(|r| r.text.as_str()).unwrap_or(fallback);
+        return base.child(SharedString::from(text.to_string()));
+    };
+    // Highlights must be in order and must not overlap: split the text at every span
+    // boundary and merge the styles that cover each piece.
+    let mut cuts: Vec<usize> = rich
+        .spans
+        .iter()
+        .flat_map(|s| [s.range.start, s.range.end])
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut highlights = Vec::new();
+    for pair in cuts.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        let mut style = HighlightStyle::default();
+        let mut any = false;
+        for span in rich.spans.iter().filter(|s| s.range.start <= start && end <= s.range.end) {
+            any = true;
+            match &span.style {
+                SpanStyle::Bold => style.font_weight = Some(FontWeight::SEMIBOLD),
+                SpanStyle::Italic => style.font_style = Some(FontStyle::Italic),
+                SpanStyle::Strike => {
+                    style.strikethrough = Some(StrikethroughStyle {
+                        thickness: px(1.),
+                        color: None,
+                    })
+                }
+                SpanStyle::Code => {
+                    style.background_color = Some(t.fg(0.08));
+                    style.color = Some(t.foreground);
+                }
+                SpanStyle::Link(_) => {
+                    style.color = Some(t.link);
+                    style.underline = Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(Tokens::with_alpha(t.link, 0.5)),
+                        wavy: false,
+                    });
+                }
+                SpanStyle::Mention(_) => {
+                    style.color = Some(if t.dark {
+                        gpui::rgb(0x7daeed).into()
+                    } else {
+                        gpui::rgb(0x285696).into()
+                    });
+                    style.background_color = Some(t.tint(0.16));
+                    style.font_weight = Some(FontWeight::MEDIUM);
+                }
+            }
+        }
+        if any {
+            highlights.push((start..end, style));
+        }
+    }
+    let styled = StyledText::new(SharedString::from(rich.text.clone())).with_highlights(highlights);
+    let links: Vec<(std::ops::Range<usize>, String)> = rich
+        .spans
+        .iter()
+        .filter_map(|s| match &s.style {
+            SpanStyle::Link(url) => Some((s.range.clone(), url.clone())),
+            _ => None,
+        })
+        .collect();
+    if links.is_empty() {
+        return base.child(styled);
+    }
+    let ranges: Vec<std::ops::Range<usize>> = links.iter().map(|(r, _)| r.clone()).collect();
+    let urls: Vec<String> = links.into_iter().map(|(_, url)| url).collect();
+    base.child(
+        InteractiveText::new(("text", view.row.rowid as usize), styled).on_click(
+            ranges,
+            move |index, _window, cx| {
+                if let Some(url) = urls.get(index) {
+                    cx.open_url(url);
+                }
+            },
+        ),
+    )
+}
+
+/// Makes a media element clickable when the conversation attached a handler.
+fn clickable(element: Div, id: (&'static str, usize), hook: &Option<ClickFn>) -> AnyElement {
+    match hook {
+        Some(hook) => {
+            let hook = hook.clone();
+            element
+                .id(id)
+                .cursor_pointer()
+                .on_click(move |event, window, cx| hook(event, window, cx))
+                .into_any_element()
+        }
+        None => element.into_any_element(),
+    }
 }
 
 /// The content of a message below its header line.
-fn content(view: &MsgView, t: &Tokens) -> Div {
+fn content(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> Div {
+    let key = view.row.rowid as usize;
     use MsgKind::*;
     let row = &view.row;
     let text = row.text.as_deref().filter(|s| !s.is_empty());
@@ -298,25 +412,25 @@ fn content(view: &MsgView, t: &Tokens) -> Div {
     match row.kind {
         Text => {
             if let Some(text) = text {
-                column = column.child(body_text(text, t));
+                column = column.child(body_text(view, text, t));
             }
         }
         Image => {
-            column = column.child(picture(view, t, None));
+            column = column.child(clickable(picture(view, t, None), ("media", key), &hooks.media));
             if let Some(text) = text {
-                column = column.child(body_text(text, t));
+                column = column.child(body_text(view, text, t));
             }
         }
         Video | VideoNote => {
-            column = column.child(picture(view, t, Some("play")));
+            column = column.child(clickable(picture(view, t, Some("play")), ("media", key), &hooks.media));
             if let Some(text) = text {
-                column = column.child(body_text(text, t));
+                column = column.child(body_text(view, text, t));
             }
         }
         Gif => {
-            column = column.child(picture(view, t, Some("film")));
+            column = column.child(clickable(picture(view, t, Some("film")), ("media", key), &hooks.media));
             if let Some(text) = text {
-                column = column.child(body_text(text, t));
+                column = column.child(body_text(view, text, t));
             }
         }
         Sticker => {
@@ -341,11 +455,15 @@ fn content(view: &MsgView, t: &Tokens) -> Div {
             } else {
                 "Audio"
             };
-            column = column.child(info_card(
-                if row.kind == Voice { "mic" } else { "music" },
-                title.to_string(),
-                duration(view.media.seconds),
-                t,
+            column = column.child(clickable(
+                info_card(
+                    if row.kind == Voice { "mic" } else { "music" },
+                    title.to_string(),
+                    duration(view.media.seconds),
+                    t,
+                ),
+                ("media", key),
+                &hooks.media,
             ));
         }
         Document => {
@@ -358,9 +476,13 @@ fn content(view: &MsgView, t: &Tokens) -> Div {
             if let Some(pages) = view.media.page_count.filter(|p| *p > 0) {
                 detail = format!("{pages} pages · {detail}");
             }
-            column = column.child(info_card("file-text", name.clone(), detail, t));
+            column = column.child(clickable(
+                info_card("file-text", name.clone(), detail, t),
+                ("media", key),
+                &hooks.media,
+            ));
             if let Some(caption) = text.filter(|c| *c != name) {
-                column = column.child(body_text(caption, t));
+                column = column.child(body_text(view, caption, t));
             }
         }
         Revoked => {
@@ -477,7 +599,7 @@ fn notice_row(view: &MsgView, text: &str, t: &Tokens) -> AnyElement {
 }
 
 /// Draws one message row.
-pub fn message_row(view: &MsgView, cx: &App) -> AnyElement {
+pub fn message_row(view: &MsgView, hooks: &RowHooks, cx: &App) -> AnyElement {
     let t = tokens(cx);
     let row = &view.row;
 
@@ -531,7 +653,7 @@ pub fn message_row(view: &MsgView, cx: &App) -> AnyElement {
                     .absolute()
                     .left(px(16.))
                     .top(px(if view.quote.is_some() { 22. } else { 2. }))
-                    .child(avatar(&view.author_seed, &view.author, 32., None, cx)),
+                    .child(avatar(&view.author_seed, &view.author, 32., view.avatar.clone(), cx)),
             )
             .child(
                 div()
@@ -589,7 +711,7 @@ pub fn message_row(view: &MsgView, cx: &App) -> AnyElement {
         );
     }
 
-    let mut body = content(view, t);
+    let mut body = content(view, hooks, t);
     if row.edited {
         body = body.child(
             div()
