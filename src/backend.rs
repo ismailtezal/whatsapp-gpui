@@ -105,6 +105,10 @@ impl Backend {
 /// alone, so that a test run never sends anything the test did not ask for.
 pub static HOLD_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Raised when this device has been logged out (here, or from the phone): the
+/// connection loop then forgets the account and starts a fresh link.
+static RELINK: std::sync::LazyLock<tokio::sync::Notify> = std::sync::LazyLock::new(tokio::sync::Notify::new);
+
 /// Whether the connection is up. Sends wait on this instead of failing while the app is
 /// still connecting or the network is briefly away.
 static ONLINE: std::sync::LazyLock<tokio::sync::watch::Sender<bool>> =
@@ -138,14 +142,26 @@ async fn run(
         while commands.recv().await.is_some() {}
         return Ok(());
     }
-    let session = SqliteStore::open(&crate::paths::session_db().to_string_lossy())
+    let mut session = SqliteStore::open(&crate::paths::session_db().to_string_lossy())
         .await
         .context("opening the session store")?;
+    // Development aid: WA_TEST_RELINK=<seconds> behaves, once, as if the device had been
+    // logged out after that long, to check the way back to the pairing code.
+    if let Some(seconds) = std::env::var("WA_TEST_RELINK").ok().and_then(|value| value.parse::<u64>().ok()) {
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+            RELINK.notify_one();
+        });
+    }
+
+    // One pass of this loop is one link: it ends when the app quits, or when the device
+    // is logged out, after which the account is forgotten and a fresh link begins.
+    loop {
 
     let handler_store = store.clone();
     let handler_events = events.clone();
     let bot = Bot::builder()
-        .with_backend(session)
+        .with_backend(session.clone())
         // Same pairing shape as the Windows desktop client, so the phone sends the full
         // chat history (up to a year) instead of only recent messages.
         .with_device_props(
@@ -171,8 +187,16 @@ async fn run(
                         replay_account_state_once(client.clone(), store.clone());
                         resend_pending_once(client.clone(), store.clone(), events.clone());
                     }
-                    Event::Disconnected(_) | Event::LoggedOut(_) => {
+                    Event::Disconnected(_) => {
                         ONLINE.send_replace(false);
+                    }
+                    Event::LoggedOut(out) => {
+                        ONLINE.send_replace(false);
+                        // Unlinked for good (not a ban or a lock): start over.
+                        use whatsapp_rust::wacore::types::events::ConnectFailureReason as Reason;
+                        if matches!(out.reason, Reason::LoggedOut | Reason::UnknownLogout) {
+                            RELINK.notify_one();
+                        }
                     }
                     _ => {}
                 }
@@ -217,7 +241,18 @@ async fn run(
     // each chat has a lane. Everything else runs side by side.
     let mut lanes: std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<Command>> =
         std::collections::HashMap::new();
-    while let Some(command) = commands.recv().await {
+    let mut logged_out = false;
+    loop {
+        let command = tokio::select! {
+            command = commands.recv() => match command {
+                Some(command) => command,
+                None => break,
+            },
+            _ = RELINK.notified() => {
+                logged_out = true;
+                break;
+            }
+        };
         if matches!(command, Command::Shutdown) {
             break;
         }
@@ -250,7 +285,43 @@ async fn run(
         tokio::spawn(async move { run_command(&client, &store, &events, command).await });
     }
     let _ = handle.shutdown().await;
-    Ok(())
+    if !logged_out {
+        return Ok(());
+    }
+
+    // Logged out. The account's chats leave this PC, as with the official client, and
+    // the device's keys are replaced, so that the next pass shows a code to link with.
+    drop(lanes);
+    drop(avatar_tx);
+    ONLINE.send_replace(false);
+    if let Ok(mut own) = OWN_JID.write() {
+        *own = None;
+    }
+    let _ = events.send(UiEvent::Connection(ConnState::LoggedOut)).await;
+    if let Err(error) = store.forget_account() {
+        let _ = events
+            .send(UiEvent::Error(format!("The chats could not be removed: {error:#}")))
+            .await;
+    }
+    // Downloaded media, pictures, saved history and backups belong to the account too.
+    for folder in [
+        crate::paths::media_dir(),
+        crate::paths::avatar_dir(),
+        crate::paths::history_dir(),
+        crate::paths::data_dir().join("backups"),
+    ] {
+        let _ = std::fs::remove_dir_all(&folder);
+        let _ = std::fs::create_dir_all(&folder);
+    }
+    let _ = events.send(UiEvent::ChatsChanged).await;
+    session = session
+        .database()
+        .reset_device(1)
+        .await
+        .map_err(|error| anyhow!("starting a fresh link: {error}"))?;
+    // A second "logged out" for the link that just ended must not end the new one.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(1), RELINK.notified()).await;
+    }
 }
 
 /// Runs one command and tells the interface if it failed.
@@ -911,8 +982,10 @@ async fn execute(
         }
 
         Command::Logout => {
+            // Unlinks this device on the server; the connection loop then forgets the
+            // account and shows a new code.
             let _ = client.logout().await;
-            let _ = events.send(UiEvent::Connection(ConnState::LoggedOut)).await;
+            RELINK.notify_one();
         }
 
         Command::Star { chat, id, starred } => {

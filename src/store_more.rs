@@ -399,3 +399,40 @@ impl Store {
         })
     }
 }
+
+impl Store {
+    /// Removes everything that belongs to the linked account: chats, messages, contacts,
+    /// calls and the rest. Only how the app looks is kept. Called when the device is
+    /// logged out, as the official client does; the file is compacted afterwards so that
+    /// nothing readable is left in it.
+    pub fn forget_account(&self) -> Result<()> {
+        self.batch(|tx| {
+            for table in [
+                "messages",
+                "chats",
+                "contacts",
+                "lid_map",
+                "reactions",
+                "receipts",
+                "group_members",
+                "calls",
+                "poll_votes",
+                "pins",
+                "channel_ids",
+            ] {
+                tx.conn.execute(&format!("DELETE FROM {table}"), [])?;
+            }
+            tx.conn.execute(
+                "DELETE FROM kv WHERE key NOT IN
+                    ('style', 'theme', 'palette', 'backdrop', 'notifications', 'emoji-recent')",
+                [],
+            )?;
+            Ok(())
+        })?;
+        self.read(|conn| {
+            let _ = conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')", []);
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);");
+            Ok(())
+        })
+    }
+}

@@ -46,7 +46,8 @@ impl AssetSource for Assets {
 pub fn run() {
     // Only one copy may run: a second one shows the first and leaves. Test copies, which
     // never connect, are exempt.
-    if std::env::var("WA_OFFLINE").is_err() && !crate::tray::claim_single_instance() {
+    let test_copy = std::env::var("WA_OFFLINE").is_ok() || std::env::var_os("WA_DATA_DIR").is_some();
+    if !test_copy && !crate::tray::claim_single_instance() {
         return;
     }
     // Opens the chat database, repairing it first if it is damaged.

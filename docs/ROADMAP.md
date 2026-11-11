@@ -146,7 +146,7 @@ tried without touching someone else or changing the account.
 | Privacy | Verified (call) / Built (screen) | Each setting is a row of choices. The change call was exercised live by re-applying a current value. A custom "my contacts except…" list made on the phone is shown but cannot be edited here. Default message timer for new chats: built. |
 | Blocked contacts | Partial | Listed; unblock is built but not exercised. |
 | Dark / light, data folder | Verified (shown) | |
-| Log out | Built | Not pressed. |
+| Log out | Verified (on a scratch copy) / Built (real unlink) | Logging out (two clicks in Settings) unlinks the device, removes the account's chats, media, pictures, saved history and backups from this PC (the look of the app is kept), replaces the device keys and shows a new code to link with, without a restart. The same happens when the phone unlinks the device. Before, the old session and every chat stayed on disk, so no code could appear. Checked with a simulated log out on a scratch folder: chats gone, a new and different code shown. A real unlink has not been run through the new path. |
 | Notification settings | Built | One switch for message notifications; chats can also be muted one by one. No choice of sound, no previews on or off. |
 | Notifications | Built | Windows notification for a new message when its chat is not in front; clicking opens the chat. No real incoming message has triggered one yet. |
 | Tray icon | Verified (icon) / Built (behaviour) | The icon was added, updated and removed on this PC. Built and not watched: a click brings the window back; its menu has Open and Quit; closing the window keeps the app running behind it (a setting, on by default). |

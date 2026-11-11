@@ -517,6 +517,19 @@ impl Shell {
         let _perf = crate::perf::scope("shell.event");
         match event {
             UiEvent::Connection(state) => {
+                if state == ConnState::LoggedOut {
+                    // The account is gone from this PC: nothing of it stays on screen.
+                    self.selected = None;
+                    self.chat = None;
+                    self.chat_menu = None;
+                    self.status_open = None;
+                    self.me_jid = None;
+                    self.qr = None;
+                    self.section = Section::Chats;
+                    self.titles.borrow_mut().clear();
+                    self.mention_names.borrow_mut().clear();
+                    self.stale_chats = true;
+                }
                 if state == ConnState::Online {
                     // Groups whose name never arrived get it fetched now.
                     for chat in self
@@ -2258,7 +2271,11 @@ impl Shell {
                                 .cursor_pointer()
                                 .bg(Tokens::with_alpha(t.destructive, if confirm { 1.0 } else { 0.14 }))
                                 .text_color(if confirm { gpui::white() } else { t.destructive })
-                                .child(if confirm { "Click again to log out" } else { "Log out" })
+                                .child(if confirm {
+                                    "Click again: logs out and removes the chats from this PC"
+                                } else {
+                                    "Log out"
+                                })
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     if this.confirm_logout {
                                         this.backend.send(Command::Logout);
@@ -2297,8 +2314,13 @@ impl Shell {
             ),
             (ConnState::LoggedOut, _) => (
                 "Logged out",
-                "This device was unlinked. Restart the app to link it again.",
+                "This device was unlinked and its chats were removed from this PC. A code to link it again appears here in a moment.",
             ),
+            (ConnState::Pairing, None) | (ConnState::Starting, _) | (ConnState::Connecting, _)
+                if self.chats.is_empty() && self.me_jid.is_none() =>
+            {
+                ("Getting ready", "Connecting to WhatsApp…")
+            }
             _ => (
                 "WhatsApp for Windows",
                 "Select a chat to start messaging. Your messages are end-to-end encrypted.",

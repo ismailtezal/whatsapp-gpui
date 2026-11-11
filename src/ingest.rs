@@ -607,6 +607,22 @@ mod tests {
     }
 
     #[test]
+    fn logging_out_forgets_the_account_but_not_the_look() {
+        let store = temp_store("forget");
+        apply(&store, &inbound(ADA, ADA, false, "MSG1", text("hello there")));
+        store.set_kv("style", "liquid").expect("style");
+        store.set_kv("account_state_replayed", "1").expect("flag");
+        store.forget_account().expect("forget");
+        assert!(store.messages(ADA, None, 10).expect("messages").is_empty());
+        assert!(store.chats(false).expect("chats").is_empty());
+        assert_eq!(store.kv("style").expect("style").as_deref(), Some("liquid"));
+        assert_eq!(store.kv("account_state_replayed").expect("flag"), None);
+        // The store still works for the next account.
+        apply(&store, &inbound(ADA, ADA, false, "MSG2", text("after linking again")));
+        assert_eq!(store.messages(ADA, None, 10).expect("messages").len(), 1);
+    }
+
+    #[test]
     fn a_message_from_our_other_device_does_not_count_as_unread() {
         let store = temp_store("own");
         let updates = apply(&store, &inbound(ADA, ADA, true, "MSG1", text("sent from my phone")));

@@ -112,6 +112,10 @@ connection. Windows only. Private now, open source later.
   scrolling, frame timing); see `vendor/README.md`.
 - Development aids: `WA_OPEN_CHAT`, `WA_SECTION` (calls, status, starred, settings,
   archived), `WA_INFO`, `WA_STYLE`, `WA_THEME`, `WA_PALETTE`.
+- `WA_TEST_RELINK=<seconds>` behaves once as if the device had been logged out, to check the
+  way back to the pairing code. Use it only with `WA_DATA_DIR` pointing at a scratch folder:
+  a log out erases the chats, media and backups of the data folder in use. A copy started
+  with `WA_DATA_DIR` may run beside the real app (it skips the single-instance check).
 - More development aids: `WA_STAGE=<file>` stages a file as if attached and `WA_EDIT=1` opens
   the photo editor on it; `WA_SLOWMO=<factor>` stretches every animation. `scripts/type.ps1`
   (text and keys), `scripts/drag.ps1`, `scripts/click.ps1 -Middle` and `scripts/crop.ps1`
