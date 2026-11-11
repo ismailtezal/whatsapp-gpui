@@ -95,7 +95,8 @@ connection. Windows only. Private now, open source later.
   this PC, so the installer is only built in CI.
 - Interface styles (Modern, Glass, Liquid Glass, Futuristic) live in `src/ui/theme.rs`
   as `Style`; `WA_STYLE`, `WA_BACKDROP`, `WA_PALETTE` and `WA_THEME` override the stored
-  choice for a dev run. `WA_FAKE_CALL=ringing|calling|connected` shows the call card.
+  choice for a dev run. `WA_FAKE_CALL=ringing|calling|connected` shows the call card; `WA_PLAY_VIDEO=1` opens
+  the newest downloaded video of the opened chat in the viewer.
 - `whatsapp-rust` is built with its `voip` feature, which compiles the native Opus
   library with CMake. On this PC CMake came from winget and `.cargo/config.toml` (not
   committed) points Cargo at it.

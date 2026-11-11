@@ -277,7 +277,22 @@ if view.chat.kind == ChatKind::Newsletter {
                 older: false,
             });
         }
-        view.reload(cx);
+view.reload(cx);
+        // Development aid: WA_PLAY_VIDEO=1 opens the newest downloaded video of the chat
+        // in the viewer, so its controls can be checked without clicking through.
+        if std::env::var("WA_PLAY_VIDEO").is_ok() {
+            let newest = view.items.iter().rev().find_map(|item| match item {
+                Item::Msg(message) if message.row.kind == MsgKind::Video => message
+                    .row
+                    .media_path
+                    .clone()
+                    .map(|path| (message.row.id.clone(), PathBuf::from(path))),
+                _ => None,
+            });
+            if let Some((id, path)) = newest {
+                view.pending_video = Some((id, path, false));
+            }
+        }
         if view.chat.kind != ChatKind::User {
             // Members are needed for @-mentions; ask the server for the current list.
             view.backend.send(Command::RefreshGroup {
