@@ -790,14 +790,21 @@ pub enum Surface {
 }
 
 impl Tokens {
-    /// Whether surfaces are drawn as real glass (blurred and refracted by the renderer).
+    /// Whether floating controls are drawn as real glass (lenses made by the renderer).
     pub fn liquid(&self) -> bool {
         self.style == Style::Liquid
     }
 
-    /// The fill of a surface. In the Liquid Glass style this is real glass: the surface
-    /// shows a blurred copy of what lies beneath, bent at its rim. In the other styles
-    /// it is the plain colour given as `solid`.
+    /// The fill of a surface. In the other styles it is the plain colour given as
+    /// `solid`. In the Liquid Glass style there are two layers, as in Apple's design:
+    ///
+    /// - Content (`Surface::Panel`: the chat list, the conversation) lies on a plain
+    ///   translucent sheet. Only Windows can blur what is behind the window, so a sheet
+    ///   is all a panel can honestly be.
+    /// - Controls that float above content (`Bar`, `Chip`, `Menu`) are lenses: the
+    ///   renderer shows what the app painted beneath them, nearly unblurred, bent hard
+    ///   in a curved bezel, with the colours parting there and light on the rim. The
+    ///   lensing, not blur, is what makes the material. Glass never lies on glass.
     pub fn surface(&self, kind: Surface, solid: Hsla) -> gpui::Background {
         if !self.liquid() {
             return solid.into();
@@ -808,58 +815,51 @@ impl Tokens {
         } else {
             hsla(220. / 360., 0.35, 0.98, 1.)
         };
-        // Over a see-through window the glass carries more of its own colour, or text
-        // would be lost against whatever is on the desktop.
-        // A clear window shows whatever is on the desktop, sharp, so surfaces that hold
-        // text must be dense enough to read over anything; the bars stay lighter.
-        let extra = match (self.backdrop, kind) {
-            (Backdrop::Solid, _) => 0.,
-            (Backdrop::Frosted, _) => 0.09,
-            (Backdrop::Clear, Surface::Panel) => 0.30,
-            (Backdrop::Clear, Surface::Menu) => 0.24,
-            (Backdrop::Clear, Surface::Bar | Surface::Chip) => 0.28,
-        };
-        let tint = |a: f32| Hsla {
-            a: (a + extra).min(0.92),
-            ..base
-        };
-        let rim = hsla(0., 0., 1., if self.dark { 0.55 } else { 0.95 });
+        let tint = |a: f32| Hsla { a, ..base };
+        let rim = hsla(0., 0., 1., if self.dark { 0.80 } else { 0.98 });
         let spec = match kind {
-            Surface::Panel => gpui::Glass {
-                tint: tint(if self.dark { 0.52 } else { 0.50 }),
-                blur: 36.,
-                refraction: 26.,
-                bevel: 20.,
-                highlight: Hsla { a: rim.a * 0.75, ..rim },
-                dispersion: 0.10,
-                saturation: 1.5,
-            },
+            Surface::Panel => {
+                // A clear window shows the desktop sharp, so the sheet must be dense
+                // enough to read text over anything; less so once something softens it.
+                let density = match (self.backdrop, self.dark) {
+                    (Backdrop::Clear, true) => 0.80,
+                    (Backdrop::Clear, false) => 0.84,
+                    (Backdrop::Frosted, true) => 0.58,
+                    (Backdrop::Frosted, false) => 0.64,
+                    (Backdrop::Solid, true) => 0.46,
+                    (Backdrop::Solid, false) => 0.52,
+                };
+                return tint(density).into();
+            }
+            // The bars over a conversation: clear, so the messages are seen sliding
+            // beneath, and bent hard at the rim.
             Surface::Bar => gpui::Glass {
-                tint: tint(if self.dark { 0.34 } else { 0.38 }),
+                tint: tint(if self.dark { 0.36 } else { 0.40 }),
                 blur: 4.5,
-                refraction: 38.,
-                bevel: 17.,
+                refraction: 30.,
+                bevel: 16.,
                 highlight: rim,
-                dispersion: 0.22,
-                saturation: 1.6,
+                dispersion: 0.20,
+                saturation: 1.25,
             },
+            // Menus hold text over anything: the "regular" glass, denser and softer.
             Surface::Menu => gpui::Glass {
-                tint: tint(if self.dark { 0.66 } else { 0.70 }),
-                blur: 26.,
-                refraction: 18.,
-                bevel: 12.,
-                highlight: Hsla { a: rim.a * 0.8, ..rim },
-                dispersion: 0.10,
-                saturation: 1.5,
+                tint: tint(if self.dark { 0.58 } else { 0.66 }),
+                blur: 9.,
+                refraction: 24.,
+                bevel: 14.,
+                highlight: Hsla { a: rim.a * 0.85, ..rim },
+                dispersion: 0.14,
+                saturation: 1.3,
             },
             Surface::Chip => gpui::Glass {
-                tint: tint(if self.dark { 0.30 } else { 0.36 }),
-                blur: 4.,
-                refraction: 16.,
-                bevel: 10.,
+                tint: tint(if self.dark { 0.24 } else { 0.30 }),
+                blur: 2.,
+                refraction: 12.,
+                bevel: 8.,
                 highlight: rim,
-                dispersion: 0.14,
-                saturation: 1.6,
+                dispersion: 0.16,
+                saturation: 1.25,
             },
         };
         gpui::glass(spec)

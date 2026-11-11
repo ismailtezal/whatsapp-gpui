@@ -888,7 +888,7 @@ impl Shell {
                     .ml(px(8.))
                     .mb(px(8.))
                     .rounded(px(22.))
-                    .bg(t.surface(Surface::Bar, t.rail))
+                    .bg(t.surface(Surface::Panel, t.rail))
             })
             .flex()
             .flex_col()

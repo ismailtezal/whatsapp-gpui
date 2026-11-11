@@ -18,8 +18,11 @@ marked with a `whatsapp-gpui patch` comment. Search for that phrase to list them
   other quads, with their lengths converted to device pixels.
 - `gpui-pre-windows/src/directx_renderer.rs`: before a glass quad is drawn, the frame so
   far is copied into a mip-mapped texture (`Backdrop`) and bound to the quad shader.
-- `gpui-pre-windows/src/shaders.hlsl`: `glass_fragment` blurs that copy, bends it near
-  the edge of the shape, splits the colours slightly in the rim, and adds a lit edge.
+- `gpui-pre-windows/src/shaders.hlsl`: `glass_fragment` treats the quad as a lens: flat in
+  the middle (the copy shows through nearly unblurred), with a squircle bezel that bends
+  the copy by Snell's law, parts the colours slightly, catches the light, and carries a
+  hairline of light on two opposite sides. The tint thickens where the neighbourhood
+  underneath (a small mip of the copy) is far from the glass's own lightness.
 
 Glass is drawn only by the Windows DirectX renderer. This app is Windows only.
 

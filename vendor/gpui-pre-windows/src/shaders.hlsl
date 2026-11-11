@@ -561,9 +561,11 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
 
 // whatsapp-gpui patch: glass quads (Background tag 4).
 //
-// A glass quad shows what was painted below it: blurred, bent near the edge as if seen
-// through the rounded rim of a thick pane, with the colours slightly split in the rim
-// and a line of light on the edge.
+// A glass quad shows what was painted below it through a lens: barely blurred and
+// undistorted in its flat middle, squeezed and bent in a curved bezel, with the colours
+// parting slightly there, a bezel that catches the light, and hairlines of light on
+// two opposite sides of the edge. This follows Apple's Liquid Glass, where the lensing
+// (not the blur) is what makes the material.
 
 // A blurred read of the frame below. The disc of taps is taken from a smaller mip
 // level, so sixteen taps cover a wide radius smoothly.
@@ -605,30 +607,51 @@ float4 glass_fragment(Quad quad, float2 pt, float4 tint) {
     float slope_length = length(slope);
     float2 normal = slope_length > 0.0001 ? slope / slope_length : float2(0.0, 0.0);
 
-    // The rim is a quarter circle in profile: flat past the bevel, steep at the edge.
-    float rim = 1.0 - saturate(-sdf / bevel);
-    float bend = 1.0 - sqrt(max(1.0 - rim * rim, 0.0));
+    // The pane is a lens: flat in the middle, with a bezel that curves down to the
+    // edge like a squircle. A ray looking straight in is bent by that curve (Snell's
+    // law, glass against air), so the bezel shows what lies further inside the shape,
+    // squeezed, while the flat middle shows what is under it undistorted.
+    float depth = -sdf;
+    float bezel = min(bevel, 0.5 * min(quad.bounds.size.x, quad.bounds.size.y));
+    float rim = saturate(1.0 - depth / max(bezel, 1.0));  // 1 at the edge, 0 where it is flat
+    float incidence = asin(min(rim * rim, 0.999));
+    float refracted = asin(sin(incidence) / 1.5);
+    float bend = tan(incidence - refracted);              // 0 in the middle, about 1.1 at the edge
     float2 shift = -normal * bend * refraction;
 
-    float4 below = glass_backdrop(pt + shift, blur);
+    // Less blur in the bezel, where the picture is already squeezed.
+    float soft = blur * (1.0 - 0.4 * rim);
+    float4 below = glass_backdrop(pt + shift, soft);
     float3 color = below.rgb;
     if (dispersion > 0.001 && bend > 0.002) {
-        color.r = glass_backdrop(pt + shift * (1.0 + dispersion), blur).r;
-        color.b = glass_backdrop(pt + shift * (1.0 - dispersion), blur).b;
+        // Colours part in the bezel: red is bent a little less than blue.
+        color.r = glass_backdrop(pt + shift * (1.0 - dispersion), soft).r;
+        color.b = glass_backdrop(pt + shift * (1.0 + dispersion), soft).b;
     }
 
     float luma = dot(color, GRAYSCALE_FACTORS);
     color = max(lerp(float3(luma, luma, luma), color, saturation), float3(0.0, 0.0, 0.0));
-    color = lerp(color, tint.rgb, tint.a);
+    // The glass adapts to what is under it: where the neighbourhood is far from the
+    // glass's own lightness (dark photos under milky glass, bright ones under smoked
+    // glass) it takes on more of its tint, so what is written on it stays readable.
+    float around = dot(t_backdrop.SampleLevel(s_backdrop, pt / global_viewport_size, 5.0).rgb, GRAYSCALE_FACTORS);
+    float apart = smoothstep(0.25, 0.75, abs(around - dot(tint.rgb, GRAYSCALE_FACTORS)));
+    float density = lerp(tint.a, max(tint.a, min(tint.a + 0.34, 0.90)), apart);
+    color = lerp(color, tint.rgb, density);
 
-    // Light gathered in the rim, then a bright line on the edge itself: strongest
-    // where the edge faces the light (top left), fainter on the opposite side.
-    color += highlight.rgb * (highlight.a * 0.10 * bend);
-    float facing = dot(normal, float2(-0.55, -0.83));
-    float lit = pow(abs(facing), 1.5) * (facing > 0.0 ? 1.0 : 0.55);
-    float line_width = max(bevel * 0.12, 1.25);
-    float edge = saturate(1.0 + sdf / line_width);
-    float glint = edge * edge * (0.2 + 0.8 * lit) * highlight.a;
+    // The light comes from the upper left.
+    float facing = dot(normal, float2(-0.6, -0.8));
+    // The glass has thickness: its bezel is a little brighter where it faces the light
+    // and a little darker on the far side, and it whitens slightly toward the edge.
+    float body = rim * rim;
+    color += highlight.rgb * (highlight.a * (0.05 * body + 0.10 * body * saturate(facing)));
+    color *= 1.0 - 0.22 * body * saturate(-facing);
+
+    // A hairline of light on the edge itself: strongest where the edge faces the
+    // light, answered by a weaker one on the opposite side, nearly gone in between.
+    float lit = pow(abs(facing), 1.7) * (facing > 0.0 ? 1.0 : 0.6);
+    float hairline = saturate(1.0 - depth / 1.5);
+    float glint = hairline * hairline * (0.20 + 0.80 * lit) * highlight.a;
     color = lerp(color, highlight.rgb, saturate(glint));
 
     // Over a see-through window the frame below may itself be transparent.
