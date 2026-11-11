@@ -708,6 +708,96 @@ async fn execute(
             notify(events, &chat).await;
         }
 
+        Command::CreateGroup { subject, members } => {
+            use whatsapp_rust::{GroupCreateOptions, GroupParticipantOptions};
+            let mut options = GroupCreateOptions::new(subject.clone());
+            for member in &members {
+                options = options.with_participant(GroupParticipantOptions::from_phone(jid(member)?));
+            }
+            let created = client
+                .groups()
+                .create_group(options)
+                .await
+                .map_err(|error| anyhow!("could not create the group: {error}"))?;
+            let group = created.metadata.id.to_non_ad_string();
+            store.batch(|tx| {
+                tx.patch_chat(
+                    &group,
+                    &ChatPatch {
+                        name: Some(subject.clone()),
+                        last_ts: Some(now_secs()),
+                        created_at: Some(now_secs()),
+                        ..Default::default()
+                    },
+                )?;
+                for member in &created.metadata.participants {
+                    let person = member
+                        .phone_number
+                        .as_ref()
+                        .unwrap_or(&member.jid)
+                        .to_non_ad_string();
+                    tx.put_group_member(&group, &person, if member.is_admin() { 1 } else { 0 })?;
+                }
+                Ok(())
+            })?;
+            notify(events, &group).await;
+        }
+
+        Command::SetSubject { chat, subject } => {
+            use whatsapp_rust::GroupSubject;
+            let validated = GroupSubject::new(subject.clone()).map_err(|error| anyhow!("{error}"))?;
+            client
+                .groups()
+                .set_subject(jid(&chat)?, validated)
+                .await
+                .map_err(|error| anyhow!("could not rename the group: {error}"))?;
+            store.patch_chat(
+                &chat,
+                &ChatPatch {
+                    name: Some(subject),
+                    ..Default::default()
+                },
+            )?;
+            notify(events, &chat).await;
+        }
+
+        Command::SetDescription { chat, description } => {
+            use whatsapp_rust::{GroupDescription, PreviousDescription};
+            let validated = match description.trim() {
+                "" => None,
+                text => Some(GroupDescription::new(text.to_string()).map_err(|error| anyhow!("{error}"))?),
+            };
+            client
+                .groups()
+                .set_description(jid(&chat)?, validated, PreviousDescription::Resolve)
+                .await
+                .map_err(|error| anyhow!("could not change the description: {error}"))?;
+            store.patch_chat(
+                &chat,
+                &ChatPatch {
+                    description: Some(description),
+                    ..Default::default()
+                },
+            )?;
+            notify(events, &chat).await;
+        }
+
+        Command::ChangeMembers { chat, members, change } => {
+            use crate::events::MemberChange;
+            let group = jid(&chat)?;
+            let people: Vec<Jid> = members.iter().map(|m| jid(m)).collect::<Result<_>>()?;
+            let groups = client.groups();
+            let outcome = match change {
+                MemberChange::Add => groups.add_participants(group, &people).await.map(|_| ()),
+                MemberChange::Remove => groups.remove_participants(group, &people).await.map(|_| ()),
+                MemberChange::Promote => groups.promote_participants(group, &people).await.map(|_| ()),
+                MemberChange::Demote => groups.demote_participants(group, &people).await.map(|_| ()),
+            };
+            outcome.map_err(|error| anyhow!("could not change the members: {error}"))?;
+            // Read the result back from the server rather than guessing it.
+            Box::pin(execute(client, store, events, Command::RefreshGroup { chat })).await?;
+        }
+
         Command::LoadOlder { chat } => {
             // The phone answers with a history-sync blob, which arrives as an event and is
             // imported like any other.

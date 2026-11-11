@@ -137,6 +137,18 @@ pub enum Command {
     /// Read a group's current subject, description and members from the server.
     RefreshGroup { chat: String },
     LeaveGroup { chat: String },
+    CreateGroup {
+        subject: String,
+        /// Phone-number JIDs of the people to add.
+        members: Vec<String>,
+    },
+    SetSubject { chat: String, subject: String },
+    SetDescription { chat: String, description: String },
+    ChangeMembers {
+        chat: String,
+        members: Vec<String>,
+        change: MemberChange,
+    },
     VotePoll {
         chat: String,
         id: String,
@@ -152,4 +164,13 @@ pub enum Command {
     },
     Logout,
     Shutdown,
+}
+
+/// A change to who is in a group or who administers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberChange {
+    Add,
+    Remove,
+    Promote,
+    Demote,
 }

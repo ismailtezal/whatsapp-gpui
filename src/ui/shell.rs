@@ -89,6 +89,10 @@ pub struct Shell {
     qr: Option<String>,
     last_error: Option<String>,
     confirm_logout: bool,
+    /// Picking several contacts for a new group instead of one to chat with.
+    group_mode: bool,
+    group_picks: Vec<String>,
+    group_name: Entity<InputState>,
     window_active: bool,
     _pump: Task<()>,
 }
@@ -104,6 +108,7 @@ impl Shell {
     pub fn new(backend: Backend, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = backend.store().clone();
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
+        let group_name = cx.new(|cx| InputState::new(window, cx).placeholder("Group name"));
         cx.subscribe_in(&search, window, |this, state, event: &InputEvent, _window, cx| {
             if matches!(event, InputEvent::Change) {
                 this.query = state.read(cx).value().to_string();
@@ -150,6 +155,9 @@ impl Shell {
             qr: None,
             last_error: None,
             confirm_logout: false,
+            group_mode: false,
+            group_picks: Vec::new(),
+            group_name,
             window_active: true,
             _pump: pump,
         };
@@ -872,6 +880,7 @@ impl Shell {
                         .child(contact.about.clone().unwrap_or_else(|| display_number(&contact.jid)))
                         .into_any_element();
                     let jid = contact.jid.clone();
+                    let picked = self.group_picks.contains(&contact.jid);
                     self.list_row(
                         SharedString::from(format!("contact-{slot}")),
                         &contact.jid,
@@ -879,12 +888,12 @@ impl Shell {
                         Some(&contact.jid),
                         String::new(),
                         detail,
-                        None,
-                        false,
+                        picked.then(|| icon("check").text_color(t.primary).into_any_element()),
+                        picked,
                         false,
                         cx,
                     )
-                    .on_click(cx.listener(move |this, _, window, cx| this.start_chat_with(&jid, window, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| this.pick_contact(&jid, window, cx)))
                     .into_any_element()
                 })
                 .collect();
@@ -1055,6 +1064,62 @@ impl Shell {
                             .prefix(icon("search").size(px(14.)).text_color(t.muted_foreground))
                             .cleanable(true),
                     ),
+                )
+            })
+            .when(self.picking, |this| {
+                let t = t.clone();
+                let hover = t.fg(0.09);
+                this.child(
+                    div()
+                        .px(px(12.))
+                        .pb(px(8.))
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(px(6.))
+                        .when(self.group_mode, |this| {
+                            this.child(div().flex_1().child(Input::new(&self.group_name)))
+                                .child(
+                                    div()
+                                        .id("create-group")
+                                        .h(px(32.))
+                                        .px(px(12.))
+                                        .rounded(R_LG)
+                                        .flex()
+                                        .flex_shrink_0()
+                                        .items_center()
+                                        .bg(t.primary)
+                                        .text_color(t.primary_foreground)
+                                        .text_size(px(13.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .cursor_pointer()
+                                        .child(format!("Create ({})", self.group_picks.len()))
+                                        .on_click(cx.listener(|this, _, _, cx| this.create_group(cx))),
+                                )
+                        })
+                        .when(!self.group_mode, |this| {
+                            this.child(
+                                div()
+                                    .id("new-group")
+                                    .h(px(32.))
+                                    .px(px(10.))
+                                    .rounded(R_LG)
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .bg(t.fg(0.06))
+                                    .text_size(px(13.))
+                                    .cursor_pointer()
+                                    .hover(move |style| style.bg(hover))
+                                    .child(icon("users").size(px(14.)))
+                                    .child("New group")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.group_mode = true;
+                                        this.group_picks.clear();
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
                 )
             })
             .when(show_filters, |this| {
@@ -1666,5 +1731,39 @@ impl Render for Shell {
                     ),
             )
             .children(chat_menu)
+    }
+}
+
+impl Shell {
+    /// A contact was clicked in the picker: start a chat, or toggle them for a new group.
+    fn pick_contact(&mut self, jid: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.group_mode {
+            self.start_chat_with(jid, window, cx);
+            return;
+        }
+        match self.group_picks.iter().position(|picked| picked == jid) {
+            Some(index) => {
+                self.group_picks.remove(index);
+            }
+            None => self.group_picks.push(jid.to_string()),
+        }
+        cx.notify();
+    }
+
+    fn create_group(&mut self, cx: &mut Context<Self>) {
+        let subject = self.group_name.read(cx).value().trim().to_string();
+        if subject.is_empty() {
+            self.last_error = Some("Give the group a name first.".to_string());
+            cx.notify();
+            return;
+        }
+        self.backend.send(Command::CreateGroup {
+            subject,
+            members: self.group_picks.clone(),
+        });
+        self.group_mode = false;
+        self.picking = false;
+        self.group_picks.clear();
+        cx.notify();
     }
 }

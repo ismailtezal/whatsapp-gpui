@@ -332,6 +332,59 @@ fn main() -> Result<()> {
             let tally: Vec<(usize, bool)> = view.options.iter().map(|o| (o.votes, o.mine)).collect();
             println!("voters={} tally(votes, mine)={tally:?}", view.voters);
         }
+        "mkgroup" => {
+            // Create an empty group (nobody else is added): wa-test mkgroup <subject>
+            let subject = args[1..].join(" ");
+            backend.send(Command::CreateGroup {
+                subject: subject.clone(),
+                members: Vec::new(),
+            });
+            std::thread::sleep(Duration::from_secs(5));
+            let created = store
+                .find_chats(&subject)?
+                .into_iter()
+                .find(|c| c.kind == ChatKind::Group);
+            match created {
+                Some(chat) => println!(
+                    "group created: jid_suffix={} members={}",
+                    chat.jid.rsplit('@').next().unwrap_or_default(),
+                    store.group_members(&chat.jid)?.len()
+                ),
+                None => println!("group was not created"),
+            }
+        }
+        "subject" => {
+            let chat = group(&store, &args[1])?;
+            let subject = args[2..].join(" ");
+            backend.send(Command::SetSubject {
+                chat: chat.clone(),
+                subject: subject.clone(),
+            });
+            std::thread::sleep(Duration::from_secs(4));
+            backend.send(Command::RefreshGroup { chat: chat.clone() });
+            std::thread::sleep(Duration::from_secs(3));
+            let title = store.chat(&chat)?.map(|c| c.title).unwrap_or_default();
+            println!("subject now matches: {}", title == subject);
+        }
+        "describe" => {
+            let chat = group(&store, &args[1])?;
+            let description = args[2..].join(" ");
+            backend.send(Command::SetDescription {
+                chat: chat.clone(),
+                description: description.clone(),
+            });
+            std::thread::sleep(Duration::from_secs(4));
+            backend.send(Command::RefreshGroup { chat: chat.clone() });
+            std::thread::sleep(Duration::from_secs(3));
+            let stored = store.chat_details(&chat)?.and_then(|(d, _, _)| d).unwrap_or_default();
+            println!("description now matches: {}", stored == description);
+        }
+        "leave" => {
+            let chat = group(&store, &args[1])?;
+            backend.send(Command::LeaveGroup { chat: chat.clone() });
+            std::thread::sleep(Duration::from_secs(4));
+            println!("leave sent for group");
+        }
         "listen" => {
             let seconds: u64 = args.get(1).and_then(|n| n.parse().ok()).unwrap_or(15);
             let mut counts = std::collections::BTreeMap::new();

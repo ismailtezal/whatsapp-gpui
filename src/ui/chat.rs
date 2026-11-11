@@ -107,6 +107,12 @@ pub struct ChatView {
     forward_targets: Vec<ChatRow>,
     /// ID of the own message whose receipts are being shown.
     info_for: Option<String>,
+    member_menu: Option<(String, Point<Pixels>)>,
+    adding_members: bool,
+    add_candidates: Vec<crate::model::ContactRow>,
+    confirm_leave: bool,
+    edit_field: Option<GroupField>,
+    edit_input: Entity<gpui_component::input::InputState>,
     info_open: bool,
     /// Group members as (JID, name, rank).
     members: Vec<(String, String, i32)>,
@@ -155,6 +161,7 @@ impl ChatView {
         })
         .detach();
 
+        let edit_input = cx.new(|cx| gpui_component::input::InputState::new(window, cx));
         let unread_at_open = chat.unread;
         let mut view = ChatView {
             backend,
@@ -183,6 +190,12 @@ impl ChatView {
             forwarding: None,
             forward_targets: Vec::new(),
             info_for: None,
+            member_menu: None,
+            adding_members: false,
+            add_candidates: Vec::new(),
+            confirm_leave: false,
+            edit_field: None,
+            edit_input,
             info_open: false,
             members: Vec::new(),
             gallery: Vec::new(),
@@ -194,6 +207,10 @@ impl ChatView {
         view.backend.send(Command::MarkRead {
             chat: view.chat.jid.clone(),
         });
+        // Development aid: start with the info panel open.
+        if std::env::var("WA_INFO").is_ok() {
+            view.toggle_info(cx);
+        }
         if view.chat.kind == ChatKind::User {
             view.backend.send(Command::WatchPresence {
                 jid: view.chat.jid.clone(),
@@ -1363,6 +1380,9 @@ impl Render for ChatView {
             .children(viewer)
             .children(self.forward_overlay(window, cx))
             .children(self.info_overlay(window, cx))
+            .children(self.group_edit_overlay(window, cx))
+            .children(self.add_members_overlay(window, cx))
+            .children(self.member_menu_overlay(window, cx))
             .children(menu)
             .children(emoji)
     }
@@ -1778,6 +1798,10 @@ impl ChatView {
                 )),
             );
 
+        if !is_person {
+            panel = panel.children(self.group_actions(cx));
+        }
+
         if !self.members.is_empty() {
             panel = panel.child(section("Members"));
             for (slot, (member, name, rank)) in self.members.iter().enumerate() {
@@ -1785,6 +1809,24 @@ impl ChatView {
                 panel = panel.child(
                     div()
                         .id(("member", slot))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener({
+                                let member = member.clone();
+                                move |this, event: &MouseDownEvent, _, cx| {
+                                    this.member_menu = Some((member.clone(), event.position));
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .on_click(cx.listener({
+                            let member = member.clone();
+                            move |this, event: &gpui::ClickEvent, _, cx| {
+                                this.member_menu = Some((member.clone(), event.position()));
+                                cx.notify();
+                            }
+                        }))
                         .min_h(px(52.))
                         .px(px(8.))
                         .py(px(6.))
@@ -2156,5 +2198,378 @@ impl ChatView {
             .with_priority(10)
             .into_any_element(),
         )
+    }
+}
+
+/// Which group text is being edited in the dialog.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GroupField {
+    Subject,
+    Description,
+}
+
+impl ChatView {
+    fn i_am_admin(&self) -> bool {
+        self.members
+            .iter()
+            .any(|(jid, _, rank)| *rank > 0 && self.me_jid.as_deref() == Some(jid.as_str()))
+    }
+
+    fn start_group_edit(&mut self, field: GroupField, window: &mut Window, cx: &mut Context<Self>) {
+        let current = match field {
+            GroupField::Subject => self.chat.title.clone(),
+            GroupField::Description => self
+                .store
+                .chat_details(&self.chat.jid)
+                .ok()
+                .flatten()
+                .and_then(|(description, _, _)| description)
+                .unwrap_or_default(),
+        };
+        self.edit_input.update(cx, |input, cx| {
+            input.set_value(current, window, cx);
+            input.focus(window, cx);
+        });
+        self.edit_field = Some(field);
+        cx.notify();
+    }
+
+    fn save_group_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(field) = self.edit_field.take() else {
+            return;
+        };
+        let text = self.edit_input.read(cx).value().trim().to_string();
+        match field {
+            GroupField::Subject if !text.is_empty() => {
+                self.chat.title = text.clone();
+                self.backend.send(Command::SetSubject {
+                    chat: self.chat.jid.clone(),
+                    subject: text,
+                });
+            }
+            GroupField::Description => self.backend.send(Command::SetDescription {
+                chat: self.chat.jid.clone(),
+                description: text,
+            }),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn change_member(&mut self, member: &str, change: crate::events::MemberChange, cx: &mut Context<Self>) {
+        self.backend.send(Command::ChangeMembers {
+            chat: self.chat.jid.clone(),
+            members: vec![member.to_string()],
+            change,
+        });
+        self.member_menu = None;
+        self.adding_members = false;
+        cx.notify();
+    }
+
+    /// A dimmed full-window layer with a centred dialog; clicking outside closes it.
+    fn dialog(
+        &self,
+        panel: gpui::Div,
+        window: &Window,
+        close: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        let size = window.viewport_size();
+        deferred(
+            anchored().position(point(px(0.), px(0.))).child(
+                div()
+                    .w(size.width)
+                    .h(size.height)
+                    .occlude()
+                    .bg(gpui::hsla(0., 0., 0., 0.55))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, close)
+                    .child(panel.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())),
+            ),
+        )
+        .with_priority(10)
+        .into_any_element()
+    }
+
+    fn dialog_panel(&self, title: &'static str, width: f32, cx: &App) -> gpui::Div {
+        let t = tokens(cx);
+        div()
+            .w(px(width))
+            .rounded(super::theme::R_2XL)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .shadow(t.shadow_dialog())
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(16.))
+                    .py(px(12.))
+                    .border_b_1()
+                    .border_color(t.border)
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+    }
+
+    /// Rename the group or edit its description.
+    fn group_edit_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let field = self.edit_field?;
+        let t = tokens(cx).clone();
+        let title = match field {
+            GroupField::Subject => "Rename group",
+            GroupField::Description => "Group description",
+        };
+        let panel = self.dialog_panel(title, 420., cx).child(
+            div()
+                .p(px(16.))
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(gpui_component::input::Input::new(&self.edit_input))
+                .child(
+                    div().flex().justify_end().child(
+                        div()
+                            .id("group-edit-save")
+                            .h(px(32.))
+                            .px(px(14.))
+                            .rounded(R_LG)
+                            .flex()
+                            .items_center()
+                            .bg(t.primary)
+                            .text_color(t.primary_foreground)
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .cursor_pointer()
+                            .child("Save")
+                            .on_click(cx.listener(|this, _, _, cx| this.save_group_edit(cx))),
+                    ),
+                ),
+        );
+        let close = cx.listener(|this, _: &MouseDownEvent, _, cx| {
+            this.edit_field = None;
+            cx.notify();
+        });
+        Some(self.dialog(panel, window, close))
+    }
+
+    /// Pick a saved contact to add to the group.
+    fn add_members_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.adding_members {
+            return None;
+        }
+        let t = tokens(cx).clone();
+        let already: Vec<&str> = self.members.iter().map(|(jid, _, _)| jid.as_str()).collect();
+        let mut rows = div()
+            .id("add-members-list")
+            .h(px(440.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .p(px(6.));
+        for (slot, contact) in self
+            .add_candidates
+            .iter()
+            .filter(|c| !already.contains(&c.jid.as_str()))
+            .enumerate()
+        {
+            let name = contact
+                .name
+                .clone()
+                .unwrap_or_else(|| crate::model::display_number(&contact.jid));
+            let hover = t.accent;
+            let member = contact.jid.clone();
+            rows = rows.child(
+                div()
+                    .id(("add-member", slot))
+                    .h(px(44.))
+                    .px(px(8.))
+                    .rounded(R_MD)
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap(px(10.))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .child(avatar(&contact.jid, &name, 28., crate::avatars::get(&contact.jid), cx))
+                    .child(div().truncate().text_size(px(14.)).child(SharedString::from(name)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.change_member(&member, crate::events::MemberChange::Add, cx)
+                    })),
+            );
+        }
+        let panel = self.dialog_panel("Add a member", 420., cx).child(rows);
+        let close = cx.listener(|this, _: &MouseDownEvent, _, cx| {
+            this.adding_members = false;
+            cx.notify();
+        });
+        Some(self.dialog(panel, window, close))
+    }
+
+    /// Right-click menu of a member in the info panel.
+    fn member_menu_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::events::MemberChange;
+        let (member, at) = self.member_menu.clone()?;
+        let t = tokens(cx).clone();
+        let rank = self
+            .members
+            .iter()
+            .find(|(jid, _, _)| *jid == member)
+            .map(|(_, _, rank)| *rank)
+            .unwrap_or(0);
+        let item = |slot: usize, name: &'static str, label: &'static str, danger: bool| {
+            let accent = t.accent;
+            let danger_fill = Tokens::with_alpha(t.destructive, if t.dark { 0.2 } else { 0.1 });
+            div()
+                .id(("member-menu-item", slot))
+                .h(px(32.))
+                .px(px(8.))
+                .rounded(R_MD)
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .text_size(px(14.))
+                .cursor_pointer()
+                .text_color(if danger { t.destructive } else { t.foreground })
+                .hover(move |style| style.bg(if danger { danger_fill } else { accent }))
+                .child(icon(name).text_color(if danger { t.destructive } else { t.muted_foreground }))
+                .child(label)
+        };
+        let open = member.clone();
+        let mut panel = div()
+            .w(px(224.))
+            .p(px(6.))
+            .rounded(R_XL)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .shadow(t.shadow_popover())
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                item(0, "message-square", "Message", false).on_click(cx.listener(move |this, _, _, cx| {
+                    this.member_menu = None;
+                    cx.emit(ChatEvent::OpenChat(open.clone()));
+                    cx.notify();
+                })),
+            );
+        if self.i_am_admin() && self.me_jid.as_deref() != Some(member.as_str()) {
+            let (label, change) = if rank > 0 {
+                ("Dismiss as admin", MemberChange::Demote)
+            } else {
+                ("Make group admin", MemberChange::Promote)
+            };
+            let target = member.clone();
+            panel = panel.child(
+                item(1, "shield", label, false)
+                    .on_click(cx.listener(move |this, _, _, cx| this.change_member(&target, change, cx))),
+            );
+            let target = member.clone();
+            panel = panel
+                .child(div().h(px(1.)).mx(px(-6.)).my(px(6.)).bg(t.border))
+                .child(item(2, "user-minus", "Remove from group", true).on_click(cx.listener(
+                    move |this, _, _, cx| this.change_member(&target, MemberChange::Remove, cx),
+                )));
+        }
+        let size = window.viewport_size();
+        let close = cx.listener(|this, _: &MouseDownEvent, _, cx| {
+            this.member_menu = None;
+            cx.notify();
+        });
+        Some(
+            deferred(
+                anchored().position(point(px(0.), px(0.))).child(
+                    div()
+                        .w(size.width)
+                        .h(size.height)
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, close)
+                        .child(anchored().position(at).snap_to_window_with_margin(px(8.)).child(panel)),
+                ),
+            )
+            .with_priority(10)
+            .into_any_element(),
+        )
+    }
+
+    /// The group-only rows of the info panel's action list.
+    fn group_actions(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let t = tokens(cx).clone();
+        let action = |id: &'static str, glyph: &'static str, label: &'static str, danger: bool| {
+            let hover = t.fg(0.06);
+            div()
+                .id(id)
+                .h(px(36.))
+                .px(px(8.))
+                .rounded(R_LG)
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(10.))
+                .text_size(px(14.))
+                .cursor_pointer()
+                .text_color(if danger { t.destructive } else { t.foreground })
+                .hover(move |style| style.bg(hover))
+                .child(icon(glyph).text_color(if danger { t.destructive } else { t.muted_foreground }))
+                .child(label)
+        };
+        let mut rows = Vec::new();
+        if self.i_am_admin() {
+            rows.push(
+                action("info-rename", "pencil", "Rename group", false)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.start_group_edit(GroupField::Subject, window, cx)
+                    }))
+                    .into_any_element(),
+            );
+            rows.push(
+                action("info-describe", "file-text", "Edit description", false)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.start_group_edit(GroupField::Description, window, cx)
+                    }))
+                    .into_any_element(),
+            );
+            rows.push(
+                action("info-add", "user-plus", "Add a member", false)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.adding_members = true;
+                        this.add_candidates = this.store.contacts().unwrap_or_default();
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        rows.push(
+            action(
+                "info-leave",
+                "log-out",
+                if self.confirm_leave {
+                    "Click again to leave"
+                } else {
+                    "Leave group"
+                },
+                true,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.confirm_leave {
+                    this.backend.send(Command::LeaveGroup {
+                        chat: this.chat.jid.clone(),
+                    });
+                    this.confirm_leave = false;
+                } else {
+                    this.confirm_leave = true;
+                }
+                cx.notify();
+            }))
+            .into_any_element(),
+        );
+        rows
     }
 }
