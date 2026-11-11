@@ -1538,11 +1538,12 @@ impl ChatView {
                 .children(self.recording_row(cx))
                 .child(
                     div()
-                        .when(self.recorder.is_some(), |this| this.hidden())
                         .p(px(6.))
                         .flex()
                         .items_end()
                         .gap(px(4.))
+                        // Hidden while recording (after `flex`, which would undo it).
+                        .when(self.recorder.is_some(), |this| this.hidden())
                         .child(
                             icon_button("attach", "plus", cx)
                                 .tooltip(tip("Attach files"))

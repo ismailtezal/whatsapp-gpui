@@ -106,6 +106,36 @@ pub enum Command {
         id: String,
         emoji: String,
     },
+    /// Post a status update: text on a coloured background, or a photo or video with
+    /// the text as its caption. `only_me` limits who receives it to this account's own
+    /// devices (used by tests, so nobody else is sent anything).
+    PostStatus {
+        text: String,
+        /// Background colour of a text status, as 0xAARRGGBB.
+        background: u32,
+        file: Option<std::path::PathBuf>,
+        only_me: bool,
+    },
+    /// Answer someone's status update; the answer goes to their chat.
+    ReplyStatus {
+        sender: String,
+        id: String,
+        text: String,
+    },
+    /// Change the name other people see.
+    SetProfileName { name: String },
+    /// Change the About line; an empty text removes it.
+    SetAbout { text: String },
+    /// Set the profile photo from a picture file, or remove it.
+    SetProfilePhoto { path: Option<std::path::PathBuf> },
+    /// Change one privacy setting. Both are the names the account info reports.
+    SetPrivacy { category: String, value: String },
+    /// The disappearing-message timer new chats start with; 0 turns it off.
+    SetDefaultTimer { seconds: u32 },
+    /// Take down one of our own status updates.
+    DeleteStatus { id: String },
+    /// Tell the poster their status update was seen.
+    SeenStatus { sender: String, id: String },
     Edit {
         chat: String,
         id: String,

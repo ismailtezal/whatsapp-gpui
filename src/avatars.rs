@@ -108,6 +108,39 @@ pub fn get(jid: &str) -> Option<PathBuf> {
 }
 
 /// Re-checks the disk for a JID after a fetch finished.
+/// Saves a picture as the one for `jid` (used for our own photo after changing it).
+pub fn store(jid: &str, bytes: &[u8]) -> Result<()> {
+    std::fs::write(picture_path(jid), bytes)?;
+    let _ = std::fs::remove_file(marker_path(jid));
+    refresh(jid);
+    Ok(())
+}
+
+/// Forgets the picture of `jid` (used after removing our own photo).
+pub fn forget(jid: &str) {
+    let _ = std::fs::remove_file(picture_path(jid));
+    refresh(jid);
+}
+
+/// A picture file as a profile photo: the centre square, 640 pixels, JPEG.
+pub fn profile_jpeg(path: &std::path::Path) -> Result<Vec<u8>> {
+    let picture = image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .decode()
+        .map_err(|error| anyhow!("that file is not a picture this app can read: {error}"))?;
+    let side = picture.width().min(picture.height());
+    let square = picture.crop_imm(
+        (picture.width() - side) / 2,
+        (picture.height() - side) / 2,
+        side,
+        side,
+    );
+    let sized = square.resize_exact(640, 640, image::imageops::FilterType::Lanczos3);
+    let mut bytes = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 88).encode_image(&sized.to_rgb8())?;
+    Ok(bytes)
+}
+
 pub fn refresh(jid: &str) {
     if let Ok(mut cache) = cache().lock() {
         let path = picture_path(jid);

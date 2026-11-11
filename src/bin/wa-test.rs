@@ -94,9 +94,11 @@ fn main() -> Result<()> {
     let store = Arc::new(Store::open_default()?);
     let backend = Backend::start(store.clone());
 
+    let mut own_name: Option<String> = None;
     wait_for(&backend, "connection", Duration::from_secs(40), |event| {
-        if let UiEvent::Identity { pn, lid, .. } = event {
+        if let UiEvent::Identity { pn, lid, push_name } = event {
             println!("identity: pn={} lid={}", pn.is_some(), lid.is_some());
+            own_name = Some(push_name.clone());
         }
         matches!(event, UiEvent::Connection(ConnState::Online))
     })?;
@@ -388,6 +390,105 @@ fn main() -> Result<()> {
             backend.send(Command::LeaveGroup { chat: chat.clone() });
             std::thread::sleep(Duration::from_secs(4));
             println!("leave sent for group");
+        }
+        "account" => {
+            // Exercise the profile and privacy calls without changing anything: set the
+            // name to the name it already is, and one privacy setting to its current value.
+            backend.send(Command::FetchAccountInfo);
+            let mut privacy = Vec::new();
+            wait_for(&backend, "account info", Duration::from_secs(30), |event| {
+                if let UiEvent::AccountInfo { privacy: settings, .. } = event {
+                    privacy = settings.clone();
+                    return true;
+                }
+                false
+            })?;
+            println!("privacy settings read: {}", privacy.len());
+            let settable = ["Last", "Profile", "Status", "GroupAdd", "ReadReceipts", "Messages"];
+            let simple = ["All", "Contacts", "None"];
+            if let Some((category, value)) = privacy
+                .iter()
+                .find(|(category, value)| settable.contains(&category.as_str()) && simple.contains(&value.as_str()))
+                .cloned()
+            {
+                backend.send(Command::SetPrivacy {
+                    category: category.clone(),
+                    value: value.clone(),
+                });
+                let mut after = Vec::new();
+                wait_for(&backend, "privacy change", Duration::from_secs(30), |event| match event {
+                    UiEvent::AccountInfo { privacy: settings, .. } => {
+                        after = settings.clone();
+                        true
+                    }
+                    UiEvent::Error(message) => {
+                        println!("privacy: {message}");
+                        true
+                    }
+                    _ => false,
+                })?;
+                let same = after.iter().any(|(c, v)| *c == category && *v == value);
+                println!("privacy setting re-applied with its own value: accepted={same}");
+            } else {
+                println!("no simple privacy setting to re-apply");
+            }
+            match own_name.clone().filter(|name| !name.is_empty()) {
+                Some(name) => {
+                    backend.send(Command::SetProfileName { name });
+                    let mut said = String::new();
+                    wait_for(&backend, "name change", Duration::from_secs(30), |event| {
+                        if let UiEvent::Error(message) = event {
+                            said = message.clone();
+                            return true;
+                        }
+                        false
+                    })?;
+                    println!("name re-applied with its own value: {said}");
+                }
+                None => println!("the account's name is not known; name call skipped"),
+            }
+        }
+        "status" => {
+            // Post a text status that only this account receives (nobody else is sent
+            // anything), check the server accepts it, then take it down again.
+            let text = format!("whatsapp-gpui status check {}", std::process::id());
+            backend.send(Command::PostStatus {
+                text: text.clone(),
+                background: 0xFF1E6E4F,
+                file: None,
+                only_me: true,
+            });
+            let chat = "status@broadcast".to_string();
+            let deadline = Instant::now() + Duration::from_secs(40);
+            let posted = loop {
+                if let Some(row) = store
+                    .status_updates(0)?
+                    .into_iter()
+                    .rev()
+                    .find(|row| row.from_me && row.text.as_deref() == Some(text.as_str()))
+                    && row.ack != whatsapp_gpui::model::Ack::Pending
+                {
+                    break row;
+                }
+                if Instant::now() > deadline {
+                    bail!("the status was not accepted in time");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            println!("posted status id={} ack={:?}", posted.id, posted.ack);
+            backend.send(Command::DeleteStatus { id: posted.id.clone() });
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let row = store.message(&chat, &posted.id)?;
+                if row.is_some_and(|row| row.kind == whatsapp_gpui::model::MsgKind::Revoked) {
+                    println!("status removed again");
+                    break;
+                }
+                if Instant::now() > deadline {
+                    bail!("the status was not removed in time");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
         }
         "voicenote" => {
             // Send a voice message made from a two-second tone (no microphone involved)

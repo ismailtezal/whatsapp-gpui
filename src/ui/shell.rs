@@ -9,7 +9,7 @@ use gpui::{
     Pixels, Point, SharedString, SystemNotification, Task, Window, WindowControlArea, anchored,
     deferred, div, point, px,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 
 use super::chat::{ChatEvent, ChatView};
 use super::theme::{COLUMN_W, HEADER_H, R_LG, R_MD, R_XL, RAIL_W, Surface, TITLE_BAR_H, Tokens, tokens};
@@ -31,6 +31,8 @@ enum RowKey {
     Hit(usize),
     Contact(usize),
     Status(usize),
+    /// "My status", shown when I have posted nothing in the last day.
+    MyStatus,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,6 +69,24 @@ impl Section {
             Section::Settings => "Settings",
         }
     }
+}
+
+/// A status update being written.
+struct StatusDraft {
+    /// Index into [`STATUS_COLORS`] for a text status.
+    background: usize,
+    /// A photo or video to post instead of text on a colour; the text becomes its caption.
+    file: Option<std::path::PathBuf>,
+}
+
+/// Background colours offered for a text status, as 0xAARRGGBB.
+const STATUS_COLORS: [u32; 8] = [
+    0xFF1E6E4F, 0xFF2C5F8D, 0xFF6B4BB5, 0xFFB5484B, 0xFFC27B2B, 0xFF2B8A8A, 0xFF5B5F6B, 0xFF8D2C5F,
+];
+
+/// The colour of a text status as it is stored in the message, for painting.
+fn argb_to_color(argb: u32) -> gpui::Hsla {
+    gpui::rgba(((argb & 0x00FF_FFFF) << 8) | 0xFF).into()
 }
 
 /// A person's status updates, oldest first.
@@ -106,6 +126,22 @@ pub struct Shell {
     /// Set by events; the lists are re-read once after a batch of events.
     stale_chats: bool,
     stale_open_chat: bool,
+    /// The name field must be refilled from the account (done at the next render, which
+    /// has the window an input needs).
+    profile_name_stale: bool,
+    /// Settings: the name and About fields.
+    profile_name: Entity<InputState>,
+    profile_about: Entity<InputState>,
+    /// The status being written, while the composer is open.
+    status_draft: Option<StatusDraft>,
+    status_text: Entity<TextareaState>,
+    status_reply: Entity<InputState>,
+    /// Status updates whose "seen" was already sent in this run.
+    status_seen: std::collections::HashSet<String>,
+    /// Whether the list of people who saw my status is unfolded.
+    status_viewers: bool,
+    /// Who saw the status on screen, read once per status rather than on every frame.
+    status_viewer_cache: std::cell::RefCell<Option<(String, Vec<(String, i64)>)>>,
     /// Names already looked up for rows (calls, search hits); cleared when chats change.
     titles: std::cell::RefCell<std::collections::HashMap<String, String>>,
     privacy: Vec<(String, String)>,
@@ -130,6 +166,20 @@ impl Shell {
         let store = backend.store().clone();
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let group_name = cx.new(|cx| InputState::new(window, cx).placeholder("Group name"));
+        let status_text = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 8)
+                .placeholder("Type a status")
+        });
+        let status_reply = cx.new(|cx| InputState::new(window, cx).placeholder("Reply"));
+        let profile_name = cx.new(|cx| InputState::new(window, cx).placeholder("Your name"));
+        let profile_about = cx.new(|cx| InputState::new(window, cx).placeholder("About (leave empty to remove it)"));
+        cx.subscribe_in(&status_reply, window, |this, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.send_status_reply(window, cx);
+            }
+        })
+        .detach();
         cx.subscribe_in(&search, window, |this, state, event: &InputEvent, _window, cx| {
             if matches!(event, InputEvent::Change) {
                 this.query = state.read(cx).value().to_string();
@@ -217,6 +267,15 @@ impl Shell {
             backdrop: None,
             stale_chats: false,
             stale_open_chat: false,
+            profile_name_stale: true,
+            profile_name,
+            profile_about,
+            status_draft: None,
+            status_text,
+            status_reply,
+            status_seen: Default::default(),
+            status_viewers: false,
+            status_viewer_cache: Default::default(),
             titles: Default::default(),
             privacy: Vec::new(),
             blocked: Vec::new(),
@@ -274,10 +333,15 @@ impl Shell {
     }
 
     fn reload_statuses(&mut self) {
+        self.status_viewer_cache.borrow_mut().take();
         // Statuses live for 24 hours.
         let rows = self.store.status_updates(now_secs() - 24 * 3600).unwrap_or_default();
         let mut groups: Vec<StatusGroup> = Vec::new();
         for row in rows {
+            // A status that was taken down is gone, not shown as "deleted".
+            if row.kind == MsgKind::Revoked {
+                continue;
+            }
             let sender = if row.from_me {
                 "me".to_string()
             } else {
@@ -301,7 +365,8 @@ impl Shell {
                 }
             }
         }
-        groups.sort_by_key(|g| std::cmp::Reverse(g.items.last().map(|r| r.ts).unwrap_or(0)));
+        // My own status first, then the most recent.
+        groups.sort_by_key(|g| (g.sender != "me", std::cmp::Reverse(g.items.last().map(|r| r.ts).unwrap_or(0))));
         self.statuses = groups;
     }
 
@@ -355,6 +420,7 @@ impl Shell {
                 self.me_jid = pn;
                 if !push_name.is_empty() {
                     self.me_name = push_name;
+                    self.profile_name_stale = true;
                 }
                 if let Some(view) = &self.chat {
                     let (name, jid) = (self.me_name.clone(), self.me_jid.clone());
@@ -987,10 +1053,14 @@ impl Shell {
                 (0..self.starred.len()).map(RowKey::Starred).collect(),
                 "No starred messages. Right-click a message and choose Star.",
             ),
-            Section::Status => (
-                (0..self.statuses.len()).map(RowKey::Status).collect(),
-                "No status updates in the last 24 hours.",
-            ),
+            Section::Status => {
+                let mut keys = Vec::new();
+                if !self.statuses.iter().any(|group| group.sender == "me") {
+                    keys.push(RowKey::MyStatus);
+                }
+                keys.extend((0..self.statuses.len()).map(RowKey::Status));
+                (keys, "")
+            }
             Section::Settings => (Vec::new(), ""),
             _ => {
                 let mut keys = Vec::new();
@@ -1080,6 +1150,23 @@ impl Shell {
                 .on_click(cx.listener(move |this, _, window, cx| this.pick_contact(&jid, window, cx)))
                 .into_any_element()
             }
+            RowKey::MyStatus => {
+                let detail = div().truncate().child("Add a status update").into_any_element();
+                self.list_row(
+                    SharedString::from("status-mine"),
+                    "me",
+                    "My status",
+                    self.me_jid.as_deref(),
+                    String::new(),
+                    detail,
+                    Some(icon("plus").text_color(t.primary).into_any_element()),
+                    self.status_draft.is_some(),
+                    false,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.open_status_composer(cx)))
+                .into_any_element()
+            }
             RowKey::Status(index) => {
                 let Some(group) = self.statuses.get(index) else {
                     return nothing();
@@ -1108,6 +1195,8 @@ impl Shell {
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.status_open = Some((index, 0));
+                    this.status_draft = None;
+                    this.status_viewers = false;
                     this.request_status_media();
                     cx.notify();
                 }))
@@ -1192,6 +1281,13 @@ impl Shell {
                             .text_color(t.foreground)
                             .child(title),
                     )
+                    .when(self.section == Section::Status, |this| {
+                        this.child(
+                            icon_button("new-status", "plus", cx)
+                                .tooltip(tip("New status"))
+                                .on_click(cx.listener(|this, _, _, cx| this.open_status_composer(cx))),
+                        )
+                    })
                     .when(self.section.lists_chats() && !self.picking, |this| {
                         this.child(
                             icon_button("new-chat", "square-pen", cx)
@@ -1434,6 +1530,17 @@ impl Shell {
         let Some((person, item)) = self.status_open else {
             return;
         };
+        // Looking at someone's status tells them it was seen, once.
+        if let Some(group) = self.statuses.get(person)
+            && group.sender != "me"
+            && let Some(row) = group.items.get(item)
+            && self.status_seen.insert(row.id.clone())
+        {
+            self.backend.send(Command::SeenStatus {
+                sender: group.sender.clone(),
+                id: row.id.clone(),
+            });
+        }
         if let Some(row) = self.statuses.get(person).and_then(|g| g.items.get(item))
             && row.kind.is_media()
             && row.media_path.is_none()
@@ -1488,13 +1595,32 @@ impl Shell {
                 .max_h_full()
                 .object_fit(gpui::ObjectFit::Contain)
                 .into_any_element(),
-            (MsgKind::Text, _) => div()
-                .max_w(px(520.))
-                .text_size(px(26.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(t.foreground)
-                .child(SharedString::from(row.text.clone().unwrap_or_default()))
-                .into_any_element(),
+            (MsgKind::Text, _) => {
+                // A text status sits on the colour its author picked.
+                let background = super::message::record_of(row)
+                    .message
+                    .as_option()
+                    .and_then(|message| message.extended_text_message.as_option())
+                    .and_then(|text| text.background_argb)
+                    .unwrap_or(STATUS_COLORS[0]);
+                div()
+                    .size_full()
+                    .rounded(R_XL)
+                    .bg(argb_to_color(background))
+                    .p(px(32.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .max_w(px(560.))
+                            .text_size(px(28.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(gpui::white())
+                            .child(SharedString::from(row.text.clone().unwrap_or_default())),
+                    )
+                    .into_any_element()
+            }
             (kind, Some(path)) if kind.is_media() => {
                 let path = std::path::PathBuf::from(path);
                 div()
@@ -1588,7 +1714,7 @@ impl Shell {
                 this.child(
                     div()
                         .px(px(24.))
-                        .pb(px(20.))
+                        .pb(px(12.))
                         .flex()
                         .justify_center()
                         .text_size(px(14.))
@@ -1596,6 +1722,7 @@ impl Shell {
                         .child(SharedString::from(caption)),
                 )
             })
+            .child(self.status_footer(group, row, cx))
             .into_any_element()
     }
 
@@ -1678,6 +1805,7 @@ impl Shell {
                                     .child(div().text_size(px(13.)).text_color(t.muted_foreground).child(number)),
                             ),
                     )
+                    .child(self.profile_editor(cx))
                     .child(rule())
                     .child(heading("Appearance", "The look follows diskurt's modern design."))
                     .child(self.style_row(cx))
@@ -1846,9 +1974,14 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf::frame();
         let _perf = crate::perf::scope("shell.render");
+        if std::mem::take(&mut self.profile_name_stale) {
+            let name = self.me_name.clone();
+            self.profile_name.update(cx, |input, cx| input.set_value(name, window, cx));
+        }
         let t = tokens(cx).clone();
         let panel: AnyElement = match (self.section, self.status_open, &self.chat) {
             (Section::Settings, _, _) => self.settings_panel(cx),
+            (Section::Status, _, _) if self.status_draft.is_some() => self.status_compose_panel(cx),
             (Section::Status, Some((person, item)), _) => self.status_panel(person, item, cx),
             (_, _, Some(chat)) => chat.clone().into_any_element(),
             _ => self.empty_panel(cx),
@@ -2006,7 +2139,7 @@ impl Shell {
         out.push(rule());
         out.push(heading(
             "Privacy",
-            "Who can see your details. Shown here as set on your account; change them on your phone.",
+            "Who can see your details. A change here applies to your whole account.",
         ));
         if self.privacy.is_empty() {
             out.push(
@@ -2017,17 +2150,92 @@ impl Shell {
                     .into_any_element(),
             );
         }
-        for (category, value) in &self.privacy {
+        for (slot, (category, value)) in self.privacy.iter().enumerate() {
             let (label, who) = Self::privacy_words(category, value);
-            out.push(
-                div()
-                    .py(px(8.))
-                    .flex()
-                    .items_center()
-                    .child(div().flex_1().text_size(px(14.)).child(label))
-                    .child(div().text_size(px(14.)).text_color(t.muted_foreground).child(who))
-                    .into_any_element(),
-            );
+            let choices = Self::privacy_choices(category);
+            let mut row = div()
+                .py(px(6.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(div().flex_1().text_size(px(14.)).child(label));
+            if choices.is_empty() || !choices.contains(&value.as_str()) {
+                // A value this app cannot set (a custom list made on the phone) is shown as it is.
+                row = row.child(div().text_size(px(14.)).text_color(t.muted_foreground).child(who));
+            }
+            for (index, choice) in choices.iter().enumerate() {
+                let active = choice == value;
+                let (_, words) = Self::privacy_words(category, choice);
+                let (category, choice) = (category.clone(), choice.to_string());
+                let hover = t.fg(0.12);
+                row = row.child(
+                    div()
+                        .id(("privacy", slot * 8 + index))
+                        .h(px(28.))
+                        .px(px(10.))
+                        .rounded(R_MD)
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .cursor_pointer()
+                        .when(active, |this| this.bg(t.tint(0.14)).text_color(t.primary))
+                        .when(!active, |this| {
+                            this.bg(t.fg(0.06))
+                                .text_color(t.foreground)
+                                .hover(move |style| style.bg(hover))
+                        })
+                        .child(words)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !active {
+                                this.backend.send(Command::SetPrivacy {
+                                    category: category.clone(),
+                                    value: choice.clone(),
+                                });
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+            out.push(row.into_any_element());
+        }
+        // The timer new chats start with.
+        {
+            let mut row = div()
+                .py(px(6.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(div().flex_1().text_size(px(14.)).child("Default message timer for new chats"));
+            for (index, (label, seconds)) in
+                [("Off", 0u32), ("24 hours", 86_400), ("7 days", 604_800), ("90 days", 7_776_000)]
+                    .into_iter()
+                    .enumerate()
+            {
+                let hover = t.fg(0.12);
+                row = row.child(
+                    div()
+                        .id(("default-timer", index))
+                        .h(px(28.))
+                        .px(px(10.))
+                        .rounded(R_MD)
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .cursor_pointer()
+                        .bg(t.fg(0.06))
+                        .hover(move |style| style.bg(hover))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.backend.send(Command::SetDefaultTimer { seconds });
+                            cx.notify();
+                        })),
+                );
+            }
+            out.push(row.into_any_element());
         }
 
         out.push(rule());
@@ -2226,5 +2434,501 @@ impl Shell {
             );
         }
         Some(row.into_any_element())
+    }
+}
+
+impl Shell {
+    fn open_status_composer(&mut self, cx: &mut Context<Self>) {
+        self.section = Section::Status;
+        self.status_open = None;
+        self.status_draft = Some(StatusDraft {
+            background: 0,
+            file: None,
+        });
+        cx.notify();
+    }
+
+    /// Posts the status being written and closes the composer.
+    fn post_status(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.status_draft.take() else {
+            return;
+        };
+        let text = self.status_text.read(cx).value().trim().to_string();
+        if text.is_empty() && draft.file.is_none() {
+            self.status_draft = Some(draft);
+            return;
+        }
+        self.backend.send(Command::PostStatus {
+            text,
+            background: STATUS_COLORS[draft.background],
+            file: draft.file,
+            only_me: false,
+        });
+        self.status_text.update(cx, |input, cx| input.set_value("", window, cx));
+        cx.notify();
+    }
+
+    fn pick_status_file(&mut self, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = chosen.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let _ = this.update(cx, |this, cx| {
+                    let kind = crate::media_ops::attach_kind_for(&path);
+                    if matches!(kind, crate::events::Attach::Image | crate::events::Attach::Video) {
+                        if let Some(draft) = this.status_draft.as_mut() {
+                            draft.file = Some(path);
+                        }
+                    } else {
+                        this.last_error = Some("A status can be text, a photo or a video.".to_string());
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Sends what is typed under someone's status to their chat, quoting the status.
+    fn send_status_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.status_reply.read(cx).value().trim().to_string();
+        let Some((person, item)) = self.status_open else {
+            return;
+        };
+        let Some((sender, id)) = self
+            .statuses
+            .get(person)
+            .filter(|group| group.sender != "me")
+            .and_then(|group| Some((group.sender.clone(), group.items.get(item)?.id.clone())))
+        else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        self.backend.send(Command::ReplyStatus { sender, id, text });
+        self.status_reply.update(cx, |input, cx| input.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// The panel for writing a status: text on a colour, or a photo or video.
+    fn status_compose_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = tokens(cx).clone();
+        let Some(draft) = self.status_draft.as_ref() else {
+            return self.empty_panel(cx);
+        };
+        let has_text = !self.status_text.read(cx).value().trim().is_empty();
+        let ready = has_text || draft.file.is_some();
+        let surface = match &draft.file {
+            Some(path) => {
+                let is_picture = crate::media_ops::attach_kind_for(path) == crate::events::Attach::Image;
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(12.))
+                    .child(if is_picture {
+                        gpui::img(path.clone())
+                            .max_w_full()
+                            .max_h(px(420.))
+                            .rounded(R_LG)
+                            .object_fit(gpui::ObjectFit::Contain)
+                            .into_any_element()
+                    } else {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(8.))
+                            .text_color(t.muted_foreground)
+                            .child(icon("video").size(px(40.)))
+                            .child(SharedString::from(name))
+                            .into_any_element()
+                    })
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(520.))
+                            .rounded(R_LG)
+                            .border_1()
+                            .border_color(t.border)
+                            .px(px(8.))
+                            .py(px(4.))
+                            .child(Textarea::new(&self.status_text).appearance(false).bordered(false)),
+                    )
+            }
+            None => div()
+                .size_full()
+                .rounded(R_XL)
+                .bg(argb_to_color(STATUS_COLORS[draft.background]))
+                .p(px(32.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(560.))
+                        .text_size(px(24.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(gpui::white())
+                        .child(Textarea::new(&self.status_text).appearance(false).bordered(false)),
+                ),
+        };
+        let mut swatches = div().flex().items_center().gap(px(6.));
+        if draft.file.is_none() {
+            for (index, color) in STATUS_COLORS.iter().enumerate() {
+                let active = index == draft.background;
+                swatches = swatches.child(
+                    div()
+                        .id(("status-color", index))
+                        .size(px(24.))
+                        .rounded_full()
+                        .bg(argb_to_color(*color))
+                        .border_2()
+                        .border_color(if active { t.foreground } else { gpui::transparent_black() })
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(draft) = this.status_draft.as_mut() {
+                                draft.background = index;
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+        let has_file = draft.file.is_some();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(16.))
+                    .py(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child("New status"))
+                    .child(div().flex_1())
+                    .child(
+                        icon_button("status-compose-close", "x", cx).on_click(cx.listener(|this, _, _, cx| {
+                            this.status_draft = None;
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().px(px(24.)).pb(px(12.)).child(surface))
+            .child(
+                div()
+                    .px(px(24.))
+                    .pb(px(8.))
+                    .text_size(px(12.))
+                    .text_color(t.muted_foreground)
+                    .child("Goes to your contacts, following the status privacy set on your phone. It disappears after 24 hours."),
+            )
+            .child(
+                div()
+                    .px(px(24.))
+                    .pb(px(20.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(swatches)
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("status-pick-file")
+                            .h(px(32.))
+                            .px(px(12.))
+                            .rounded(R_LG)
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .bg(t.fg(0.06))
+                            .text_size(px(13.))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(t.fg(0.10)))
+                            .child(icon("image-plus").size(px(14.)))
+                            .child(if has_file { "Change photo or video" } else { "Photo or video" })
+                            .on_click(cx.listener(|this, _, _, cx| this.pick_status_file(cx))),
+                    )
+                    .when(has_file, |this| {
+                        this.child(
+                            icon_button("status-drop-file", "x", cx)
+                                .tooltip(tip("Remove the photo or video"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(draft) = this.status_draft.as_mut() {
+                                        draft.file = None;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("status-post")
+                            .h(px(32.))
+                            .px(px(16.))
+                            .rounded(R_LG)
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .when(ready, |this| {
+                                this.bg(t.primary)
+                                    .text_color(t.primary_foreground)
+                                    .cursor_pointer()
+                                    .shadow(t.glow())
+                            })
+                            .when(!ready, |this| this.bg(t.fg(0.06)).text_color(t.muted_foreground))
+                            .child(icon("send-horizontal").size(px(14.)))
+                            .child("Post")
+                            .on_click(cx.listener(|this, _, window, cx| this.post_status(window, cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Under a status: a reply box and a heart for someone else's, who saw it and a
+    /// delete button for my own.
+    fn status_footer(&self, group: &StatusGroup, row: &MsgRow, cx: &mut Context<Self>) -> AnyElement {
+        let t = tokens(cx).clone();
+        if group.sender != "me" {
+            let id = row.id.clone();
+            return div()
+                .px(px(24.))
+                .pb(px(20.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(8.))
+                .child(div().w_full().max_w(px(520.)).child(Input::new(&self.status_reply)))
+                .child(
+                    icon_button("status-like", "heart", cx)
+                        .tooltip(tip("Like"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.backend.send(Command::React {
+                                chat: "status@broadcast".to_string(),
+                                id: id.clone(),
+                                emoji: "\u{2764}\u{fe0f}".to_string(),
+                            });
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    icon_button("status-reply-send", "send-horizontal", cx)
+                        .tooltip(tip("Send reply"))
+                        .on_click(cx.listener(|this, _, window, cx| this.send_status_reply(window, cx))),
+                )
+                .into_any_element();
+        }
+        // My own status: who has seen it.
+        let cached = self
+            .status_viewer_cache
+            .borrow()
+            .as_ref()
+            .filter(|(id, _)| *id == row.id)
+            .map(|(_, viewers)| viewers.clone());
+        let viewers: Vec<(String, i64)> = match cached {
+            Some(viewers) => viewers,
+            None => {
+                let viewers: Vec<(String, i64)> = self
+                    .store
+                    .receipts("status@broadcast", &row.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(user, _, read, _)| Some((user, read?)))
+                    .collect();
+                *self.status_viewer_cache.borrow_mut() = Some((row.id.clone(), viewers.clone()));
+                viewers
+            }
+        };
+        let id = row.id.clone();
+        let mut footer = div().px(px(24.)).pb(px(20.)).flex().flex_col().items_center().gap(px(8.)).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .id("status-viewers")
+                        .h(px(32.))
+                        .px(px(12.))
+                        .rounded(R_LG)
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .bg(t.fg(0.06))
+                        .text_size(px(13.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(t.fg(0.10)))
+                        .child(icon("eye").size(px(14.)))
+                        .child(format!("Seen by {}", viewers.len()))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.status_viewers = !this.status_viewers;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    icon_button("status-delete", "trash", cx)
+                        .tooltip(tip("Delete this status"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.backend.send(Command::DeleteStatus { id: id.clone() });
+                            this.status_open = None;
+                            cx.notify();
+                        })),
+                ),
+        );
+        if self.status_viewers && !viewers.is_empty() {
+            let mut list = div()
+                .id("status-viewer-list")
+                .w(px(320.))
+                .max_h(px(180.))
+                .overflow_y_scroll()
+                .rounded(R_LG)
+                .border_1()
+                .border_color(t.border)
+                .p(px(6.))
+                .flex()
+                .flex_col();
+            for (user, seen_at) in viewers.iter().take(200) {
+                let name = self.title_of(user);
+                list = list.child(
+                    div()
+                        .h(px(36.))
+                        .px(px(8.))
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(avatar(user, &name, 24., crate::avatars::get(user), cx))
+                        .child(div().flex_1().truncate().text_size(px(13.)).child(SharedString::from(name)))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(t.muted_foreground)
+                                .child(list_time(*seen_at)),
+                        ),
+                );
+            }
+            footer = footer.child(list);
+        }
+        footer.into_any_element()
+    }
+}
+
+impl Shell {
+    /// The values this app can set for a privacy category, in the order shown.
+    fn privacy_choices(category: &str) -> &'static [&'static str] {
+        match category {
+            "Last" | "Profile" | "Status" | "GroupAdd" | "About" => &["All", "Contacts", "None"],
+            "Online" => &["All", "MatchLastSeen"],
+            "ReadReceipts" => &["All", "None"],
+            "CallAdd" => &["All", "Contacts", "Known"],
+            "Messages" => &["All", "Contacts"],
+            _ => &[],
+        }
+    }
+
+    /// Settings: change the name, the About line and the profile photo.
+    fn profile_editor(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = tokens(cx).clone();
+        let button = |id: &'static str, label: &'static str| {
+            let hover = t.fg(0.12);
+            div()
+                .id(id)
+                .h(px(32.))
+                .px(px(12.))
+                .rounded(R_LG)
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .bg(t.fg(0.06))
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .child(label)
+        };
+        div()
+            .mt(px(16.))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().w(px(64.)).text_size(px(13.)).text_color(t.muted_foreground).child("Name"))
+                    .child(div().flex_1().child(Input::new(&self.profile_name)))
+                    .child(button("profile-save-name", "Save").on_click(cx.listener(|this, _, _, cx| {
+                        let name = this.profile_name.read(cx).value().trim().to_string();
+                        if name.is_empty() {
+                            this.last_error = Some("The name cannot be empty.".to_string());
+                        } else {
+                            this.backend.send(Command::SetProfileName { name });
+                        }
+                        cx.notify();
+                    }))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().w(px(64.)).text_size(px(13.)).text_color(t.muted_foreground).child("About"))
+                    .child(div().flex_1().child(Input::new(&self.profile_about)))
+                    .child(button("profile-save-about", "Save").on_click(cx.listener(|this, _, _, cx| {
+                        let text = this.profile_about.read(cx).value().trim().to_string();
+                        this.backend.send(Command::SetAbout { text });
+                        cx.notify();
+                    }))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().w(px(64.)).text_size(px(13.)).text_color(t.muted_foreground).child("Photo"))
+                    .child(button("profile-photo-change", "Choose a photo").on_click(cx.listener(|_, _, _, cx| {
+                        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
+                            files: true,
+                            directories: false,
+                            multiple: false,
+                            prompt: Some("Use as profile photo".into()),
+                        });
+                        cx.spawn(async move |this, cx| {
+                            if let Ok(Ok(Some(paths))) = chosen.await
+                                && let Some(path) = paths.into_iter().next()
+                            {
+                                let _ = this.update(cx, |this, cx| {
+                                    this.backend.send(Command::SetProfilePhoto { path: Some(path) });
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        .detach();
+                    })))
+                    .child(button("profile-photo-remove", "Remove photo").on_click(cx.listener(|this, _, _, cx| {
+                        this.backend.send(Command::SetProfilePhoto { path: None });
+                        cx.notify();
+                    }))),
+            )
+            .into_any_element()
     }
 }

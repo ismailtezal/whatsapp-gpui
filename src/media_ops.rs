@@ -366,6 +366,25 @@ pub async fn send_file(
     caption: Option<String>,
     reply_to: Option<String>,
 ) -> Result<String> {
+    let message = build_file_message(client, store, chat, path, kind, caption, reply_to).await?;
+    let id = send_prepared(client, store, events, chat, message).await?;
+    // Our own copy is already on disk: point the message at it so it shows without a download.
+    let local = path.to_string_lossy().to_string();
+    store.batch(|tx| tx.set_media_path(chat, &id, &local))?;
+    notify(events, chat).await;
+    Ok(id)
+}
+
+/// Uploads a file and builds the message that carries it, without sending it.
+pub(crate) async fn build_file_message(
+    client: &Arc<Client>,
+    store: &Arc<Store>,
+    chat: &str,
+    path: &Path,
+    kind: Attach,
+    caption: Option<String>,
+    reply_to: Option<String>,
+) -> Result<crate::wa::Message> {
     use whatsapp_rust::media::{self, AudioOptions, DocumentOptions, ImageOptions, VideoOptions};
     use whatsapp_rust::wacore::download::MediaType;
 
@@ -482,12 +501,7 @@ pub async fn send_file(
         }
     };
 
-    let id = send_prepared(client, store, events, chat, message).await?;
-    // Our own copy is already on disk: point the message at it so it shows without a download.
-    let local = path.to_string_lossy().to_string();
-    store.batch(|tx| tx.set_media_path(chat, &id, &local))?;
-    notify(events, chat).await;
-    Ok(id)
+    Ok(message)
 }
 
 /// Runs the commands that deal with files.

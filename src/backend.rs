@@ -293,6 +293,44 @@ pub(crate) fn quote_context(record: &wa::WebMessageInfo, chat: &str) -> Option<w
     Some(context)
 }
 
+/// Who a status update goes to: this account, plus the saved contacts allowed by the
+/// status privacy setting last synced from the phone. With `only_me`, just this account.
+fn status_recipients(client: &Arc<Client>, store: &Arc<Store>, only_me: bool) -> Result<Vec<whatsapp_rust::Jid>> {
+    use wa::sync_action_value::status_privacy_action::StatusDistributionMode as Mode;
+    let me = client.pn().ok_or_else(|| anyhow!("not logged in"))?.to_non_ad();
+    let mut recipients = vec![me.clone()];
+    if only_me {
+        return Ok(recipients);
+    }
+    let audience = client.status().audience();
+    let listed: Vec<String> = audience
+        .as_ref()
+        .map(|audience| audience.user_jid.iter().map(|jid| bare(jid)).collect())
+        .unwrap_or_default();
+    let mode = audience.as_ref().and_then(|audience| audience.mode);
+    let contacts: Vec<String> = store.contacts()?.into_iter().map(|contact| contact.jid).collect();
+    let chosen: Vec<String> = match mode {
+        Some(mode) if mode == Mode::ALLOW_LIST => listed,
+        Some(mode) if mode == Mode::DENY_LIST => {
+            contacts.into_iter().filter(|contact| !listed.contains(contact)).collect()
+        }
+        _ => contacts,
+    };
+    for address in chosen {
+        if let Ok(parsed) = jid(&address)
+            && parsed != me
+        {
+            recipients.push(parsed);
+        }
+    }
+    Ok(recipients)
+}
+
+/// An address without its device part.
+fn bare(address: &str) -> String {
+    crate::content::bare_jid(address)
+}
+
 fn text_message(text: &str, context: Option<wa::ContextInfo>, mentions: &[String]) -> wa::Message {
     let mut message = wa::Message::default();
     if context.is_none() && mentions.is_empty() {
@@ -382,6 +420,89 @@ async fn execute(
             };
             let message = text_message(&text, context, &mentions);
             send_prepared(client, store, events, &chat, message).await?;
+        }
+
+        Command::PostStatus {
+            text,
+            background,
+            file,
+            only_me,
+        } => {
+            let recipients = status_recipients(client, store, only_me)?;
+            let chat = "status@broadcast";
+            let message = match &file {
+                Some(path) => {
+                    let kind = crate::media_ops::attach_kind_for(path);
+                    if !matches!(kind, crate::events::Attach::Image | crate::events::Attach::Video) {
+                        return Err(anyhow!("a status can be text, a photo or a video"));
+                    }
+                    let caption = Some(text.clone()).filter(|text| !text.trim().is_empty());
+                    crate::media_ops::build_file_message(client, store, chat, path, kind, caption, None).await?
+                }
+                None => {
+                    let mut extended = wa::message::ExtendedTextMessage::default();
+                    extended.text = Some(text.clone());
+                    extended.background_argb = Some(background);
+                    extended.text_argb = Some(0xFFFF_FFFF);
+                    extended.font = Some(wa::message::extended_text_message::FontType::SYSTEM);
+                    let mut message = wa::Message::default();
+                    message.extended_text_message = MessageField::some(extended);
+                    message
+                }
+            };
+            let id = client.generate_message_id();
+            let id_text = id.as_str().to_string();
+            store_outgoing(store, chat, &id_text, &message)?;
+            if let Some(path) = &file {
+                let local = path.to_string_lossy().to_string();
+                store.batch(|tx| tx.set_media_path(chat, &id_text, &local))?;
+            }
+            notify(events, chat).await;
+            let options = whatsapp_rust::StatusSendOptions::default().with_message_id(id);
+            match client.status().send_raw(message, &recipients, options).await {
+                Ok(_) => {
+                    store.batch(|tx| tx.set_status(chat, &id_text, Ack::Sent))?;
+                    notify(events, chat).await;
+                }
+                Err(error) => {
+                    store.batch(|tx| tx.force_status(chat, &id_text, Ack::Error))?;
+                    notify(events, chat).await;
+                    return Err(anyhow!("the status could not be posted: {error}"));
+                }
+            }
+        }
+
+        Command::ReplyStatus { sender, id, text } => {
+            let record = store
+                .record("status@broadcast", &id)?
+                .ok_or_else(|| anyhow!("that status is no longer here"))?;
+            // The quote names the status channel, so the reply shows which update it answers.
+            let mut context = quote_context(&record, "status@broadcast")
+                .ok_or_else(|| anyhow!("that status cannot be answered"))?;
+            context.remote_jid = Some("status@broadcast".to_string());
+            context.participant = Some(sender.clone());
+            let message = text_message(&text, Some(context), &[]);
+            send_prepared(client, store, events, &sender, message).await?;
+        }
+
+        Command::DeleteStatus { id } => {
+            let recipients = status_recipients(client, store, false)?;
+            client
+                .status()
+                .revoke(MessageId::new(&id)?, &recipients, whatsapp_rust::StatusSendOptions::default())
+                .await
+                .map_err(|error| anyhow!("the status could not be removed: {error}"))?;
+            store.batch(|tx| tx.mark_revoked("status@broadcast", &id))?;
+            notify(events, "status@broadcast").await;
+        }
+
+        Command::SeenStatus { sender, id } => {
+            if !read_only() {
+                let poster = jid(&sender)?;
+                client
+                    .mark_as_read(&whatsapp_rust::Jid::status_broadcast(), Some(&poster), &[id.as_str()])
+                    .await?;
+            }
         }
 
         Command::React { chat, id, emoji } => {
@@ -814,6 +935,115 @@ async fn execute(
             outcome.map_err(|error| anyhow!("could not change the members: {error}"))?;
             // Read the result back from the server rather than guessing it.
             Box::pin(execute(client, store, events, Command::RefreshGroup { chat })).await?;
+        }
+
+        Command::SetProfileName { name } => {
+            let name = name.trim().to_string();
+            let outcome = client
+                .profile()
+                .set_push_name(&name)
+                .await
+                .map_err(|error| anyhow!("the name could not be changed: {error}"))?;
+            let synced = matches!(outcome, whatsapp_rust::PushNameOutcome::Synced);
+            let _ = events
+                .send(UiEvent::Identity {
+                    pn: client.pn().map(|j| j.to_non_ad_string()),
+                    lid: client.lid().map(|j| j.to_non_ad_string()),
+                    push_name: name,
+                })
+                .await;
+            let _ = events
+                .send(UiEvent::Error(if synced {
+                    "Name changed.".to_string()
+                } else {
+                    "Name changed here. It has not reached your other devices yet.".to_string()
+                }))
+                .await;
+        }
+
+        Command::SetAbout { text } => {
+            let text = text.trim().to_string();
+            let outcome = if text.is_empty() {
+                client.profile().clear_text_status().await
+            } else {
+                client
+                    .profile()
+                    .set_text_status(&text, None, whatsapp_rust::TextStatusExpiry::Never)
+                    .await
+            };
+            outcome.map_err(|error| anyhow!("the About text could not be changed: {error}"))?;
+            let _ = events.send(UiEvent::Error("About changed.".to_string())).await;
+        }
+
+        Command::SetProfilePhoto { path } => {
+            let me = client.pn().ok_or_else(|| anyhow!("not logged in"))?.to_non_ad_string();
+            match path {
+                Some(path) => {
+                    let bytes = tokio::task::spawn_blocking(move || crate::avatars::profile_jpeg(&path)).await??;
+                    client
+                        .profile()
+                        .set_profile_picture(bytes.clone())
+                        .await
+                        .map_err(|error| anyhow!("the photo could not be changed: {error}"))?;
+                    crate::avatars::store(&me, &bytes)?;
+                }
+                None => {
+                    client
+                        .profile()
+                        .remove_profile_picture()
+                        .await
+                        .map_err(|error| anyhow!("the photo could not be removed: {error}"))?;
+                    crate::avatars::forget(&me);
+                }
+            }
+            let _ = events.send(UiEvent::AvatarReady { jid: me }).await;
+        }
+
+        Command::SetPrivacy { category, value } => {
+            use whatsapp_rust::privacy_settings::{PrivacyCategory, PrivacyValue};
+            let parsed_category = match category.as_str() {
+                "Last" => PrivacyCategory::Last,
+                "Online" => PrivacyCategory::Online,
+                "Profile" => PrivacyCategory::Profile,
+                "Status" => PrivacyCategory::Status,
+                "GroupAdd" => PrivacyCategory::GroupAdd,
+                "ReadReceipts" => PrivacyCategory::ReadReceipts,
+                "CallAdd" => PrivacyCategory::CallAdd,
+                "Messages" => PrivacyCategory::Messages,
+                other => return Err(anyhow!("this app cannot change the setting {other}")),
+            };
+            let parsed_value = match value.as_str() {
+                "All" => PrivacyValue::All,
+                "Contacts" => PrivacyValue::Contacts,
+                "None" => PrivacyValue::None,
+                "MatchLastSeen" => PrivacyValue::MatchLastSeen,
+                "Known" => PrivacyValue::Known,
+                other => return Err(anyhow!("this app cannot set the value {other}")),
+            };
+            if !parsed_category.is_valid_value(&parsed_value) {
+                return Err(anyhow!("{value} is not a choice for {category}"));
+            }
+            client
+                .set_privacy_setting(parsed_category, parsed_value)
+                .await
+                .map_err(|error| anyhow!("the privacy setting could not be changed: {error}"))?;
+            Box::pin(execute(client, store, events, Command::FetchAccountInfo)).await?;
+        }
+
+        Command::SetDefaultTimer { seconds } => {
+            client
+                .set_default_disappearing_mode(seconds)
+                .await
+                .map_err(|error| anyhow!("the default timer could not be changed: {error}"))?;
+            let _ = events
+                .send(UiEvent::Error(
+                    if seconds == 0 {
+                        "New chats will not start with disappearing messages.".to_string()
+                    } else {
+                        "New chats will start with disappearing messages.".to_string()
+                    },
+                ))
+                .await;
         }
 
         Command::FetchAccountInfo => {
