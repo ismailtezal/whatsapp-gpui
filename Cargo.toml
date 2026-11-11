@@ -19,6 +19,9 @@ ureq = "3.5"
 windows = { version = "0.62", features = ["Media_Playback", "Media_Core", "Foundation", "Storage", "Storage_FileProperties", "Storage_Streams", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 sha2 = "0.10"
 raw-window-handle = "0.6"
+cpal = "0.18"
+ogg = "0.9"
+unsafe-libopus = "0.2"
 
 [build-dependencies]
 winresource = "0.1"

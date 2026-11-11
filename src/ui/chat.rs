@@ -116,6 +116,8 @@ pub struct ChatView {
     /// The identity and appearance stamp of each list item, to tell the list exactly
     /// which rows changed on a reload.
     item_keys: Vec<(String, u64)>,
+    /// The voice message being recorded, if any.
+    recorder: Option<crate::voice::Recorder>,
     pins: Vec<String>,
     /// Wording of the first pinned message, read when the chat is loaded.
     pin_text: Option<String>,
@@ -217,6 +219,7 @@ impl ChatView {
             info_for: None,
             members_expanded: false,
             item_keys: Vec::new(),
+            recorder: None,
             pins: Vec::new(),
             pin_text: None,
             video: None,
@@ -1532,8 +1535,10 @@ impl ChatView {
                     )
                 })
                 .children(self.pending_tray(cx))
+                .children(self.recording_row(cx))
                 .child(
                     div()
+                        .when(self.recorder.is_some(), |this| this.hidden())
                         .p(px(6.))
                         .flex()
                         .items_end()
@@ -1599,7 +1604,13 @@ impl ChatView {
                                 })
                                 .when(!has_text, |this| this.text_color(t.muted_foreground))
                                 .child(icon(if has_text { "send-horizontal" } else { "mic" }))
-                                .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if has_text {
+                                        this.send(window, cx)
+                                    } else {
+                                        this.start_recording(cx)
+                                    }
+                                })),
                         ),
                 ),
         )
@@ -1609,6 +1620,10 @@ impl ChatView {
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _perf = crate::perf::scope("chat.render");
+        if self.recorder.is_some() {
+            // The timer and the level meter move while recording.
+            window.request_animation_frame();
+        }
         crate::perf::note(|| {
             let top = self.list.logical_scroll_top();
             format!(
@@ -3691,5 +3706,150 @@ fn item_key(item: &Item) -> (String, u64) {
             }
             (view.row.id.clone(), hasher.finish())
         }
+    }
+}
+
+impl ChatView {
+    /// Starts recording a voice message from the microphone.
+    fn start_recording(&mut self, cx: &mut Context<Self>) {
+        match crate::voice::Recorder::start() {
+            Ok(recorder) => {
+                self.recorder = Some(recorder);
+                self.backend.send(Command::Typing {
+                    chat: self.chat.jid.clone(),
+                    activity: Activity::Recording,
+                });
+            }
+            Err(error) => self.notice = Some(format!("Microphone: {error:#}")),
+        }
+        cx.notify();
+    }
+
+    /// Throws the recording away.
+    fn cancel_recording(&mut self, cx: &mut Context<Self>) {
+        self.recorder = None;
+        self.backend.send(Command::Typing {
+            chat: self.chat.jid.clone(),
+            activity: Activity::Idle,
+        });
+        cx.notify();
+    }
+
+    /// Stops recording and sends what was said as a voice message.
+    fn finish_recording(&mut self, cx: &mut Context<Self>) {
+        let Some(recorder) = self.recorder.take() else {
+            return;
+        };
+        if let Some(error) = recorder.error() {
+            self.notice = Some(format!("Microphone: {error}"));
+        }
+        let (samples, rate) = recorder.stop();
+        let chat = self.chat.jid.clone();
+        let reply_to = self.reply_to.take().map(|reply| reply.id);
+        self.backend.send(Command::Typing {
+            chat: chat.clone(),
+            activity: Activity::Idle,
+        });
+        cx.spawn(async move |this, cx| {
+            // Encoding takes a moment for a long recording: keep it off the interface.
+            let made = cx
+                .background_executor()
+                .spawn(async move {
+                    let recording = crate::voice::finish(&samples, rate)?;
+                    let folder = crate::paths::media_dir();
+                    std::fs::create_dir_all(&folder)?;
+                    let stamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_millis())
+                        .unwrap_or(0);
+                    let path = folder.join(format!("voice-{stamp}.ogg"));
+                    std::fs::write(&path, &recording.ogg)?;
+                    anyhow::Ok(path)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match made {
+                    Ok(path) => this.backend.send(Command::SendFile {
+                        chat,
+                        path,
+                        kind: crate::events::Attach::Voice,
+                        caption: None,
+                        reply_to,
+                    }),
+                    Err(error) => this.notice = Some(format!("Voice message: {error:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The message box while recording: discard, a red dot, the time, a live level
+    /// meter, and send.
+    fn recording_row(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let recorder = self.recorder.as_ref()?;
+        let t = tokens(cx).clone();
+        let seconds = recorder.elapsed().as_secs();
+        let mut meter = div()
+            .flex_1()
+            .min_w_0()
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(2.))
+            .overflow_hidden();
+        for level in recorder.levels(64) {
+            // Speech is quiet on a linear scale; the square root makes it visible.
+            let height = 3. + level.clamp(0., 1.).sqrt() * 23.;
+            meter = meter.child(
+                div()
+                    .w(px(3.))
+                    .h(px(height))
+                    .flex_shrink_0()
+                    .rounded(px(1.5))
+                    .bg(t.fg(0.55)),
+            );
+        }
+        Some(
+            div()
+                .p(px(6.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    icon_button("record-discard", "trash", cx)
+                        .tooltip(tip("Discard"))
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_recording(cx))),
+                )
+                .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(t.destructive))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(13.))
+                        .text_color(t.foreground)
+                        .child(format!("{}:{:02}", seconds / 60, seconds % 60)),
+                )
+                .child(meter)
+                .child(
+                    div()
+                        .id("record-send")
+                        .size(px(32.))
+                        .flex_shrink_0()
+                        .rounded(R_LG)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .bg(t.primary)
+                        .text_color(t.primary_foreground)
+                        .shadow(t.glow())
+                        .child(icon("send-horizontal"))
+                        .tooltip(tip("Send voice message"))
+                        .on_click(cx.listener(|this, _, _, cx| this.finish_recording(cx))),
+                )
+                .into_any_element(),
+        )
     }
 }

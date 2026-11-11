@@ -1681,6 +1681,7 @@ impl Shell {
                     .child(rule())
                     .child(heading("Appearance", "The look follows diskurt's modern design."))
                     .child(self.style_row(cx))
+                    .children(self.backdrop_row(cx))
                     .child(self.palette_row(cx))
                     .child(
                         div()
@@ -2178,5 +2179,52 @@ impl Shell {
             );
         }
         row.into_any_element()
+    }
+}
+
+impl Shell {
+    /// Liquid Glass only: what is behind the window.
+    fn backdrop_row(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use super::theme::Backdrop;
+        let t = tokens(cx).clone();
+        if !t.liquid() {
+            return None;
+        }
+        let current = super::theme::backdrop(cx);
+        let mut row = div().flex().flex_wrap().items_center().gap(px(8.)).mb(px(12.)).child(
+            div()
+                .w(px(96.))
+                .text_size(px(13.))
+                .text_color(t.muted_foreground)
+                .child("Background"),
+        );
+        for (slot, backdrop) in Backdrop::ALL.into_iter().enumerate() {
+            let active = backdrop == current;
+            let hover = t.fg(0.12);
+            row = row.child(
+                div()
+                    .id(("backdrop", slot))
+                    .h(px(32.))
+                    .px(px(12.))
+                    .rounded(R_LG)
+                    .border_1()
+                    .border_color(if active { t.primary } else { t.fg(0.08) })
+                    .bg(if active { t.tint(0.10) } else { t.fg(0.05) })
+                    .flex()
+                    .items_center()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if active { t.primary } else { t.foreground })
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(hover))
+                    .child(backdrop.name())
+                    .tooltip(tip(backdrop.summary()))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        super::theme::set_backdrop(backdrop, cx);
+                        cx.refresh_windows();
+                    })),
+            );
+        }
+        Some(row.into_any_element())
     }
 }

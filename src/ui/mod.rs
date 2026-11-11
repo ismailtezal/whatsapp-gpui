@@ -58,7 +58,7 @@ pub fn run() {
         }
         // A test run (any appearance override, or the offline test mode) must not save
         // its appearance over the owner's choice.
-        if ["WA_THEME", "WA_STYLE", "WA_PALETTE", "WA_OFFLINE"]
+        if ["WA_THEME", "WA_STYLE", "WA_PALETTE", "WA_BACKDROP", "WA_OFFLINE"]
             .iter()
             .any(|name| std::env::var(name).is_ok())
         {
@@ -71,6 +71,10 @@ pub fn run() {
         // Development aid: WA_STYLE picks a surface style for this run.
         if let Ok(name) = std::env::var("WA_STYLE") {
             theme::set_style(theme::Style::from_name(&name), cx);
+        }
+        // Development aid: WA_BACKDROP picks the Liquid Glass background for this run.
+        if let Ok(name) = std::env::var("WA_BACKDROP") {
+            theme::set_backdrop(theme::Backdrop::from_name(&name), cx);
         }
         // Development aid: WA_PALETTE picks a palette for this run.
         if let Ok(name) = std::env::var("WA_PALETTE") {

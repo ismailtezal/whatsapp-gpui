@@ -418,12 +418,21 @@ pub async fn send_file(
             media::video_message(upload, options)
         }
         Attach::Audio | Attach::Voice => {
+            // A voice message carries its length and the bars drawn on it; both are
+            // read back from the recording.
+            let voice = (kind == Attach::Voice)
+                .then(|| crate::voice::decode_ogg_opus(&data).ok())
+                .flatten();
             let upload = client
                 .upload(data, MediaType::Audio, Default::default())
                 .await?;
             let mut options = AudioOptions::default();
             options.mimetype = Some(mime);
             options.ptt = Some(kind == Attach::Voice);
+            if let Some(samples) = voice {
+                options.duration_seconds = Some((samples.len() as f32 / 48_000.).round().max(1.) as u32);
+                options.waveform = Some(crate::voice::waveform(&samples));
+            }
             options.context_info = context;
             media::audio_message(upload, options)
         }

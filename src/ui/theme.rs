@@ -26,6 +26,8 @@ pub const FONT_UI: &str = "Figtree";
 pub struct Tokens {
     pub dark: bool,
     pub style: Style,
+    /// What is behind the window in the Liquid Glass style.
+    pub backdrop: Backdrop,
     pub background: Hsla,
     pub foreground: Hsla,
     pub card: Hsla,
@@ -64,6 +66,7 @@ impl Tokens {
         Tokens {
             dark: true,
             style: Style::Modern,
+            backdrop: Backdrop::Solid,
             background: hex(0x07080b),
             foreground: hex(0xedeef0),
             card: hex(0x0c0e12),
@@ -98,6 +101,7 @@ impl Tokens {
         Tokens {
             dark: false,
             style: Style::Modern,
+            backdrop: Backdrop::Solid,
             background: hex(0xfbfcfd),
             foreground: hex(0x15181e),
             card: hex(0xffffff),
@@ -241,7 +245,9 @@ fn remember(store: &std::sync::Arc<crate::store::Store>, key: &str, value: &str)
 }
 
 pub fn install(dark: bool, cx: &mut App) {
-    let t = Tokens::of(palette(cx), dark).styled(style(cx));
+    let mut t = Tokens::of(palette(cx), dark);
+    t.backdrop = backdrop(cx);
+    let t = t.styled(style(cx));
     // Remember the mode for the next start.
     if let Some(store) = cx.try_global::<Appearance>().and_then(|a| a.store.clone()) {
         remember(&store, "theme", if dark { "dark" } else { "light" });
@@ -542,7 +548,14 @@ impl Tokens {
                 // The window keeps one opaque base colour (the rail token); every
                 // other surface is glass or a faint fill, so the ambient colours and
                 // the content beneath show through.
-                self.rail = if self.dark { hex(0x05060b) } else { hex(0xe6ebf3) };
+                let base = if self.dark { hex(0x05060b) } else { hex(0xe6ebf3) };
+                self.rail = match self.backdrop {
+                    Backdrop::Solid => base,
+                    // The window is see-through. A thin veil is left so text that sits
+                    // on no glass (the title bar) stays readable over a bright desktop.
+                    Backdrop::Frosted => alpha(base, if self.dark { 0.30 } else { 0.26 }),
+                    Backdrop::Clear => alpha(base, if self.dark { 0.16 } else { 0.12 }),
+                };
                 self.sidebar = alpha(self.sidebar, 0.);
                 self.background = alpha(self.background, 0.);
                 self.card = self.fg(if self.dark { 0.07 } else { 0.05 });
@@ -664,8 +677,10 @@ impl Tokens {
 
     /// What the window shows behind its own surfaces.
     pub fn window_backdrop(&self) -> gpui::WindowBackgroundAppearance {
-        match self.style {
-            Style::Glass => gpui::WindowBackgroundAppearance::Blurred,
+        match (self.style, self.backdrop) {
+            (Style::Glass, _) => gpui::WindowBackgroundAppearance::Blurred,
+            (Style::Liquid, Backdrop::Clear) => gpui::WindowBackgroundAppearance::Transparent,
+            (Style::Liquid, Backdrop::Frosted) => gpui::WindowBackgroundAppearance::Blurred,
             _ => gpui::WindowBackgroundAppearance::Opaque,
         }
     }
@@ -690,6 +705,13 @@ pub fn restore_style(cx: &mut App) {
         .map(|name| Style::from_name(&name))
         .unwrap_or_default();
     cx.set_global(StyleChoice(remembered));
+    let backdrop = cx
+        .try_global::<Appearance>()
+        .and_then(|appearance| appearance.store.clone())
+        .and_then(|store| store.kv("backdrop").ok().flatten())
+        .map(|name| Backdrop::from_name(&name))
+        .unwrap_or_default();
+    cx.set_global(BackdropChoice(backdrop));
     let dark = cx.try_global::<Tokens>().map(|t| t.dark).unwrap_or(true);
     install(dark, cx);
 }
@@ -736,7 +758,21 @@ impl Tokens {
         } else {
             hsla(220. / 360., 0.35, 0.98, 1.)
         };
-        let tint = |a: f32| Hsla { a, ..base };
+        // Over a see-through window the glass carries more of its own colour, or text
+        // would be lost against whatever is on the desktop.
+        // A clear window shows whatever is on the desktop, sharp, so surfaces that hold
+        // text must be dense enough to read over anything; the bars stay lighter.
+        let extra = match (self.backdrop, kind) {
+            (Backdrop::Solid, _) => 0.,
+            (Backdrop::Frosted, _) => 0.09,
+            (Backdrop::Clear, Surface::Panel) => 0.30,
+            (Backdrop::Clear, Surface::Menu) => 0.24,
+            (Backdrop::Clear, Surface::Bar | Surface::Chip) => 0.28,
+        };
+        let tint = |a: f32| Hsla {
+            a: (a + extra).min(0.92),
+            ..base
+        };
         let rim = hsla(0., 0., 1., if self.dark { 0.55 } else { 0.95 });
         let spec = match kind {
             Surface::Panel => gpui::Glass {
@@ -787,7 +823,8 @@ impl Tokens {
     /// The soft colours behind everything in the Liquid Glass style, as (x, y, size,
     /// colour) with positions as fractions of the window. Glass needs something to bend.
     pub fn ambient(&self) -> Vec<(f32, f32, f32, Hsla)> {
-        if !self.liquid() {
+        // The soft colours stand in for a backdrop; a see-through window has the desktop.
+        if !self.liquid() || self.backdrop != Backdrop::Solid {
             return Vec::new();
         }
         let hue = self.primary.h;
@@ -801,4 +838,63 @@ impl Tokens {
             (0.30, 0.74, 360., hsla(turn(0.20), 0.70, light, alpha * 0.5)),
         ]
     }
+}
+
+/// What shows behind the window in the Liquid Glass style.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Backdrop {
+    /// The desktop and other windows show through, sharp.
+    #[default]
+    Clear,
+    /// The desktop shows through, blurred by Windows.
+    Frosted,
+    /// Nothing shows through: soft colours of the app's own are painted instead.
+    Solid,
+}
+
+impl Backdrop {
+    pub const ALL: [Backdrop; 3] = [Backdrop::Clear, Backdrop::Frosted, Backdrop::Solid];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Backdrop::Clear => "Clear",
+            Backdrop::Frosted => "Frosted",
+            Backdrop::Solid => "Solid",
+        }
+    }
+
+    pub fn summary(self) -> &'static str {
+        match self {
+            Backdrop::Clear => "See the desktop through the window",
+            Backdrop::Frosted => "See the desktop, blurred",
+            Backdrop::Solid => "Not see-through",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Backdrop {
+        Backdrop::ALL
+            .into_iter()
+            .find(|backdrop| backdrop.name().eq_ignore_ascii_case(name))
+            .unwrap_or_default()
+    }
+}
+
+struct BackdropChoice(Backdrop);
+
+impl Global for BackdropChoice {}
+
+pub fn backdrop(cx: &App) -> Backdrop {
+    cx.try_global::<BackdropChoice>()
+        .map(|choice| choice.0)
+        .unwrap_or_default()
+}
+
+/// Switches what is behind the window, keeping everything else.
+pub fn set_backdrop(backdrop: Backdrop, cx: &mut App) {
+    if let Some(store) = cx.try_global::<Appearance>().and_then(|a| a.store.clone()) {
+        remember(&store, "backdrop", backdrop.name());
+    }
+    cx.set_global(BackdropChoice(backdrop));
+    let dark = cx.try_global::<Tokens>().map(|t| t.dark).unwrap_or(true);
+    install(dark, cx);
 }

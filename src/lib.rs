@@ -24,6 +24,7 @@ pub mod store_more;
 pub mod system;
 pub mod thumbs;
 pub mod video;
+pub mod voice;
 pub mod ui;
 
 pub use whatsapp_rust::waproto::whatsapp as wa;
