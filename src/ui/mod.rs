@@ -1,6 +1,7 @@
 //! The graphical interface.
 
 mod chat;
+mod editor;
 mod message;
 mod shell;
 pub mod theme;

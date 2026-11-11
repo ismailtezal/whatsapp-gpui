@@ -37,7 +37,8 @@ tried without touching someone else or changing the account.
 | Send text | Verified | |
 | Reply (quote), jump to the quoted message | Verified (send) / Built (jump) | |
 | Reactions: send, show | Verified | Quick reactions and the full emoji picker. |
-| Reactions from the right-click menu | Built | Nothing appears on hover any more (the owner found the hover bar distracting). The menu's top row has six quick reactions and a plus for the full picker; the one that is mine is marked and choosing it again takes it back. Clicking a message's reaction chips lists who reacted; my own line removes my reaction. |
+| Middle-button auto-scroll | Verified (test copy) | A middle click drops a marker; moving the pointer away from it scrolls what is under it, faster the further away. Any click, key or wheel notch ends it; press-drag-release works too. Checked with an injected middle click in a conversation. |
+| Reactions from the right-click menu | Verified (menu) / Built (removing) | Nothing appears on hover any more (the owner found the hover bar distracting). The menu's top row has six quick reactions and a plus for the full picker; the one that is mine is marked and choosing it again takes it back. Clicking a message's reaction chips lists who reacted; my own line removes my reaction. |
 | Emoji picker | Verified (shown) | Every emoji the system font draws (Unicode 15 and earlier), in nine groups plus recents, with search by name. Seen on screen. No skin-tone choice. |
 | Edit own message | Verified | 15-minute window. |
 | Delete for everyone | Verified | Text, photo and document. |
@@ -50,7 +51,7 @@ tried without touching someone else or changing the account.
 | Delivery ticks | Partial | Sent, delivered, read are stored and drawn; history shows all three, live only "sent" was observed. |
 | Typing indicator: send, show | Built | Sent at most once every 8 seconds while typing. Sending is disabled in test runs. |
 | Presence (online, last seen) | Built | The account shows as online only while the window is in front. |
-| Mentions | Verified (send) / Built (picker) | A message mentioning this account itself was sent to "Dosyalar" and carried the mention. Typing `@` in a group lists the members; that list was not clicked through. |
+| Mentions | Verified (send, picker) | Typing `@` in a group lists the members (search ignores accents); arrows, Tab, Enter or a click pick one, and the mention sits in the message box as one coloured unit. Checked in the test copy by typing and picking with the keyboard. A message mentioning this account itself was sent to "Dosyalar" and carried the mention. Edits and captions carry mentions too (built). In the chat list and in copies that lost their tag (forwards), `@number` is shown as the person's name when it is known. `@all` is not built. |
 | Formatting (bold, italic, strike, code), links | Verified | Unit tests. |
 | Link previews | Partial | Shown for received and stored messages. Not generated when sending a link. |
 | Polls | Verified | Create (`/poll Question \| A \| B` in the composer), show, vote. Gaps: no dialog for creating one. Decoding of other people's votes as they arrive is built but unproven. |
@@ -69,7 +70,8 @@ tried without touching someone else or changing the account.
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Photos: download, show, viewer | Verified | Download on view; in-app viewer. In a conversation a photo is shown from a small copy made in the background, so scrolling past large photos does not stall. |
+| Photos: download, show, viewer | Verified | Download on view. The viewer covers the window: wheel, buttons or a click zoom, a drag moves the zoomed photo, arrows (on screen and on the keyboard) page through the chat's photos, and a copy can be saved. Opening, zooming and paging were checked in the test copy; "Save as" was not clicked. In a conversation a photo is shown from a small copy made in the background, so scrolling past large photos does not stall. |
+| Edit a photo before sending | Verified (test copy) | Click a staged picture: crop (free or square, with thirds), turn, draw (8 colours, 3 widths), add text (same colours, 3 sizes, movable), undo, Done. The result replaces the staged file. Checked in the test copy on a generated picture: the saved file matched what the editor showed. Not built: emoji and stickers on a photo, blur, a "view once" switch, editing videos. Text is drawn with Segoe UI, so emoji typed into a label are not drawn. |
 | Send photo | Verified | With thumbnail and dimensions. |
 | Send document | Verified | |
 | Send video, audio | Built | Same path as photos and documents. Videos are sent without a preview image. |
@@ -82,7 +84,7 @@ tried without touching someone else or changing the account.
 | Sticker picker | Built | Lists stickers already downloaded to this PC. No favourites, no sticker packs. |
 | Video and GIF previews | Verified | GIFs and videos up to 16 MB download on view; Windows makes the preview picture. |
 | GIFs: play in app | Verified | A click opens the viewer, where the GIF loops. In the conversation itself a GIF is a still preview; it does not autoplay inline. |
-| Video: play in app | Verified (controls) / Built (sound) | The viewer has play and pause, a bar to jump with, the time and mute. Checked in the test copy with a real 34-second video, sound off: the time advanced, pause held it, a click at three quarters of the bar jumped to 0:26, and play resumed. Not checked: the sound itself and whether it stays in step with the picture, because test runs are silent. |
+| Video: play in app | Verified (picture) / Built (sound) | The viewer covers the window and has play and pause, a bar to jump with, the time and mute. The pictures follow the sound's clock, so the two stay together; they are handed to the screen once per frame (165 a second measured while playing); large videos are averaged down while decoding instead of being squeezed on screen; videos recorded upright are turned upright (checked with test files carrying each rotation). Sound was only ever played muted in tests, so lip-sync was not judged by ear. |
 | Documents: open | Built | Downloads and opens with the default app. |
 | Albums | Built | Photos sent together are shown as a two-column grid. Videos in an album are still listed separately. |
 | Camera capture | Not done | |

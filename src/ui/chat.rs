@@ -43,6 +43,20 @@ enum Item {
     Msg(Box<MsgView>),
 }
 
+/// The photo viewer's zoom and position, for the photo it was last set up for.
+#[derive(Default)]
+struct Look {
+    of: Option<PathBuf>,
+    /// The photo's own size in pixels.
+    size: (f32, f32),
+    /// 1 fits the photo in the window; more is closer.
+    zoom: f32,
+    /// How far the photo is moved from the middle, in window pixels.
+    offset: (f32, f32),
+    /// A drag in progress: where it began, the offset then, and whether it moved.
+    drag: Option<(Point<Pixels>, (f32, f32), bool)>,
+}
+
 #[derive(Clone)]
 struct MenuState {
     id: String,
@@ -120,10 +134,18 @@ pub struct ChatView {
     /// Media already asked for in this view, so a failed download is not retried in a loop.
     requested: HashSet<String>,
     open_when_ready: Option<String>,
+    /// Development aid: open the editor on the first staged file at the next render.
+    edit_when_ready: bool,
+    /// The photo editor, open on the staged file at this position.
+    editor: Option<(usize, Entity<super::editor::PhotoEditor>)>,
     menu: Option<MenuState>,
     reactors: Option<ReactorsState>,
     emoji: Option<EmojiState>,
     viewer: Option<PathBuf>,
+    /// How the open photo is being looked at.
+    look: Look,
+    /// The downloaded photos of this chat, oldest first, for paging in the viewer.
+    photos: Vec<PathBuf>,
     notice: Option<String>,
     audio: Option<crate::audio::AudioPlayer>,
     forwarding: Option<String>,
@@ -267,10 +289,14 @@ impl ChatView {
             presence: None,
             requested: HashSet::new(),
             open_when_ready: None,
+            edit_when_ready: false,
+            editor: None,
             menu: None,
             reactors: None,
             emoji: None,
             viewer: None,
+            look: Look::default(),
+            photos: Vec::new(),
             notice: None,
             audio: None,
             forwarding: None,
@@ -317,6 +343,12 @@ if view.chat.kind == ChatKind::Newsletter {
             });
         }
 view.reload(cx);
+        // Development aid: WA_STAGE=<file> stages that file as if it had been attached;
+        // with WA_EDIT=1 the photo editor opens on it.
+        if let Ok(staged) = std::env::var("WA_STAGE") {
+            view.pending.push(PathBuf::from(staged));
+            view.edit_when_ready = std::env::var("WA_EDIT").is_ok();
+        }
         // Development aid: WA_PLAY_VIDEO=1 opens the newest downloaded video of the chat
         // in the viewer, so its controls can be checked without clicking through.
         if std::env::var("WA_PLAY_VIDEO").is_ok() {
@@ -453,6 +485,11 @@ view.reload(cx);
             .messages(&self.chat.jid, None, self.loaded)
             .unwrap_or_default();
         self.has_older = rows.len() >= self.loaded;
+        self.photos = rows
+            .iter()
+            .filter(|row| row.kind == MsgKind::Image)
+            .filter_map(|row| row.media_path.as_ref().map(PathBuf::from))
+            .collect();
         let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
         let mut reactions: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for (id, sender, emoji) in self.store.reactions(&self.chat.jid, &ids).unwrap_or_default() {
@@ -491,6 +528,11 @@ view.reload(cx);
         let mut missing_views: Vec<std::path::PathBuf> = Vec::new();
         for (index, row) in rows.iter().enumerate() {
             if index < skip_to {
+                continue;
+            }
+            // An album's container message has nothing to show: its photos and videos
+            // follow as messages of their own.
+            if row.kind == MsgKind::Album {
                 continue;
             }
             let day = local_day(row.ts);
@@ -1709,49 +1751,253 @@ view.reload(cx);
         Some(self.overlay(at, panel, window, cx))
     }
 
-    fn viewer_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// Shows the next or the previous photo of the chat.
+    fn step_viewer(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let photos = self.photos.clone();
+        let Some(current) = self.viewer.as_ref().and_then(|open| photos.iter().position(|path| path == open)) else {
+            return;
+        };
+        let next = if forward { current + 1 } else { current.wrapping_sub(1) };
+        if let Some(path) = photos.get(next).filter(|path| path.exists()) {
+            self.viewer = Some(path.clone());
+            cx.notify();
+        }
+    }
+
+    /// Zooms the open photo by a factor, keeping it within sensible limits.
+    fn zoom_viewer(&mut self, factor: f32, cx: &mut Context<Self>) {
+        self.look.zoom = (self.look.zoom * factor).clamp(1., 8.);
+        if self.look.zoom <= 1.001 {
+            self.look.zoom = 1.;
+            self.look.offset = (0., 0.);
+        }
+        cx.notify();
+    }
+
+    /// Saves a copy of the open photo where the user chooses.
+    fn save_viewer_copy(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.viewer.clone() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "photo.jpg".to_string());
+        let folder = dirs_downloads();
+        let chosen = cx.prompt_for_new_path(&folder, Some(&name));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(target))) = chosen.await {
+                let copied = std::fs::copy(&path, &target);
+                let _ = this.update(cx, |this, cx| {
+                    this.notice = Some(match copied {
+                        Ok(_) => format!("Saved to {}", target.display()),
+                        Err(error) => format!("Could not save the photo: {error}"),
+                    });
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// The photo viewer: the photo fitted to the window, with zoom (wheel, buttons or a
+    /// click), dragging while zoomed, paging through the chat's photos, and saving.
+    fn viewer_overlay(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let path = self.viewer.clone()?;
+        if self.look.of.as_ref() != Some(&path) {
+            let (wide, tall) = image::image_dimensions(&path).unwrap_or((1, 1));
+            self.look = Look {
+                of: Some(path.clone()),
+                size: (wide.max(1) as f32, tall.max(1) as f32),
+                zoom: 1.,
+                offset: (0., 0.),
+                drag: None,
+            };
+        }
+        let view = window.viewport_size();
+        let bar = super::theme::TITLE_BAR_H;
+        let (room_wide, room_tall) = (view.width / px(1.), (view.height - bar) / px(1.));
+        let (wide, tall) = self.look.size;
+        // Fitted with a margin; small photos are not blown up.
+        let fit = ((room_wide - 96.) / wide).min((room_tall - 96.) / tall).min(1.).max(0.01);
+        let zoom = self.look.zoom;
+        let (shown_wide, shown_tall) = (wide * fit * zoom, tall * fit * zoom);
+        // Keep the photo from being dragged out of sight.
+        let limit = |shown: f32, room: f32| ((shown - room) / 2.).max(0.) + 40.;
+        let offset = if zoom > 1. {
+            (
+                self.look.offset.0.clamp(-limit(shown_wide, room_wide), limit(shown_wide, room_wide)),
+                self.look.offset.1.clamp(-limit(shown_tall, room_tall), limit(shown_tall, room_tall)),
+            )
+        } else {
+            (0., 0.)
+        };
+        self.look.offset = offset;
+        let photos = self.photos.clone();
+        let position = photos.iter().position(|photo| photo == &path);
         let external = path.clone();
-        Some(Self::window_layer(
-            window,
-            div()
-                .id("viewer")
-                .relative()
-                .occlude()
-                .bg(gpui::hsla(0., 0., 0., 0.88))
-                .flex()
-                .items_center()
-                .justify_center()
-                .p(px(32.))
-                .on_click(cx.listener(|this, _, _, cx| {
+        let stop = |_: &MouseDownEvent, _: &mut Window, cx: &mut App| cx.stop_propagation();
+        let button = |id: &'static str, name: &'static str, cx: &App| {
+            icon_button(id, name, cx)
+                .text_color(gpui::white())
+                .on_mouse_down(MouseButton::Left, stop)
+        };
+
+        let photo = div()
+            .id("viewer-photo")
+            .absolute()
+            .left(px((room_wide - shown_wide) / 2. + offset.0))
+            .top(px((room_tall - shown_tall) / 2. + offset.1))
+            .w(px(shown_wide))
+            .h(px(shown_tall))
+            .cursor(if zoom > 1. {
+                gpui::CursorStyle::OpenHand
+            } else {
+                gpui::CursorStyle::PointingHand
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.look.drag = Some((event.position, this.look.offset, false));
+                }),
+            )
+            .child(
+                gpui::img(path)
+                    .w(px(shown_wide))
+                    .h(px(shown_tall))
+                    .object_fit(gpui::ObjectFit::Fill),
+            );
+
+        let mut layer = div()
+            .id("viewer")
+            .relative()
+            .occlude()
+            .overflow_hidden()
+            .bg(gpui::hsla(0., 0., 0., 0.92))
+            // A press on the backdrop closes the viewer.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
                     this.viewer = None;
                     cx.notify();
-                }))
-                .child(
-                    gpui::img(path)
-                        .max_w_full()
-                        .max_h_full()
-                        .object_fit(gpui::ObjectFit::Contain),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(12.))
-                        .right(px(12.))
-                        .flex()
-                        .gap(px(4.))
-                        .text_color(gpui::white())
-                        .child(
-                            icon_button("viewer-open", "external-link", cx)
-                                .tooltip(tip("Open in default app"))
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.stop_propagation();
-                                    cx.open_with_system(&external);
-                                })),
-                        )
-                        .child(icon_button("viewer-close", "x", cx).tooltip(tip("Close"))),
-                ),
-        ))
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                let Some((from, start, moved)) = this.look.drag.as_mut() else {
+                    return;
+                };
+                if !event.dragging() {
+                    this.look.drag = None;
+                    return;
+                }
+                let (dx, dy) = ((event.position.x - from.x) / px(1.), (event.position.y - from.y) / px(1.));
+                if dx.abs() + dy.abs() > 3. {
+                    *moved = true;
+                }
+                if this.look.zoom > 1. {
+                    this.look.offset = (start.0 + dx, start.1 + dy);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    // A click that did not drag switches between fitted and close up.
+                    if let Some((_, _, moved)) = this.look.drag.take()
+                        && !moved
+                    {
+                        let closer = this.look.zoom <= 1.;
+                        this.look.zoom = if closer { 2.5 } else { 1. };
+                        this.look.offset = (0., 0.);
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_scroll(cx.listener(|this, event: &gpui::ScrollEvent, _, cx| {
+                let notches = event.delta.pixel_delta(px(40.)).y / px(120.);
+                this.zoom_viewer(1.25f32.powf(notches), cx);
+            }))
+            .child(photo)
+            .child(
+                div()
+                    .absolute()
+                    .top(px(12.))
+                    .right(px(12.))
+                    .flex()
+                    .gap(px(4.))
+                    .child(
+                        button("viewer-zoom-out", "zoom-out", cx)
+                            .tooltip(tip("Zoom out"))
+                            .on_click(cx.listener(|this, _, _, cx| this.zoom_viewer(1. / 1.5, cx))),
+                    )
+                    .child(
+                        button("viewer-zoom-in", "zoom-in", cx)
+                            .tooltip(tip("Zoom in"))
+                            .on_click(cx.listener(|this, _, _, cx| this.zoom_viewer(1.5, cx))),
+                    )
+                    .child(
+                        button("viewer-save", "download", cx)
+                            .tooltip(tip("Save as…"))
+                            .on_click(cx.listener(|this, _, _, cx| this.save_viewer_copy(cx))),
+                    )
+                    .child(
+                        button("viewer-open", "external-link", cx)
+                            .tooltip(tip("Open in default app"))
+                            .on_click(cx.listener(move |_, _, _, cx| cx.open_with_system(&external))),
+                    )
+                    .child(icon_button("viewer-close", "x", cx).text_color(gpui::white()).tooltip(tip("Close"))),
+            );
+        if let Some(position) = position {
+            let arrow = |id: &'static str, name: &'static str, cx: &App| {
+                icon_button(id, name, cx)
+                    .size(px(40.))
+                    .rounded_full()
+                    .bg(gpui::hsla(0., 0., 1., 0.12))
+                    .text_color(gpui::white())
+                    .on_mouse_down(MouseButton::Left, stop)
+            };
+            if position > 0 {
+                layer = layer.child(
+                    div().absolute().left(px(16.)).top(px(room_tall / 2. - 20.)).child(
+                        arrow("viewer-previous", "chevron-left", cx)
+                            .tooltip(tip("Previous photo"))
+                            .on_click(cx.listener(|this, _, _, cx| this.step_viewer(false, cx))),
+                    ),
+                );
+            }
+            if position + 1 < photos.len() {
+                layer = layer.child(
+                    div().absolute().right(px(16.)).top(px(room_tall / 2. - 20.)).child(
+                        arrow("viewer-next", "chevron-right", cx)
+                            .tooltip(tip("Next photo"))
+                            .on_click(cx.listener(|this, _, _, cx| this.step_viewer(true, cx))),
+                    ),
+                );
+            }
+            layer = layer.child(
+                div()
+                    .absolute()
+                    .bottom(px(14.))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .h(px(26.))
+                            .px(px(10.))
+                            .rounded_full()
+                            .bg(gpui::hsla(0., 0., 0., 0.55))
+                            .flex()
+                            .items_center()
+                            .text_size(px(12.))
+                            .text_color(gpui::hsla(0., 0., 1., 0.85))
+                            .child(format!("{} of {}", position + 1, photos.len())),
+                    ),
+            );
+        }
+        Some(Self::window_layer(window, layer))
     }
 
     // ---- header and composer ---------------------------------------------------------------
@@ -2049,6 +2295,9 @@ impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _perf = crate::perf::scope("chat.render");
         self.pump_video(window);
+        if std::mem::take(&mut self.edit_when_ready) {
+            self.edit_pending(0, window, cx);
+        }
         if self.recorder.is_some() {
             // The timer and the level meter move while recording.
             window.request_animation_frame();
@@ -2073,6 +2322,10 @@ impl Render for ChatView {
         let menu = self.menu_overlay(window, cx);
         let emoji = self.emoji_overlay(window, cx);
         let reactors = self.reactors_overlay(window, cx);
+        let editor = self
+            .editor
+            .as_ref()
+            .map(|(_, editor)| Self::window_layer(window, div().id("photo-editor-layer").child(editor.clone())));
         if let Some((id, path, looping)) = self.pending_video.take() {
             self.start_video(&id, path, looping, window, cx);
         }
@@ -2083,8 +2336,18 @@ impl Render for ChatView {
             .flex()
             .flex_col()
             .bg(t.background)
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                // The arrow keys page through the photos while one is open.
+                if this.viewer.is_some() && matches!(event.keystroke.key.as_str(), "left" | "right") {
+                    this.step_viewer(event.keystroke.key == "right", cx);
+                    return;
+                }
                 if event.keystroke.key == "escape" {
+                    if this.video.is_some() {
+                        this.stop_video(window);
+                        cx.notify();
+                        return;
+                    }
                     // Escape closes whatever is open on top, one layer at a time.
                     if this.viewer.take().is_some()
                         || this.menu.take().is_some()
@@ -2146,6 +2409,7 @@ impl Render for ChatView {
             .children(menu)
             .children(emoji)
             .children(reactors)
+            .children(editor)
     }
 }
 
@@ -3934,6 +4198,32 @@ impl ChatView {
     }
 
     /// The files waiting to be sent, shown above the message box until Enter is pressed.
+    /// Opens the photo editor on a staged picture.
+    fn edit_pending(&mut self, slot: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.pending.get(slot).cloned() else {
+            return;
+        };
+        let editor = cx.new(|cx| super::editor::PhotoEditor::new(path, window, cx));
+        cx.subscribe_in(
+            &editor,
+            window,
+            |this, editor, event: &super::editor::EditorEvent, window, cx| {
+                if let (super::editor::EditorEvent::Done(path), Some((slot, _))) = (event, this.editor.as_ref())
+                    && let Some(staged) = this.pending.get_mut(*slot)
+                {
+                    *staged = path.clone();
+                }
+                editor.update(cx, |editor, _| editor.release(window));
+                this.editor = None;
+                this.focus_input(window, cx);
+                cx.notify();
+            },
+        )
+        .detach();
+        self.editor = Some((slot, editor));
+        cx.notify();
+    }
+
     fn pending_tray(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.pending.is_empty() {
             return None;
@@ -3957,6 +4247,11 @@ impl ChatView {
                 Some("jpg" | "jpeg" | "png" | "webp" | "gif")
             );
             let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            // Still pictures can be cropped, turned, drawn and written on.
+            let editable = matches!(
+                path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref(),
+                Some("jpg" | "jpeg" | "png" | "webp")
+            );
             tray = tray.child(
                 div()
                     .w(px(144.))
@@ -3972,6 +4267,7 @@ impl ChatView {
                     .gap(px(4.))
                     .child(
                         div()
+                            .id(("pending-open", slot))
                             .h(px(96.))
                             .rounded(R_MD)
                             .bg(t.muted)
@@ -3980,6 +4276,11 @@ impl ChatView {
                             .items_center()
                             .justify_center()
                             .text_color(t.muted_foreground)
+                            .when(editable, |this| {
+                                this.cursor_pointer()
+                                    .tooltip(tip("Edit: crop, turn, draw, text"))
+                                    .on_click(cx.listener(move |this, _, window, cx| this.edit_pending(slot, window, cx)))
+                            })
                             .child(if is_picture {
                                 gpui::img(path.clone())
                                     .w(px(132.))
@@ -3997,6 +4298,26 @@ impl ChatView {
                             .text_color(t.muted_foreground)
                             .child(super::widgets::file_size(size)),
                     )
+                    .when(editable, |this| {
+                        this.child(
+                            div()
+                                .id(("pending-edit", slot))
+                                .absolute()
+                                .top(px(4.))
+                                .left(px(4.))
+                                .size(px(24.))
+                                .rounded(R_MD)
+                                .border_1()
+                                .border_color(t.border)
+                                .bg(t.popover_fill())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .child(icon("pencil").size(px(14.)))
+                                .on_click(cx.listener(move |this, _, window, cx| this.edit_pending(slot, window, cx))),
+                        )
+                    })
                     .child(
                         div()
                             .id(("pending-remove", slot))
@@ -5065,4 +5386,11 @@ impl ChatView {
             })
             .into_any_element()
     }
+}
+
+/// The user's Downloads folder, or their home folder failing that.
+fn dirs_downloads() -> PathBuf {
+    let home = std::env::var("USERPROFILE").map(PathBuf::from).unwrap_or_default();
+    let downloads = home.join("Downloads");
+    if downloads.is_dir() { downloads } else { home }
 }

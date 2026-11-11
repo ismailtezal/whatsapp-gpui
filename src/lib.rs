@@ -17,6 +17,7 @@ pub mod import;
 pub mod media_ops;
 pub mod ingest;
 pub mod model;
+pub mod paint;
 pub mod paths;
 pub mod perf;
 pub mod polls;
