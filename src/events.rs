@@ -65,6 +65,11 @@ pub enum UiEvent {
         lid: Option<String>,
         push_name: String,
     },
+    /// Privacy settings as (category, value) and the blocked people.
+    AccountInfo {
+        privacy: Vec<(String, String)>,
+        blocked: Vec<String>,
+    },
     Error(String),
 }
 
@@ -137,6 +142,9 @@ pub enum Command {
     /// Read a group's current subject, description and members from the server.
     RefreshGroup { chat: String },
     LeaveGroup { chat: String },
+    /// Read the privacy settings and the block list.
+    FetchAccountInfo,
+    Block { jid: String, blocked: bool },
     CreateGroup {
         subject: String,
         /// Phone-number JIDs of the people to add.

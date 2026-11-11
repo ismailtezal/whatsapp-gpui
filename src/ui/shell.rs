@@ -89,6 +89,8 @@ pub struct Shell {
     qr: Option<String>,
     last_error: Option<String>,
     confirm_logout: bool,
+    privacy: Vec<(String, String)>,
+    blocked: Vec<String>,
     /// Picking several contacts for a new group instead of one to chat with.
     group_mode: bool,
     group_picks: Vec<String>,
@@ -172,6 +174,8 @@ impl Shell {
             qr: None,
             last_error: None,
             confirm_logout: false,
+            privacy: Vec::new(),
+            blocked: Vec::new(),
             group_mode: false,
             group_picks: Vec::new(),
             group_name,
@@ -265,6 +269,9 @@ impl Shell {
     }
 
     fn set_section(&mut self, section: Section, cx: &mut Context<Self>) {
+        if section == Section::Settings {
+            self.backend.send(Command::FetchAccountInfo);
+        }
         self.section = section;
         self.picking = false;
         self.status_open = None;
@@ -278,6 +285,9 @@ impl Shell {
         match event {
             UiEvent::Connection(state) => {
                 if state == ConnState::Online {
+                    if self.section == Section::Settings {
+                        self.backend.send(Command::FetchAccountInfo);
+                    }
                     self.qr = None;
                 }
                 self.conn = state;
@@ -378,6 +388,10 @@ impl Shell {
                     .into(),
                     actions: Vec::new(),
                 });
+            }
+            UiEvent::AccountInfo { privacy, blocked } => {
+                self.privacy = privacy;
+                self.blocked = blocked;
             }
             UiEvent::AvatarReady { jid } => crate::avatars::refresh(&jid),
             UiEvent::MediaReady {
@@ -1629,6 +1643,7 @@ impl Shell {
                                 })),
                         ),
                     )
+                    .children(self.account_sections(cx))
                     .when_some(self.last_error.clone(), |this, error| {
                         this.child(rule())
                             .child(heading(
@@ -1802,5 +1817,131 @@ impl Shell {
         self.picking = false;
         self.group_picks.clear();
         cx.notify();
+    }
+}
+
+impl Shell {
+    /// Plain wording for a privacy setting as the server names it.
+    fn privacy_words(category: &str, value: &str) -> (String, String) {
+        let label = match category {
+            "Last" => "Last seen",
+            "Online" => "Online",
+            "Profile" => "Profile photo",
+            "Status" => "Status",
+            "GroupAdd" => "Who can add me to groups",
+            "ReadReceipts" => "Read receipts",
+            "About" => "About",
+            "CallAdd" => "Who can call me",
+            "Messages" => "Who can message me",
+            other => other,
+        };
+        let who = match (category, value) {
+            ("ReadReceipts", "All") => "On",
+            ("ReadReceipts", "None") => "Off",
+            (_, "All") => "Everyone",
+            (_, "Contacts") => "My contacts",
+            (_, "None") => "Nobody",
+            (_, "ContactBlacklist") => "My contacts, except some",
+            (_, "MatchLastSeen") => "Same as last seen",
+            (_, "Known") => "People I know",
+            (_, other) => other,
+        };
+        (label.to_string(), who.to_string())
+    }
+
+    /// The privacy and blocked-contacts part of the settings page.
+    fn account_sections(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let t = tokens(cx).clone();
+        let heading = |text: &'static str, detail: &'static str| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .mb(px(12.))
+                .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(text))
+                .child(div().text_size(px(14.)).text_color(t.muted_foreground).child(detail))
+                .into_any_element()
+        };
+        let rule = || div().h(px(1.)).my(px(28.)).bg(t.border).into_any_element();
+        let mut out = Vec::new();
+
+        out.push(rule());
+        out.push(heading(
+            "Privacy",
+            "Who can see your details. Shown here as set on your account; change them on your phone.",
+        ));
+        if self.privacy.is_empty() {
+            out.push(
+                div()
+                    .text_size(px(13.))
+                    .text_color(t.muted_foreground)
+                    .child("Loading…")
+                    .into_any_element(),
+            );
+        }
+        for (category, value) in &self.privacy {
+            let (label, who) = Self::privacy_words(category, value);
+            out.push(
+                div()
+                    .py(px(8.))
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().text_size(px(14.)).child(label))
+                    .child(div().text_size(px(14.)).text_color(t.muted_foreground).child(who))
+                    .into_any_element(),
+            );
+        }
+
+        out.push(rule());
+        out.push(heading("Blocked contacts", "People who cannot message or call you."));
+        if self.blocked.is_empty() {
+            out.push(
+                div()
+                    .text_size(px(13.))
+                    .text_color(t.muted_foreground)
+                    .child("Nobody is blocked.")
+                    .into_any_element(),
+            );
+        }
+        for (slot, person) in self.blocked.iter().enumerate() {
+            let name = self
+                .store
+                .display_name(person)
+                .unwrap_or_else(|_| display_number(person));
+            let who = person.clone();
+            let hover = t.fg(0.12);
+            out.push(
+                div()
+                    .py(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(avatar(person, &name, 32., crate::avatars::get(person), cx))
+                    .child(div().flex_1().text_size(px(14.)).child(SharedString::from(name)))
+                    .child(
+                        div()
+                            .id(("unblock", slot))
+                            .h(px(28.))
+                            .px(px(10.))
+                            .rounded(R_LG)
+                            .flex()
+                            .items_center()
+                            .bg(t.fg(0.08))
+                            .text_size(px(12.))
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(hover))
+                            .child("Unblock")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.backend.send(Command::Block {
+                                    jid: who.clone(),
+                                    blocked: false,
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        out
     }
 }

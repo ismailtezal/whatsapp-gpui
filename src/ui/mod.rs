@@ -56,7 +56,9 @@ pub fn run() {
         if let Some(font) = Embedded::get("fonts/Figtree-Variable.ttf") {
             let _ = cx.text_system().add_fonts(vec![font.data]);
         }
-        theme::install(true, cx);
+        // Development aid: WA_THEME=light starts in the light theme.
+        let dark = std::env::var("WA_THEME").map(|theme| theme != "light").unwrap_or(true);
+        theme::install(dark, cx);
 
         // Call logs arrive inside history blobs; older builds did not store them.
         if store.kv("calls_imported").ok().flatten().is_none()

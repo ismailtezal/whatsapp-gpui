@@ -96,7 +96,7 @@ member) and in an empty test group created for the purpose, never with another p
 | Add, remove, promote, demote members | Built | Deliberately not exercised: it would affect real people. |
 | Group settings (who can send, approval, invite links) | Not done | The library supports them. |
 | Communities, channels | Not done | Shown as plain chats; the Channels section only filters. |
-| Block, report | Not done | |
+| Block, report | Partial | Unblock from Settings is built; there is no "block" button on a chat and no report. |
 | Labels (business) | Not done | |
 
 ## Other surfaces
@@ -108,8 +108,9 @@ member) and in an empty test group created for the purpose, never with another p
 | Incoming call notice | Built | A Windows notification says who is calling and to answer on the phone. No ringing screen, no decline button. |
 | Status: view | Built | Text and photo statuses of the last 24 hours; other media open in the default player. Viewing does not send a "seen" receipt. |
 | Status: post, reply | Not done | |
-| Settings: profile, dark / light, data folder, log out | Built | |
-| Settings: privacy, notifications, edit name / about / photo | Not done | |
+| Settings: profile, dark / light, data folder, log out | Verified (shown) / Built (log out) | Dark and light were both checked on screen. Log out was not pressed. |
+| Settings: privacy and blocked contacts | Partial | Read from the account and shown. Privacy cannot be changed here; unblock is built but not exercised. |
+| Settings: notifications, edit name / about / photo | Not done | |
 | Notifications | Built | Windows notification for a new message when its chat is not in front; clicking opens the chat. No real incoming message has triggered one yet. |
 | Taskbar badge, tray icon, start with Windows, installer | Not done | |
 | Other colour palettes of the design | Not done | Neutral only. |

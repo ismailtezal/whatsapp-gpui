@@ -798,6 +798,40 @@ async fn execute(
             Box::pin(execute(client, store, events, Command::RefreshGroup { chat })).await?;
         }
 
+        Command::FetchAccountInfo => {
+            // Read-only: who can see what, and who is blocked.
+            let privacy = match client.fetch_privacy_settings().await {
+                Ok(response) => response
+                    .settings
+                    .iter()
+                    .map(|setting| (format!("{:?}", setting.category), format!("{:?}", setting.value)))
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            let blocked = match client.blocking().get_blocklist().await {
+                Ok(entries) => {
+                    let mut people = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        people.push(store.canonical(&entry.jid.to_non_ad_string())?);
+                    }
+                    people
+                }
+                Err(_) => Vec::new(),
+            };
+            let _ = events.send(UiEvent::AccountInfo { privacy, blocked }).await;
+        }
+
+        Command::Block { jid: who, blocked } => {
+            let person = jid(&who)?;
+            let outcome = if blocked {
+                client.blocking().block(&person).await
+            } else {
+                client.blocking().unblock(&person).await
+            };
+            outcome.map_err(|error| anyhow!("could not change the block: {error}"))?;
+            Box::pin(execute(client, store, events, Command::FetchAccountInfo)).await?;
+        }
+
         Command::LoadOlder { chat } => {
             // The phone answers with a history-sync blob, which arrives as an event and is
             // imported like any other.
