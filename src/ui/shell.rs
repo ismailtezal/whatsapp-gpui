@@ -11,7 +11,7 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 
-use super::chat::ChatView;
+use super::chat::{ChatEvent, ChatView};
 use super::theme::{COLUMN_W, HEADER_H, R_LG, R_MD, R_XL, RAIL_W, TITLE_BAR_H, Tokens, tokens};
 use super::widgets::{avatar, count_badge, duration, icon, icon_button, list_time, tip};
 use crate::backend::Backend;
@@ -370,11 +370,23 @@ impl Shell {
         let Some(chat) = known.or_else(|| self.store.chat(jid).ok().flatten()) else {
             return;
         };
+        // Keep what was typed but not sent in the chat being left.
+        if let (Some(old), Some(view)) = (self.selected.clone(), &self.chat) {
+            let draft = view.read(cx).draft(cx);
+            let _ = self.store.batch(|tx| tx.set_draft(&old, Some(&draft)));
+        }
         self.selected = Some(jid.to_string());
         let backend = self.backend.clone();
         let me_name = self.me_name.clone();
         let me_jid = self.me_jid.clone();
         let view = cx.new(|cx| ChatView::new(backend, chat, me_name, me_jid, window, cx));
+        cx.subscribe_in(&view, window, |this, _, event: &ChatEvent, window, cx| match event {
+            ChatEvent::OpenChat(jid) => {
+                let jid = jid.clone();
+                this.start_chat_with(&jid, window, cx);
+            }
+        })
+        .detach();
         view.update(cx, |view, cx| view.focus_input(window, cx));
         self.chat = Some(view);
         self.reload();

@@ -252,3 +252,21 @@ impl Tx<'_> {
         Ok(())
     }
 }
+
+impl Store {
+    /// Who received, read or played a message: (person, delivered, read, played).
+    #[allow(clippy::type_complexity)]
+    pub fn receipts(&self, chat: &str, id: &str) -> Result<Vec<(String, Option<i64>, Option<i64>, Option<i64>)>> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT user, delivered, read, played FROM receipts
+                 WHERE chat = ?1 AND msg_id = ?2
+                 ORDER BY COALESCE(played, read, delivered) DESC",
+            )?;
+            let rows = stmt.query_map(params![chat, id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            rows.collect()
+        })
+    }
+}

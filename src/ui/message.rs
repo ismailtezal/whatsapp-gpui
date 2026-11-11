@@ -66,6 +66,7 @@ pub struct MsgView {
     pub rich: Option<Rich>,
     pub avatar: Option<std::path::PathBuf>,
     pub poll: Option<crate::polls::PollView>,
+    pub extras: Extras,
 }
 
 /// What a click on a part of a row does.
@@ -82,6 +83,8 @@ pub struct RowHooks {
     pub quote: Option<ClickFn>,
     /// Vote for the option at this index of a poll.
     pub poll_vote: Option<Rc<dyn Fn(usize, &mut Window, &mut App)>>,
+    /// Open the chat with this JID.
+    pub open_chat: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
 }
 
 /// Extracts what a row needs from the stored record.
@@ -665,6 +668,52 @@ fn content(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> Div {
             }
             column = column.child(card);
         }
+        Location | LiveLocation => {
+            let label = preview_label(row.kind, None);
+            let place = text.map(str::to_string).unwrap_or_else(|| label.clone());
+            let card = info_card(
+                "map-pin",
+                place,
+                match (view.extras.lat, view.extras.lon) {
+                    (Some(lat), Some(lon)) => format!("{lat:.5}, {lon:.5} · open in maps"),
+                    _ => label,
+                },
+                t,
+            );
+            column = column.child(match (view.extras.lat, view.extras.lon) {
+                (Some(lat), Some(lon)) => {
+                    let url = format!("https://www.google.com/maps?q={lat},{lon}");
+                    card.id(("place", key))
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                        .into_any_element()
+                }
+                _ => card.into_any_element(),
+            });
+        }
+        Contact => {
+            let name = text.map(str::to_string).unwrap_or_else(|| "Contact".to_string());
+            let number = view.extras.contact_number.clone();
+            let card = info_card(
+                "contact",
+                name,
+                match &number {
+                    Some(number) => format!("+{number} · message"),
+                    None => "Contact card".to_string(),
+                },
+                t,
+            );
+            column = column.child(match (number, &hooks.open_chat) {
+                (Some(number), Some(hook)) => {
+                    let hook = hook.clone();
+                    card.id(("contact", key))
+                        .cursor_pointer()
+                        .on_click(move |_, window, cx| hook(format!("{number}@s.whatsapp.net"), window, cx))
+                        .into_any_element()
+                }
+                _ => card.into_any_element(),
+            });
+        }
         other => {
             let label = preview_label(other, None);
             column = column.child(info_card(
@@ -674,6 +723,10 @@ fn content(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> Div {
                 t,
             ));
         }
+    }
+
+    if let Some(link) = &view.extras.link {
+        column = column.child(link_card(link, key, t));
     }
 
     if !view.reactions.is_empty() {
@@ -926,4 +979,135 @@ pub fn unread_separator(cx: &App) -> AnyElement {
                 .child("New"),
         )
         .into_any_element()
+}
+
+/// The preview WhatsApp attaches to a message that contains a link.
+#[derive(Clone)]
+pub struct LinkPreview {
+    pub url: String,
+    pub title: String,
+    pub description: String,
+    pub thumb: Option<Arc<Image>>,
+}
+
+/// Details of the less common message kinds (location, contact card, link preview).
+#[derive(Clone, Default)]
+pub struct Extras {
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
+    /// The WhatsApp number on a shared contact card, digits only.
+    pub contact_number: Option<String>,
+    pub link: Option<LinkPreview>,
+}
+
+/// The WhatsApp number in a vCard: the digits of its `waid=` parameter.
+pub fn vcard_number(vcard: &str) -> Option<String> {
+    let start = vcard.find("waid=")? + "waid=".len();
+    let digits: String = vcard[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    (!digits.is_empty()).then_some(digits)
+}
+
+pub fn extras_of(record: &wa::WebMessageInfo) -> Extras {
+    let mut extras = Extras::default();
+    let Some(message) = record.message.as_option() else {
+        return extras;
+    };
+    let (base, _, _) = content::unwrap(message);
+    if let Some(m) = base.location_message.as_option() {
+        extras.lat = m.degrees_latitude;
+        extras.lon = m.degrees_longitude;
+    } else if let Some(m) = base.live_location_message.as_option() {
+        extras.lat = m.degrees_latitude;
+        extras.lon = m.degrees_longitude;
+    } else if let Some(m) = base.contact_message.as_option() {
+        extras.contact_number = m.vcard.as_deref().and_then(vcard_number);
+    } else if let Some(m) = base.extended_text_message.as_option() {
+        let title = m.title.clone().unwrap_or_default();
+        let url = m.matched_text.clone().unwrap_or_default();
+        if !title.is_empty() && !url.is_empty() {
+            extras.link = Some(LinkPreview {
+                url,
+                title,
+                description: m.description.clone().unwrap_or_default(),
+                thumb: m
+                    .jpeg_thumbnail
+                    .as_ref()
+                    .filter(|bytes| !bytes.is_empty())
+                    .map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Jpeg, bytes.clone()))),
+            });
+        }
+    }
+    extras
+}
+
+/// The card under a message that links somewhere: site title, description, thumbnail.
+fn link_card(link: &LinkPreview, key: usize, t: &Tokens) -> AnyElement {
+    let url = link.url.clone();
+    div()
+        .id(("link", key))
+        .max_w(px(420.))
+        .rounded(R_LG)
+        .border_1()
+        .border_l_2()
+        .border_color(t.border)
+        .bg(t.card)
+        .p(px(12.))
+        .flex()
+        .gap(px(12.))
+        .cursor_pointer()
+        .on_click(move |_, _, cx| cx.open_url(&url))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.link)
+                        .child(SharedString::from(link.title.clone())),
+                )
+                .when(!link.description.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .text_size(px(13.))
+                            .line_height(px(18.))
+                            .max_h(px(72.))
+                            .overflow_hidden()
+                            .text_color(t.fg(0.8))
+                            .child(SharedString::from(link.description.clone())),
+                    )
+                })
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(11.))
+                        .text_color(t.muted_foreground)
+                        .child(SharedString::from(link.url.clone())),
+                ),
+        )
+        .children(link.thumb.clone().map(|thumb| {
+            gpui::img(thumb)
+                .size(px(64.))
+                .flex_shrink_0()
+                .rounded(R_MD)
+                .object_fit(gpui::ObjectFit::Cover)
+        }))
+        .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_whatsapp_number_from_a_contact_card() {
+        let vcard = "BEGIN:VCARD\nFN:Ada\nTEL;type=CELL;waid=15550001111:+1 555 000 1111\nEND:VCARD";
+        assert_eq!(vcard_number(vcard).as_deref(), Some("15550001111"));
+        assert_eq!(vcard_number("BEGIN:VCARD\nFN:No number\nEND:VCARD"), None);
+    }
 }

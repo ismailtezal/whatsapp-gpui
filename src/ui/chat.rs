@@ -105,6 +105,8 @@ pub struct ChatView {
     audio: Option<crate::audio::AudioPlayer>,
     forwarding: Option<String>,
     forward_targets: Vec<ChatRow>,
+    /// ID of the own message whose receipts are being shown.
+    info_for: Option<String>,
     info_open: bool,
     /// Group members as (JID, name, rank).
     members: Vec<(String, String, i32)>,
@@ -125,11 +127,13 @@ impl ChatView {
     ) -> Self {
         let store = backend.store().clone();
         let placeholder = format!("Message {}", chat.title);
+        let draft = chat.draft.clone().unwrap_or_default();
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 14)
                 .submit_on_enter(true)
                 .placeholder(placeholder)
+                .default_value(draft)
         });
         cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
             InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
@@ -178,6 +182,7 @@ impl ChatView {
             audio: None,
             forwarding: None,
             forward_targets: Vec::new(),
+            info_for: None,
             info_open: false,
             members: Vec::new(),
             gallery: Vec::new(),
@@ -401,6 +406,7 @@ impl ChatView {
                 media,
                 notice,
                 view_once,
+                extras: super::message::extras_of(&record),
                 poll: if row.kind == MsgKind::Poll {
                     self.store.poll(&self.chat.jid, &row.id, &row.proto)
                 } else {
@@ -668,6 +674,12 @@ impl ChatView {
                 let _ = entity.update(cx, |this, cx| this.open_media(&media_id, cx));
             })),
             audio: self.audio.as_ref().and_then(|player| player.playback()),
+            open_chat: Some({
+                let entity = cx.entity().downgrade();
+                Rc::new(move |jid: String, _: &mut Window, cx: &mut App| {
+                    let _ = entity.update(cx, |_, cx| cx.emit(ChatEvent::OpenChat(jid)));
+                })
+            }),
             poll_vote: Some({
                 let entity = cx.entity().downgrade();
                 let poll_id = id.clone();
@@ -942,6 +954,17 @@ impl ChatView {
                     }),
                 ));
             }
+        }
+
+        if row.from_me {
+            let info_id = row.id.clone();
+            panel = panel.child(item(9, "info", "Message info", false).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.info_for = Some(info_id.clone());
+                    this.menu = None;
+                    cx.notify();
+                },
+            )));
         }
 
         let forward_id = row.id.clone();
@@ -1339,6 +1362,7 @@ impl Render for ChatView {
             )
             .children(viewer)
             .children(self.forward_overlay(window, cx))
+            .children(self.info_overlay(window, cx))
             .children(menu)
             .children(emoji)
     }
@@ -2007,5 +2031,130 @@ impl ChatView {
                 false
             }
         }
+    }
+}
+
+/// What a conversation asks of the window around it.
+#[derive(Clone, Debug)]
+pub enum ChatEvent {
+    /// Open the chat with this JID (from a contact card or a member row).
+    OpenChat(String),
+}
+
+impl gpui::EventEmitter<ChatEvent> for ChatView {}
+
+impl ChatView {
+    /// The text left unsent in the composer, to keep as a draft.
+    pub fn draft(&self, cx: &App) -> String {
+        if self.editing.is_some() {
+            return String::new();
+        }
+        self.input.read(cx).value().to_string()
+    }
+
+    /// Who has received and read one of our messages.
+    fn info_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let id = self.info_for.clone()?;
+        let t = tokens(cx).clone();
+        let size = window.viewport_size();
+        let receipts = self.store.receipts(&self.chat.jid, &id).unwrap_or_default();
+        let stamp = |ts: Option<i64>| ts.filter(|ts| *ts > 0).map(super::widgets::header_time);
+        let mut rows = div()
+            .id("info-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .p(px(6.));
+        if receipts.is_empty() {
+            rows = rows.child(
+                div()
+                    .p(px(16.))
+                    .text_size(px(13.))
+                    .text_color(t.muted_foreground)
+                    .child("No delivery or read receipts have arrived for this message yet."),
+            );
+        }
+        for (user, delivered, read, played) in receipts {
+            let name = self
+                .store
+                .display_name(&user)
+                .unwrap_or_else(|_| crate::model::display_number(&user));
+            let state = match (stamp(played), stamp(read), stamp(delivered)) {
+                (Some(at), _, _) => format!("Played {at}"),
+                (None, Some(at), _) => format!("Read {at}"),
+                (None, None, Some(at)) => format!("Delivered {at}"),
+                _ => "Sent".to_string(),
+            };
+            rows = rows.child(
+                div()
+                    .h(px(52.))
+                    .px(px(8.))
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(avatar(&user, &name, 36., crate::avatars::get(&user), cx))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(SharedString::from(name)),
+                            )
+                            .child(div().text_size(px(12.)).text_color(t.muted_foreground).child(state)),
+                    ),
+            );
+        }
+        let panel = div()
+            .w(px(420.))
+            .h(px(440.))
+            .rounded(super::theme::R_2XL)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .shadow(t.shadow_dialog())
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .px(px(16.))
+                    .py(px(12.))
+                    .border_b_1()
+                    .border_color(t.border)
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Message info"),
+            )
+            .child(rows);
+        let close = cx.listener(|this, _: &MouseDownEvent, _, cx| {
+            this.info_for = None;
+            cx.notify();
+        });
+        Some(
+            deferred(
+                anchored().position(point(px(0.), px(0.))).child(
+                    div()
+                        .w(size.width)
+                        .h(size.height)
+                        .occlude()
+                        .bg(gpui::hsla(0., 0., 0., 0.55))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(MouseButton::Left, close)
+                        .child(panel),
+                ),
+            )
+            .with_priority(10)
+            .into_any_element(),
+        )
     }
 }
