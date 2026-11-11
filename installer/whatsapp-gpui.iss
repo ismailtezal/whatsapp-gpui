@@ -32,6 +32,8 @@ Name: "startup"; Description: "Start with Windows"; Flags: unchecked
 
 [Files]
 Source: "..\target\release\whatsapp-gpui.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+Source: "..\NOTICE"; DestDir: "{app}"; DestName: "NOTICE.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\whatsapp-gpui"; Filename: "{app}\whatsapp-gpui.exe"

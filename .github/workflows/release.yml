@@ -43,7 +43,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path target\release\whatsapp-gpui.exe, README.md `
+          Compress-Archive -Path target\release\whatsapp-gpui.exe, README.md, LICENSE, NOTICE `
             -DestinationPath "dist\whatsapp-gpui-$env:APP_VERSION-portable.zip" -Force
 
       - name: Publish the release
