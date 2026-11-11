@@ -1874,7 +1874,7 @@ impl Render for Shell {
                     .shadow(vec![gpui::BoxShadow {
                         color,
                         offset: gpui::point(px(0.), px(0.)),
-                        blur_radius: px(size * 0.7),
+                        blur_radius: px(size * 0.5),
                         spread_radius: px(0.),
                         inset: false,
                     }]),

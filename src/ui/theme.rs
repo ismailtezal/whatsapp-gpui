@@ -750,11 +750,11 @@ impl Tokens {
             },
             Surface::Bar => gpui::Glass {
                 tint: tint(if self.dark { 0.34 } else { 0.38 }),
-                blur: 9.,
-                refraction: 30.,
-                bevel: 18.,
+                blur: 4.5,
+                refraction: 38.,
+                bevel: 17.,
                 highlight: rim,
-                dispersion: 0.16,
+                dispersion: 0.22,
                 saturation: 1.6,
             },
             Surface::Menu => gpui::Glass {
@@ -768,9 +768,9 @@ impl Tokens {
             },
             Surface::Chip => gpui::Glass {
                 tint: tint(if self.dark { 0.30 } else { 0.36 }),
-                blur: 7.,
-                refraction: 12.,
-                bevel: 9.,
+                blur: 4.,
+                refraction: 16.,
+                bevel: 10.,
                 highlight: rim,
                 dispersion: 0.14,
                 saturation: 1.6,
@@ -792,7 +792,7 @@ impl Tokens {
         }
         let hue = self.primary.h;
         let turn = |by: f32| (hue + by).rem_euclid(1.);
-        let (light, alpha) = if self.dark { (0.42, 0.42) } else { (0.74, 0.55) };
+        let (light, alpha) = if self.dark { (0.45, 0.60) } else { (0.72, 0.62) };
         // Neighbouring hues of the accent, so the backdrop reads as one mood.
         vec![
             (0.08, 0.10, 520., hsla(turn(0.), 0.80, light, alpha)),

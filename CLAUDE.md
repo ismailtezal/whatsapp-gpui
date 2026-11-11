@@ -44,10 +44,22 @@ connection. Windows only. Private now, open source later.
 - `whatsapp-rust` is pinned to a git commit; it bundles SQLite via `libsqlite3-sys 0.38`,
   so `rusqlite` must stay on 0.40.x.
 - Only one process may use `session.db` at a time. Close the app before `wa-test`.
-- `scripts/dev.sh [chat title] [seconds]` stops the app, rebuilds, relaunches in
-  read-only mode and saves a screenshot to `.reference/shot.png`. Development aids:
-  `WA_OPEN_CHAT`, `WA_SECTION` (calls, status, starred, settings, archived), `WA_INFO`,
-  `WA_HOVER=1` (keeps every message's hover bar visible, for screenshots).
+- **Testing the interface never touches the owner's running app.** `scripts/uitest.sh`
+  builds a separate copy (`target/uitest`, run as `wa-uitest.exe`) that is off the
+  screen, never connects (`WA_OFFLINE`), and never saves appearance changes.
+  `scripts/dev.sh [chat title] [seconds]` rebuilds it, starts it and saves a screenshot
+  to `.reference/shot.png`. `scripts/wheel.ps1 -ProcessName wa-uitest` sends wheel
+  scrolls to it. Never kill `whatsapp-gpui.exe`: that is the owner's copy. Build
+  `target/release` (what `run.bat` starts) only when the owner's copy is not running.
+- **Speed is a requirement: at least 120 frames a second everywhere** (the owner's
+  screen is 165 Hz). `scripts/perf.sh [chat]` prints frame timings (`WA_PERF=1`).
+  Lists must be virtual (`uniform_list` or `list`), nothing may query the database or
+  the disk per frame, and a chat reload must splice only the rows that changed.
+- GPUI is vendored in `vendor/` with patches (glass backgrounds, smooth wheel
+  scrolling, frame timing); see `vendor/README.md`.
+- Development aids: `WA_OPEN_CHAT`, `WA_SECTION` (calls, status, starred, settings,
+  archived), `WA_INFO`, `WA_HOVER=1` (keeps every message's hover bar visible),
+  `WA_STYLE`, `WA_THEME`, `WA_PALETTE`.
 - Source files are reformatted after being written, so line-exact text replacement is
   fragile. Insert by anchor line, or append a new `impl` block.
 - Icons are Lucide SVGs in `assets/icons` at stroke width 1.75; add new ones there.
