@@ -115,7 +115,7 @@ member) and in an empty test group created for the purpose, never with another p
 | Settings: notifications, edit name / about / photo | Not done | |
 | Notifications | Built | Windows notification for a new message when its chat is not in front; clicking opens the chat. No real incoming message has triggered one yet. |
 | Taskbar badge, tray icon, start with Windows, installer | Not done | |
-| Other colour palettes of the design | Not done | Neutral only. |
+| Colour palettes of the design | Partial | Neutral, Turquoise, Midnight, Mono and Amber, in dark and light, chosen in Settings and remembered. Turquoise dark was checked on screen. The other five palettes of diskurt (ocean, violet, rose, pomegranate, forest) are not included. |
 
 ## Design
 

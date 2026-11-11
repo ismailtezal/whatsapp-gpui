@@ -1591,6 +1591,7 @@ impl Shell {
                     )
                     .child(rule())
                     .child(heading("Appearance", "The look follows diskurt's modern design."))
+                    .child(self.palette_row(cx))
                     .child(
                         div()
                             .flex()
@@ -1958,5 +1959,55 @@ impl Shell {
             );
         }
         out
+    }
+}
+
+impl Shell {
+    /// The palette swatches in Settings.
+    fn palette_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        use super::theme::{Palette, Tokens as PaletteTokens};
+        let t = tokens(cx).clone();
+        let current = super::theme::palette(cx);
+        let mut row = div().flex().flex_wrap().gap(px(8.)).mb(px(12.));
+        for (slot, palette) in Palette::ALL.into_iter().enumerate() {
+            let sample = PaletteTokens::of(palette, t.dark);
+            let active = palette == current;
+            let hover = t.fg(0.12);
+            row = row.child(
+                div()
+                    .id(("palette", slot))
+                    .h(px(36.))
+                    .px(px(10.))
+                    .rounded(R_LG)
+                    .border_1()
+                    .border_color(if active { t.primary } else { gpui::transparent_black() })
+                    .bg(t.fg(0.06))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(13.))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .child(
+                        // A two-tone swatch: the palette's surface and its accent.
+                        div()
+                            .size(px(18.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(t.fg(0.2))
+                            .bg(sample.background)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(div().size(px(8.)).rounded_full().bg(sample.primary)),
+                    )
+                    .child(palette.name())
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        super::theme::set_palette(palette, cx);
+                        cx.refresh_windows();
+                    })),
+            );
+        }
+        row.into_any_element()
     }
 }

@@ -223,7 +223,11 @@ pub fn tokens(cx: &App) -> &Tokens {
 /// Installs the tokens and makes the component library's own widgets (text fields,
 /// menus, tooltips, scrollbars) use the same colours, font and radii.
 pub fn install(dark: bool, cx: &mut App) {
-    let t = if dark { Tokens::dark() } else { Tokens::light() };
+    let t = Tokens::of(palette(cx), dark);
+    // Remember the mode for the next start.
+    if let Some(store) = cx.try_global::<Appearance>().and_then(|a| a.store.clone()) {
+        let _ = store.set_kv("theme", if dark { "dark" } else { "light" });
+    }
     gpui_component::Theme::change(
         if dark {
             gpui_component::ThemeMode::Dark
@@ -273,4 +277,170 @@ pub fn install(dark: bool, cx: &mut App) {
         theme.scrollbar_thumb_hover = t.fg(0.28);
     }
     cx.set_global(t);
+}
+
+/// The colour palettes of the design. Neutral is the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Palette {
+    Neutral,
+    Turquoise,
+    Midnight,
+    Mono,
+    Amber,
+}
+
+impl Palette {
+    pub const ALL: [Palette; 5] = [
+        Palette::Neutral,
+        Palette::Turquoise,
+        Palette::Midnight,
+        Palette::Mono,
+        Palette::Amber,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Palette::Neutral => "Neutral",
+            Palette::Turquoise => "Turquoise",
+            Palette::Midnight => "Midnight",
+            Palette::Mono => "Mono",
+            Palette::Amber => "Amber",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Palette {
+        Palette::ALL
+            .into_iter()
+            .find(|palette| palette.name().eq_ignore_ascii_case(name))
+            .unwrap_or(Palette::Neutral)
+    }
+
+    /// The palette's colours, in the order: background, foreground, card, popover, primary,
+    /// primary-foreground, secondary, muted, muted-foreground, accent, destructive, ring,
+    /// sidebar, sidebar-foreground, sidebar-accent, rail, tooltip, link, mention, code.
+    fn values(self, dark: bool) -> Option<[u32; 20]> {
+        Some(match (self, dark) {
+            (Palette::Neutral, _) => return None,
+            (Palette::Turquoise, true) => [
+                0x14171b, 0xeef0f3, 0x1b1e23, 0x1b1e23, 0x42d8c8, 0x001e1e, 0x23272c, 0x1d2125, 0x999fa7, 0x25292f,
+                0xf04c55, 0x42d8c8, 0x0d1013, 0xd5d8db, 0x1d2125, 0x0d1013, 0x2c3136, 0x58d1e5, 0xefb146, 0x0f1215,
+            ],
+            (Palette::Turquoise, false) => [
+                0xffffff, 0x12161c, 0xffffff, 0xffffff, 0x007f80, 0xf9fdfc, 0xeef0f3, 0xf1f3f5, 0x646971, 0xebeef2,
+                0xdb2b33, 0x009a9b, 0xeff1f4, 0x292e34, 0xe4e7eb, 0xeff1f4, 0x171b21, 0x00769c, 0xe19b1b, 0xf2f4f6,
+            ],
+            (Palette::Midnight, true) => [
+                0x010101, 0xeeeef0, 0x020203, 0x030305, 0x8f9eef, 0x0d1023, 0x06070a, 0x060609, 0x8d8f94, 0x08090c,
+                0xed4a49, 0x8f9eef, 0x000000, 0xdddee0, 0x040507, 0x000000, 0x111316, 0x92b9f8, 0xefb146, 0x000000,
+            ],
+            (Palette::Midnight, false) => [
+                0xfbfcfd, 0x17181c, 0xffffff, 0xffffff, 0x4b53c2, 0xfcfcfc, 0xeff0f2, 0xf1f2f3, 0x6a6c70, 0xecedef,
+                0xdf2225, 0x4b53c2, 0xf4f5f6, 0x25262a, 0xe7e8ea, 0xecedee, 0x191a1e, 0x355bbd, 0xe49e22, 0xf3f3f5,
+            ],
+            (Palette::Mono, true) => [
+                0x080808, 0xeeeeee, 0x0e0e0e, 0x101010, 0xebebeb, 0x0d0d0d, 0x171717, 0x161616, 0x8f8f8f, 0x191919,
+                0xed4a49, 0xebebeb, 0x050505, 0xdedede, 0x141414, 0x030303, 0x242424, 0xa4c9e9, 0xefb146, 0x050505,
+            ],
+            (Palette::Mono, false) => [
+                0xfcfcfc, 0x181818, 0xffffff, 0xffffff, 0x1b1b1b, 0xfcfcfc, 0xf0f0f0, 0xf2f2f2, 0x6c6c6c, 0xededed,
+                0xdf2225, 0x1b1b1b, 0xf5f5f5, 0x262626, 0xe8e8e8, 0xededed, 0x1b1b1b, 0x23588a, 0xe49e22, 0xf3f3f3,
+            ],
+            (Palette::Amber, true) => [
+                0x0b0805, 0xf0eeec, 0x120d09, 0x14100b, 0xf9b13e, 0x301904, 0x1b1611, 0x1a1510, 0x978d83, 0x1e1812,
+                0xed4a49, 0xf9b13e, 0x070503, 0xe1ddd9, 0x18130e, 0x040301, 0x29231d, 0xf4c26a, 0xefb146, 0x070503,
+            ],
+            (Palette::Amber, false) => [
+                0xfdfbfa, 0x1d1711, 0xffffff, 0xffffff, 0xf09c17, 0x311805, 0xf2f0ec, 0xf4f1ee, 0x726a61, 0xf0ece8,
+                0xdf2225, 0xf09c17, 0xf7f5f2, 0x2b251e, 0xebe7e2, 0xefece9, 0x1f1913, 0x9d5300, 0xe49e22, 0xf6f3f0,
+            ],
+        })
+    }
+}
+
+impl Tokens {
+    /// The tokens of a palette in dark or light mode.
+    pub fn of(palette: Palette, dark: bool) -> Tokens {
+        let mut t = if dark { Tokens::dark() } else { Tokens::light() };
+        let Some(v) = palette.values(dark) else {
+            return t;
+        };
+        t.background = hex(v[0]);
+        t.foreground = hex(v[1]);
+        t.card = hex(v[2]);
+        t.popover = hex(v[3]);
+        t.primary = hex(v[4]);
+        t.primary_foreground = hex(v[5]);
+        t.secondary = hex(v[6]);
+        t.muted = hex(v[7]);
+        t.muted_foreground = hex(v[8]);
+        t.accent = hex(v[9]);
+        t.destructive = hex(v[10]);
+        t.ring = hex(v[11]);
+        t.sidebar = hex(v[12]);
+        t.sidebar_foreground = hex(v[13]);
+        t.sidebar_accent = hex(v[14]);
+        t.rail = hex(v[15]);
+        t.tooltip = hex(v[16]);
+        t.link = hex(v[17]);
+        t.mention = hex(v[18]);
+        t.code = hex(v[19]);
+        t
+    }
+}
+
+/// The palette in use, and where the appearance choice is remembered.
+struct Appearance {
+    palette: Palette,
+    store: Option<std::sync::Arc<crate::store::Store>>,
+}
+
+impl Global for Appearance {}
+
+/// Loads the remembered appearance and applies it. `force_dark` overrides the stored mode.
+pub fn restore(store: std::sync::Arc<crate::store::Store>, force_dark: Option<bool>, cx: &mut App) {
+    let palette = store
+        .kv("palette")
+        .ok()
+        .flatten()
+        .map(|name| Palette::from_name(&name))
+        .unwrap_or(Palette::Neutral);
+    let dark = force_dark.unwrap_or_else(|| store.kv("theme").ok().flatten().as_deref() != Some("light"));
+    cx.set_global(Appearance {
+        palette,
+        store: Some(store),
+    });
+    install(dark, cx);
+}
+
+pub fn palette(cx: &App) -> Palette {
+    cx.try_global::<Appearance>()
+        .map(|appearance| appearance.palette)
+        .unwrap_or(Palette::Neutral)
+}
+
+/// Switches palette, keeping the current dark or light mode.
+pub fn set_palette(palette: Palette, cx: &mut App) {
+    let dark = cx.try_global::<Tokens>().map(|t| t.dark).unwrap_or(true);
+    let store = cx.try_global::<Appearance>().and_then(|a| a.store.clone());
+    if let Some(store) = &store {
+        let _ = store.set_kv("palette", palette.name());
+    }
+    cx.set_global(Appearance { palette, store });
+    install(dark, cx);
+}
+
+impl Tokens {
+    /// Text colour of a mention pill: the accent mixed 70 / 30 with the foreground.
+    pub fn mention_text(&self) -> Hsla {
+        let accent = gpui::Rgba::from(self.primary);
+        let text = gpui::Rgba::from(self.foreground);
+        let mix = |a: f32, b: f32| a * 0.7 + b * 0.3;
+        gpui::Rgba {
+            r: mix(accent.r, text.r),
+            g: mix(accent.g, text.g),
+            b: mix(accent.b, text.b),
+            a: 1.,
+        }
+        .into()
+    }
 }

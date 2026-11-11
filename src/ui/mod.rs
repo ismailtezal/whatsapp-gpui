@@ -56,9 +56,13 @@ pub fn run() {
         if let Some(font) = Embedded::get("fonts/Figtree-Variable.ttf") {
             let _ = cx.text_system().add_fonts(vec![font.data]);
         }
-        // Development aid: WA_THEME=light starts in the light theme.
-        let dark = std::env::var("WA_THEME").map(|theme| theme != "light").unwrap_or(true);
-        theme::install(dark, cx);
+        // Development aid: WA_THEME=light or dark overrides the remembered mode.
+        let forced = std::env::var("WA_THEME").ok().map(|theme| theme != "light");
+        theme::restore(store.clone(), forced, cx);
+        // Development aid: WA_PALETTE picks a palette for this run.
+        if let Ok(name) = std::env::var("WA_PALETTE") {
+            theme::set_palette(theme::Palette::from_name(&name), cx);
+        }
 
         // Call logs arrive inside history blobs; older builds did not store them.
         if store.kv("calls_imported").ok().flatten().is_none()

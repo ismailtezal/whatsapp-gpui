@@ -354,11 +354,7 @@ fn body_text(view: &MsgView, fallback: &str, t: &Tokens) -> Div {
                     });
                 }
                 SpanStyle::Mention(_) => {
-                    style.color = Some(if t.dark {
-                        gpui::rgb(0x7daeed).into()
-                    } else {
-                        gpui::rgb(0x285696).into()
-                    });
+                    style.color = Some(t.mention_text());
                     style.background_color = Some(t.tint(0.16));
                     style.font_weight = Some(FontWeight::MEDIUM);
                 }
