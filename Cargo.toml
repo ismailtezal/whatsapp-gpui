@@ -18,3 +18,6 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 ureq = "3.5"
 windows = { version = "0.62", features = ["Media_Playback", "Media_Core", "Foundation", "Storage", "Storage_FileProperties", "Storage_Streams", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_Foundation"] }
 sha2 = "0.10"
+
+[build-dependencies]
+winresource = "0.1"

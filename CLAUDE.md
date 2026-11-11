@@ -49,3 +49,10 @@ connection. Windows only. Private now, open source later.
 - Source files are reformatted after being written, so line-exact text replacement is
   fragile. Insert by anchor line, or append a new `impl` block.
 - Icons are Lucide SVGs in `assets/icons` at stroke width 1.75; add new ones there.
+- Work directly on `main`; the owner does not want a `dev` branch.
+- Releases: push a `v*` tag. `.github/workflows/release.yml` builds the app, the Inno
+  Setup installer (`installer/whatsapp-gpui.iss`) and a portable zip, and publishes
+  them. `ci.yml` tests and builds every push to `main`. Inno Setup is not installed on
+  this PC, so the installer is only built in CI.
+- Interface styles (Modern, Glass, Futuristic) live in `src/ui/theme.rs` as `Style`;
+  `WA_STYLE`, `WA_PALETTE` and `WA_THEME` override the stored choice for a dev run.

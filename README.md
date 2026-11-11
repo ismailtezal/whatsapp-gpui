@@ -11,7 +11,26 @@ connection. It links to your account as one more device, the same way WhatsApp D
 What works and what does not is tracked honestly, feature by feature, in
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
-## Run it
+## Install
+
+Download `whatsapp-gpui-setup-<version>.exe` from the repository's Releases page and run
+it. It installs for the current user only (no administrator rights), adds a Start menu
+entry and an uninstaller, and can add a desktop shortcut and start with Windows. The
+installer is not signed, so Windows SmartScreen asks for confirmation. The portable zip
+on the same page holds just the program.
+
+A release is made by pushing a version tag; the workflow in
+`.github/workflows/release.yml` builds and publishes it:
+
+```bash
+git tag v0.1.0
+```
+
+```bash
+git push origin v0.1.0
+```
+
+## Run it from source
 
 ```bash
 run.bat
