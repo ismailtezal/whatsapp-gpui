@@ -59,6 +59,11 @@ pub fn run() {
         // Development aid: WA_THEME=light or dark overrides the remembered mode.
         let forced = std::env::var("WA_THEME").ok().map(|theme| theme != "light");
         theme::restore(store.clone(), forced, cx);
+        theme::restore_style(cx);
+        // Development aid: WA_STYLE picks a surface style for this run.
+        if let Ok(name) = std::env::var("WA_STYLE") {
+            theme::set_style(theme::Style::from_name(&name), cx);
+        }
         // Development aid: WA_PALETTE picks a palette for this run.
         if let Ok(name) = std::env::var("WA_PALETTE") {
             theme::set_palette(theme::Palette::from_name(&name), cx);
@@ -78,6 +83,8 @@ pub fn run() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(940.), px(500.))),
+                // Glass needs a see-through window from the start.
+                window_background: theme::tokens(cx).window_backdrop(),
                 ..TitleBar::window_options()
             },
             |window, cx| {

@@ -25,6 +25,7 @@ pub const FONT_UI: &str = "Figtree";
 #[derive(Clone, Debug)]
 pub struct Tokens {
     pub dark: bool,
+    pub style: Style,
     pub background: Hsla,
     pub foreground: Hsla,
     pub card: Hsla,
@@ -62,6 +63,7 @@ impl Tokens {
     pub fn dark() -> Self {
         Tokens {
             dark: true,
+            style: Style::Modern,
             background: hex(0x07080b),
             foreground: hex(0xedeef0),
             card: hex(0x0c0e12),
@@ -95,6 +97,7 @@ impl Tokens {
     pub fn light() -> Self {
         Tokens {
             dark: false,
+            style: Style::Modern,
             background: hex(0xfbfcfd),
             foreground: hex(0x15181e),
             card: hex(0xffffff),
@@ -223,7 +226,7 @@ pub fn tokens(cx: &App) -> &Tokens {
 /// Installs the tokens and makes the component library's own widgets (text fields,
 /// menus, tooltips, scrollbars) use the same colours, font and radii.
 pub fn install(dark: bool, cx: &mut App) {
-    let t = Tokens::of(palette(cx), dark);
+    let t = Tokens::of(palette(cx), dark).styled(style(cx));
     // Remember the mode for the next start.
     if let Some(store) = cx.try_global::<Appearance>().and_then(|a| a.store.clone()) {
         let _ = store.set_kv("theme", if dark { "dark" } else { "light" });
@@ -244,6 +247,8 @@ pub fn install(dark: bool, cx: &mut App) {
         theme.radius = R_LG;
         theme.radius_lg = R_XL;
         theme.background = t.background;
+        // The component library's root view paints this one behind everything.
+        theme.tokens.background = t.background.into();
         theme.foreground = t.foreground;
         theme.border = t.border;
         theme.input = t.input;
@@ -443,4 +448,208 @@ impl Tokens {
         }
         .into()
     }
+}
+
+/// How surfaces are treated, on top of the palette and the dark / light mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Style {
+    /// Solid, layered surfaces: the design as specified.
+    #[default]
+    Modern,
+    /// Translucent surfaces over a blurred view of what is behind the window, with light
+    /// edges that read as the rim of a pane of glass.
+    Glass,
+    /// Deeper blacks, accent-coloured hairlines and a soft glow on what is active.
+    Futuristic,
+}
+
+impl Style {
+    pub const ALL: [Style; 3] = [Style::Modern, Style::Glass, Style::Futuristic];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Style::Modern => "Modern",
+            Style::Glass => "Glass",
+            Style::Futuristic => "Futuristic",
+        }
+    }
+
+    pub fn summary(self) -> &'static str {
+        match self {
+            Style::Modern => "Solid, layered surfaces",
+            Style::Glass => "Translucent panes over a blurred backdrop",
+            Style::Futuristic => "Deep blacks, accent lines and glow",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Style {
+        Style::ALL
+            .into_iter()
+            .find(|style| style.name().eq_ignore_ascii_case(name))
+            .unwrap_or_default()
+    }
+}
+
+impl Tokens {
+    /// Applies a style's surface treatment to the palette's colours.
+    pub fn styled(mut self, style: Style) -> Tokens {
+        self.style = style;
+        let alpha = |color: Hsla, a: f32| Hsla { a, ..color };
+        match style {
+            Style::Modern => {}
+            Style::Glass => {
+                // Chrome is the most see-through, the reading surface the least.
+                self.rail = alpha(self.rail, 0.34);
+                self.sidebar = alpha(self.sidebar, 0.26);
+                self.background = alpha(self.background, if self.dark { 0.62 } else { 0.70 });
+                self.card = alpha(self.card, if self.dark { 0.66 } else { 0.74 });
+                // Menus stay nearly solid: text over text must remain readable.
+                self.popover = alpha(self.popover, 0.93);
+                self.tooltip = alpha(self.tooltip, 0.95);
+                self.sidebar_accent = self.fg(0.09);
+                self.secondary = self.fg(0.08);
+                self.muted = self.fg(0.08);
+                self.accent = self.fg(0.11);
+                self.border = self.fg(0.14);
+                self.sidebar_border = self.fg(0.12);
+                self.input = self.fg(0.18);
+            }
+            Style::Futuristic => {
+                if self.dark {
+                    self.background = hex(0x04050a);
+                    self.sidebar = hex(0x020308);
+                    self.rail = hex(0x010205);
+                    self.card = hex(0x080a12);
+                    self.popover = hex(0x0a0d16);
+                    self.sidebar_accent = hex(0x0b0e18);
+                    self.accent = hex(0x10131e);
+                }
+                self.border = self.tint(0.20);
+                self.sidebar_border = self.tint(0.16);
+                self.input = self.tint(0.30);
+            }
+        }
+        self
+    }
+
+    /// The fill of a message bubble: ours or someone else's.
+    pub fn bubble(&self, mine: bool) -> Hsla {
+        match (self.style, mine) {
+            (Style::Modern, true) => self.tint(0.16),
+            (Style::Modern, false) => self.fg(0.06),
+            (Style::Glass, true) => self.tint(0.36),
+            (Style::Glass, false) => self.fg(0.12),
+            (Style::Futuristic, true) => self.tint(0.18),
+            (Style::Futuristic, false) => self.fg(0.045),
+        }
+    }
+
+    /// The edge of a message bubble.
+    pub fn bubble_border(&self, mine: bool) -> Hsla {
+        match (self.style, mine) {
+            (Style::Modern, _) => gpui::transparent_black(),
+            // A light rim, like the edge of glass catching light.
+            (Style::Glass, _) => self.fg(0.16),
+            (Style::Futuristic, true) => self.tint(0.60),
+            (Style::Futuristic, false) => self.tint(0.18),
+        }
+    }
+
+    /// The hairline round the floating main panel.
+    pub fn panel_border(&self) -> Hsla {
+        match self.style {
+            Style::Modern => self.fg(0.10),
+            Style::Glass => self.fg(0.20),
+            Style::Futuristic => self.tint(0.38),
+        }
+    }
+
+    /// The shadow of the floating main panel.
+    pub fn panel_shadow(&self) -> Vec<BoxShadow> {
+        let mut shadows = self.shadow_panel();
+        match self.style {
+            Style::Modern => {}
+            Style::Glass => {
+                // Depth below, and a bright inner top edge.
+                shadows.push(BoxShadow {
+                    color: hsla(0., 0., 0., if self.dark { 0.35 } else { 0.12 }),
+                    offset: point(px(0.), px(12.)),
+                    blur_radius: px(32.),
+                    spread_radius: px(-8.),
+                    inset: false,
+                });
+                shadows.push(BoxShadow {
+                    color: hsla(0., 0., 1., if self.dark { 0.10 } else { 0.55 }),
+                    offset: point(px(0.), px(1.)),
+                    blur_radius: px(0.),
+                    spread_radius: px(0.),
+                    inset: true,
+                });
+            }
+            Style::Futuristic => shadows.push(BoxShadow {
+                color: self.tint(0.22),
+                offset: point(px(0.), px(0.)),
+                blur_radius: px(28.),
+                spread_radius: px(-6.),
+                inset: false,
+            }),
+        }
+        shadows
+    }
+
+    /// A glow for what is active (selected rail tile, send button). Empty outside the
+    /// futuristic style.
+    pub fn glow(&self) -> Vec<BoxShadow> {
+        match self.style {
+            Style::Futuristic => vec![BoxShadow {
+                color: self.tint(0.55),
+                offset: point(px(0.), px(0.)),
+                blur_radius: px(14.),
+                spread_radius: px(0.),
+                inset: false,
+            }],
+            _ => Vec::new(),
+        }
+    }
+
+    /// What the window shows behind its own surfaces.
+    pub fn window_backdrop(&self) -> gpui::WindowBackgroundAppearance {
+        match self.style {
+            Style::Glass => gpui::WindowBackgroundAppearance::Blurred,
+            _ => gpui::WindowBackgroundAppearance::Opaque,
+        }
+    }
+}
+
+struct StyleChoice(Style);
+
+impl Global for StyleChoice {}
+
+pub fn style(cx: &App) -> Style {
+    cx.try_global::<StyleChoice>()
+        .map(|choice| choice.0)
+        .unwrap_or_default()
+}
+
+/// Applies the style remembered from the last run. Call after [`restore`].
+pub fn restore_style(cx: &mut App) {
+    let remembered = cx
+        .try_global::<Appearance>()
+        .and_then(|appearance| appearance.store.clone())
+        .and_then(|store| store.kv("style").ok().flatten())
+        .map(|name| Style::from_name(&name))
+        .unwrap_or_default();
+    cx.set_global(StyleChoice(remembered));
+    let dark = cx.try_global::<Tokens>().map(|t| t.dark).unwrap_or(true);
+    install(dark, cx);
+}
+
+/// Switches style, keeping the palette and the dark or light mode.
+pub fn set_style(style: Style, cx: &mut App) {
+    if let Some(store) = cx.try_global::<Appearance>().and_then(|a| a.store.clone()) {
+        let _ = store.set_kv("style", style.name());
+    }
+    cx.set_global(StyleChoice(style));
+    let dark = cx.try_global::<Tokens>().map(|t| t.dark).unwrap_or(true);
+    install(dark, cx);
 }

@@ -459,7 +459,9 @@ fn content(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> Div {
                 Some(path) => frame.child(
                     gpui::img(std::path::PathBuf::from(path))
                         .size(px(side))
-                        .object_fit(gpui::ObjectFit::Contain),
+                        .object_fit(gpui::ObjectFit::Contain)
+                        // An identity lets the picture keep its place in an animation.
+                        .id(("sticker", key)),
                 ),
                 None => frame
                     .rounded(R_LG)
@@ -868,7 +870,7 @@ fn footer(view: &MsgView, t: &Tokens) -> Div {
 
 /// Draws one message as a WhatsApp bubble: ours on the right, theirs on the left, with
 /// the time and ticks inside. Colours, radii and type come from the design tokens.
-pub fn message_row(view: &MsgView, hooks: &RowHooks, cx: &App) -> AnyElement {
+pub fn message_row(view: &MsgView, hooks: &RowHooks, toolbar: Option<AnyElement>, cx: &App) -> AnyElement {
     let t = tokens(cx);
     let row = &view.row;
 
@@ -882,7 +884,7 @@ pub fn message_row(view: &MsgView, hooks: &RowHooks, cx: &App) -> AnyElement {
     let mine = row.from_me;
     // Stickers stand alone, without a bubble behind them.
     let bare = row.kind == MsgKind::Sticker && !view.view_once;
-    let fill = if mine { t.tint(0.16) } else { t.fg(0.06) };
+    let fill = t.bubble(mine);
     let name_color = tint_of(&view.author_seed, t.dark).1;
 
     let mut bubble = div()
@@ -893,7 +895,13 @@ pub fn message_row(view: &MsgView, hooks: &RowHooks, cx: &App) -> AnyElement {
         .gap(px(3.))
         .rounded(R_XL);
     if !bare {
-        bubble = bubble.bg(fill).px(px(9.)).pt(px(6.)).pb(px(5.));
+        bubble = bubble
+            .bg(fill)
+            .border_1()
+            .border_color(t.bubble_border(mine))
+            .px(px(9.))
+            .pt(px(6.))
+            .pb(px(5.));
         // The first bubble of a run gets a tighter corner on its own side, like a tail.
         if view.head {
             bubble = if mine {
@@ -1010,7 +1018,8 @@ pub fn message_row(view: &MsgView, hooks: &RowHooks, cx: &App) -> AnyElement {
         .flex()
         .gap(px(8.))
         .when(mine, |this| this.justify_end())
-        .mt(px(if view.head { 8. } else { 2. }));
+        // Padding, not margin, so the gap above still counts as hovering this row.
+        .pt(px(if view.head { 8. } else { 2. }));
     // Other people's bubbles in a group sit beside their picture.
     if view.group && !mine {
         line = line.child(if view.head {
@@ -1019,7 +1028,13 @@ pub fn message_row(view: &MsgView, hooks: &RowHooks, cx: &App) -> AnyElement {
             div().w(px(28.)).flex_shrink_0()
         });
     }
-    line.child(stack).into_any_element()
+    // The reaction bar sits beside the bubble, on its inner side.
+    match (toolbar, mine) {
+        (Some(bar), true) => line.child(bar).child(stack),
+        (Some(bar), false) => line.child(stack).child(bar),
+        (None, _) => line.child(stack),
+    }
+    .into_any_element()
 }
 
 /// A date separator: a centred pill, as WhatsApp shows it.

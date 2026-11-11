@@ -89,6 +89,8 @@ pub struct Shell {
     qr: Option<String>,
     last_error: Option<String>,
     confirm_logout: bool,
+    /// The window backdrop last applied, so it is only set when the style changes.
+    backdrop: Option<gpui::WindowBackgroundAppearance>,
     privacy: Vec<(String, String)>,
     blocked: Vec<String>,
     /// Picking several contacts for a new group instead of one to chat with.
@@ -178,6 +180,7 @@ impl Shell {
             qr: None,
             last_error: None,
             confirm_logout: false,
+            backdrop: None,
             privacy: Vec::new(),
             blocked: Vec::new(),
             group_mode: false,
@@ -604,7 +607,9 @@ impl Shell {
                 .cursor_pointer()
                 .border_2()
                 .border_color(if selected { t.primary } else { gpui::transparent_black() })
-                .when(selected, |this| this.bg(t.tint(0.12)).text_color(t.primary))
+                .when(selected, |this| {
+                    this.bg(t.tint(0.12)).text_color(t.primary).shadow(t.glow())
+                })
                 .when(!selected, |this| {
                     this.bg(t.sidebar_accent)
                         .text_color(t.muted_foreground)
@@ -1591,6 +1596,7 @@ impl Shell {
                     )
                     .child(rule())
                     .child(heading("Appearance", "The look follows diskurt's modern design."))
+                    .child(self.style_row(cx))
                     .child(self.palette_row(cx))
                     .child(
                         div()
@@ -1761,6 +1767,12 @@ impl Render for Shell {
             _ => self.empty_panel(cx),
         };
         let chat_menu = self.chat_menu_overlay(window, cx);
+        // Glass shows a blurred view of what is behind the window; the others are opaque.
+        let backdrop = t.window_backdrop();
+        if self.backdrop != Some(backdrop) {
+            window.set_background_appearance(backdrop);
+            self.backdrop = Some(backdrop);
+        }
         div()
             .size_full()
             .flex()
@@ -1789,9 +1801,9 @@ impl Render for Shell {
                                         .size_full()
                                         .rounded(R_XL)
                                         .border_1()
-                                        .border_color(t.fg(0.10))
+                                        .border_color(t.panel_border())
                                         .bg(t.background)
-                                        .shadow(t.shadow_panel())
+                                        .shadow(t.panel_shadow())
                                         .overflow_hidden()
                                         .child(panel),
                                 ),
@@ -2004,6 +2016,54 @@ impl Shell {
                     .child(palette.name())
                     .on_click(cx.listener(move |_, _, _, cx| {
                         super::theme::set_palette(palette, cx);
+                        cx.refresh_windows();
+                    })),
+            );
+        }
+        row.into_any_element()
+    }
+}
+
+impl Shell {
+    /// The surface-style choices in Settings.
+    fn style_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        use super::theme::Style;
+        let t = tokens(cx).clone();
+        let current = super::theme::style(cx);
+        let mut row = div().flex().flex_wrap().gap(px(8.)).mb(px(12.));
+        for (slot, style) in Style::ALL.into_iter().enumerate() {
+            let active = style == current;
+            let hover = t.fg(0.12);
+            row = row.child(
+                div()
+                    .id(("style", slot))
+                    .w(px(204.))
+                    .px(px(12.))
+                    .py(px(10.))
+                    .rounded(R_LG)
+                    .border_1()
+                    .border_color(if active { t.primary } else { t.fg(0.08) })
+                    .bg(if active { t.tint(0.10) } else { t.fg(0.05) })
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .cursor_pointer()
+                    .hover(move |this| this.bg(hover))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if active { t.primary } else { t.foreground })
+                            .child(style.name()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(t.muted_foreground)
+                            .child(style.summary()),
+                    )
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        super::theme::set_style(style, cx);
                         cx.refresh_windows();
                     })),
             );

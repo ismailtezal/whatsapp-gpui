@@ -849,17 +849,10 @@ impl ChatView {
                 }) as super::message::ClickFn
             }),
         };
-        let row = message_row(view, &hooks, cx);
-        if matches!(view.row.kind, MsgKind::System | MsgKind::Revoked) {
-            return row;
-        }
-
         let hover = if t.dark { t.accent } else { t.muted };
         let mut toolbar = div()
-            .absolute()
-            .top(px(-10.))
-            .when(view.row.from_me, |this| this.left(px(16.)))
-            .when(!view.row.from_me, |this| this.right(px(16.)))
+            .flex_none()
+            .h(px(34.))
             .invisible()
             .group_hover("row", |style| style.visible())
             .flex()
@@ -932,6 +925,12 @@ impl ChatView {
                 },
             )));
 
+        // Notices and deleted messages have no actions; everything else gets the bar.
+        let plain = matches!(view.row.kind, MsgKind::System | MsgKind::Revoked);
+        let row = message_row(view, &hooks, (!plain).then(|| toolbar.into_any_element()), cx);
+        if plain {
+            return row;
+        }
         let menu_id = id.clone();
         div()
             .id(("row", index))
@@ -948,7 +947,6 @@ impl ChatView {
                 }),
             )
             .child(row)
-            .child(toolbar)
             .into_any_element()
     }
 
@@ -1510,7 +1508,9 @@ impl ChatView {
                                 .items_center()
                                 .justify_center()
                                 .cursor_pointer()
-                                .when(has_text, |this| this.bg(t.primary).text_color(t.primary_foreground))
+                                .when(has_text, |this| {
+                                    this.bg(t.primary).text_color(t.primary_foreground).shadow(t.glow())
+                                })
                                 .when(!has_text, |this| this.text_color(t.muted_foreground))
                                 .child(icon(if has_text { "send-horizontal" } else { "mic" }))
                                 .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
