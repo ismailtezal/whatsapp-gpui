@@ -34,7 +34,7 @@ tried without touching someone else or changing the account.
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Receive messages | Partial | The handling is covered by tests (text, own-device messages, groups, reactions, deletes, edits). One real incoming message arrived while the app was running: it appeared in the chat list with its preview and unread badge. It was not watched arriving inside an open conversation. |
-| Send text | Verified | |
+| Send text | Verified (earlier) / Built (new delivery) | Messages to one chat now go out one after another, in the order written. A send waits for the connection (up to ten minutes) instead of failing while the app is still connecting, and is tried again under the same ID if the connection drops; only then is it marked failed. A failed message has "Send again" in its menu. Messages left half-sent by a closed app go out again at the next start (the last six hours only). The new delivery path compiles and its parts are tested, but no message has been sent through it yet. |
 | Reply (quote), jump to the quoted message | Verified (send) / Built (jump) | |
 | Reactions: send, show | Verified | Quick reactions and the full emoji picker. |
 | Motion | Verified (menu, in slow motion) / Built (rest) | One small set of animations in `src/ui/motion.rs`, after Emil Kowalski's rules: menus and pickers enter in 140 ms from the side they were asked from, dialogs and the call card settle in 200 ms, viewers and the editor fade in 160 ms, the info panel slides in 240 ms, a newly arrived message rises into place in 180 ms; all on a strong ease-out, all leave at once; buttons and menu items dim while pressed. Nothing animates on key presses, chat switching or hover. GPUI cannot scale an element, so entrances move and fade instead of growing. `WA_SLOWMO=<factor>` stretches them for inspection; the menu entrance was looked at that way. |
@@ -48,8 +48,12 @@ tried without touching someone else or changing the account.
 | Forward, with a chat picker | Verified (send) / Built (picker) | A message was forwarded within "Dosyalar" and arrived marked as forwarded. The picker was not clicked through. |
 | Copy text | Built | |
 | Message info (who received and read) | Built | From stored receipts. |
+| Events handled in order, none dropped | Built | The connection library by default handled sixteen events at once and dropped events once 256 were waiting, so an edit or a receipt could be applied before its message, and a reconnect after hours offline or a history sync could lose messages silently. Events are now handled one at a time in arrival order with room for 200,000. Not yet watched through a real burst. |
+| Problems are shown | Built | A message that could not be sent, or a request the server refused, appears at the bottom of the window for seven seconds (a click dismisses it). Before, it was only in Settings. The notice in a chat's header now clears itself after five seconds. |
+| Smaller fixes from a code audit | Built | Messages into a chat with disappearing messages carry the timer; a reply to my own message names me as its author; editing a reply keeps the quote; a timed mute ends; the tray and taskbar badge count every chat whichever section is showing; no notifications for the backlog after a reconnect, and a muted chat stays silent even when another section is showing; "typing…" lapses after 20 seconds without a repeat; a draft is cleared when it is sent; the "New" line stays where it was when the chat was opened; a new message no longer re-measures the whole conversation or throws a scrolled-up view to the top; Escape leaves edit mode; deleting a chat takes two clicks and closes it. Not fixed yet from the same audit: group ticks turn blue on the first reader; a reply to a message this device does not have shows no quote; nothing shows while a file uploads; the message-info panel and a few lists read the database while drawing. |
+| "Waiting for this message" | Built | A message this device cannot decrypt yet shows the same placeholder as the official client and is replaced when the sender's phone delivers it again. Not seen live. |
 | Read receipts (blue ticks) | Built | Test runs set `WA_READONLY=1`, so none has been sent for real. |
-| Delivery ticks | Partial | Sent, delivered, read are stored and drawn; history shows all three, live only "sent" was observed. |
+| Delivery ticks | Fixed (tested) | A "delivered" or "read" that arrived before its message (usual for messages typed on the phone) used to be lost, leaving one grey tick for ever: 59 of one day's messages were found that way with their receipts on record. A new message row now takes its ticks from the receipts on record, a receipt that names the chat by an unknown address finds its message by ID, and existing rows were repaired once (checked on a copy: 70 stuck messages became 5). In groups the ticks still turn blue on the first reader instead of the last; not fixed. |
 | Typing indicator: send, show | Built | Sent at most once every 8 seconds while typing. Sending is disabled in test runs. |
 | Presence (online, last seen) | Built | The account shows as online only while the window is in front. |
 | Mentions | Verified (send, picker) | Typing `@` in a group lists the members (search ignores accents); arrows, Tab, Enter or a click pick one, and the mention sits in the message box as one coloured unit. Checked in the test copy by typing and picking with the keyboard. A message mentioning this account itself was sent to "Dosyalar" and carried the mention. Edits and captions carry mentions too (built). In the chat list and in copies that lost their tag (forwards), `@number` is shown as the person's name when it is known. `@all` is not built. |
@@ -180,35 +184,42 @@ Known differences from the spec:
 - The spec was extracted from diskurt's source; there was no screenshot of the modern
   design to compare against, so small visual differences are likely.
 
-## The database incident (2026-11-11)
+## The database incidents (2026-11-11) and their cause
 
-During development the chat database was found damaged: SQLite could not read its
-schema, and the newest pages of the file were blank. Recent writes had been recorded in
-SQLite's write-ahead log and never reached the main file. It was rebuilt from its intact
-data pages and the saved history files: 73,754 messages and 131 chats, with messages up
-to the minute before the damage and no gap seen in the hours before it. It cannot be
-ruled out that a few messages of that morning are missing. The damaged file is kept in
-`%LOCALAPPDATA%\whatsapp-gpui\backup-20261111-111714`.
+The chat database was damaged twice on 2026-11-11. The cause, found that evening:
 
-The cause was not proven. Development test processes were sharing the file with each
-other at the time. Two stress tests on scratch copies (several writers with 33 random
-force-kills; 120 rounds of the voice codec next to a warm database cache) both left the
-database intact. Every plausible cause was therefore removed: interface tests use a
-throwaway snapshot, the voice encoder runs in a child process, and the app repairs,
-checks and backs up its database by itself (see "Data safety").
+Development runs inside the Claude desktop app, which Windows packages in a container.
+A program started from there sees a redirected `AppData\Local`: what it writes goes to
+the container's private copy of the folder, and a file that copy lacks is silently
+taken from the real folder. So there were two data folders all along, each a separately
+linked WhatsApp device: the real one (the app started from Explorer; linked by the owner
+at 08:44) and the container's (everything started from the development shell; linked at
+01:56). A database opened through the merged view could be given the *other* database's
+write-ahead log.
 
-## Test leftovers on the account
+- Morning: the container copy's database was found unreadable and was rebuilt from its
+  data pages and the saved history files.
+- Evening, 21:45: a snapshot tool opened the container copy's `chats.db` while that copy
+  had no log of its own. SQLite took the real folder's log (left by the owner's app,
+  which had run from 19:53 to 20:15), applied it to the wrong database and deleted it.
+  The container copy was damaged; the owner's copy lost what it had written in those 22
+  minutes. The repair that followed could not rebuild in place, fell back to restoring a
+  backup, and in doing so deleted what it took for the damaged file: the owner's copy's
+  `chats.db`.
 
-Left behind by the checks, all clearly labelled:
+What was done the same evening: the owner's copy was restored from its own 19:53 backup
+(73,694 messages), then given every row the container copy's intact 19:51 backup had
+that it lacked (the whole day's messages, which that device had also received) and
+every row that could be read back from the damaged file (which held the lost log's
+pages). Both copies now hold 73,919 messages and pass SQLite's integrity check. The
+damaged file is kept in the container copy's `damaged-1794423405` folder. What cannot be
+ruled out: a few messages or setting changes from 19:53 to 20:15 that were in the lost
+log and could not be read back.
 
-- In "Dosyalar": one edited test message, one test reply, one test poll, a sticker,
-  a two-second test voice note (a tone), a "mention check" message, a forwarded copy of
-  it, and several "This message was deleted" markers.
-- Groups the account has left, which can be deleted from the chat list: "wagpui test
-  group renamed" and "wagpui settings test".
-- A community named "wagpui community" followed by a number was created and closed
-  again. Its announcement and general groups may still be listed.
-- A status posted to this account only, removed again after a few seconds.
+What prevents a repeat: `src/paths.rs` finds the folder's true location and every file
+is opened by it, so a process works on one copy or the other and never on a mixture;
+the snapshot for interface tests lives inside the project; the snapshot tool keeps the
+previous snapshot until a new one has succeeded; the app says so when it is running on
+a container's private copy. The earlier stress tests could not reproduce the damage
+because they ran on scratch folders that have no twin in the real location.
 
-On this PC: CMake was installed with winget (the native Opus library used for calls is
-built with it).

@@ -15,7 +15,9 @@
 #        scripts/uitest.sh stop
 cd "$(dirname "$0")/.." || exit 1
 exe=target/uitest/release/wa-uitest.exe
-data="$LOCALAPPDATA/whatsapp-gpui-uitest"
+# The snapshot lives inside the project (not under AppData, which Windows redirects for
+# programs started from a packaged app; see src/paths.rs).
+data="$(pwd -W)/target/uitest-data"
 snapshot() {
   [ -f target/debug/wa-snapshot.exe ] || cargo build --bin wa-snapshot 2>&1 | grep -E "^error" -A8
   # The snapshot tool reads the real folder; it must not inherit a test data folder.

@@ -147,6 +147,14 @@ pub struct Shell {
     chat_menu: Option<(String, Point<Pixels>)>,
     qr: Option<String>,
     last_error: Option<String>,
+    /// The problem being shown at the bottom of the window, and since when.
+    toast: Option<(String, std::time::Instant)>,
+    /// The problem last put on show, so that it is shown once.
+    toast_seen: Option<String>,
+    /// Unread messages in chats that are neither muted nor archived, for the badges.
+    unread_total: i64,
+    /// The chat whose "Delete chat" was clicked once and waits for the second click.
+    confirm_delete: Option<String>,
     confirm_logout: bool,
     /// The window backdrop last applied, so it is only set when the style changes.
     backdrop: Option<gpui::WindowBackgroundAppearance>,
@@ -317,6 +325,10 @@ impl Shell {
             chat_menu: None,
             qr: None,
             last_error: None,
+            toast: None,
+            toast_seen: None,
+            unread_total: 0,
+            confirm_delete: None,
             confirm_logout: false,
             backdrop: None,
             stale_chats: false,
@@ -388,14 +400,18 @@ impl Shell {
     }
 
     /// Tells the tray icon and the taskbar badge how many messages are unread.
-    fn update_badge(&self) {
+    fn update_badge(&mut self) {
+        // Every chat that is not archived counts, whichever section is on screen.
+        let unread: i64 = self
+            .store
+            .chats(false)
+            .unwrap_or_default()
+            .iter()
+            .filter(|chat| !crate::model::muted_now(chat.mute_until) && !chat.archived)
+            .map(|chat| chat.unread.max(chat.marked_unread as i64))
+            .sum();
+        self.unread_total = unread;
         if let Some(tray) = crate::tray::current() {
-            let unread: i64 = self
-                .chats
-                .iter()
-                .filter(|chat| chat.mute_until == 0 && !chat.archived)
-                .map(|chat| chat.unread.max(chat.marked_unread as i64))
-                .sum();
             tray.set_unread(unread.clamp(0, u32::MAX as i64) as u32);
         }
     }
@@ -550,6 +566,7 @@ impl Shell {
                 chat,
                 sender,
                 preview,
+                backlog,
                 ..
             } => {
                 let open_and_focused = self.window_active && self.selected.as_deref() == Some(chat.as_str());
@@ -557,9 +574,15 @@ impl Shell {
                     // The chat is in front of the user: what arrives is read as it arrives.
                     self.backend.send(Command::MarkRead { chat: chat.clone() });
                 }
-                let row = self.chats.iter().find(|c| c.jid == chat);
-                let muted = row.is_some_and(|c| c.mute_until != 0);
-                if self.notify_on && !open_and_focused && !muted && chat != "status@broadcast" {
+                // The chat may not be in the list on screen (another section is showing):
+                // read it from the store then, so its mute and its name still count.
+                let row = match self.chats.iter().find(|c| c.jid == chat) {
+                    Some(row) => Some(row.clone()),
+                    None => self.store.chat(&chat).ok().flatten(),
+                };
+                let row = row.as_ref();
+                let muted = row.is_some_and(|c| crate::model::muted_now(c.mute_until));
+                if self.notify_on && !backlog && !open_and_focused && !muted && chat != "status@broadcast" {
                     let title = row.map(|c| c.title.clone()).unwrap_or_else(|| display_number(&chat));
                     let body = match (row.map(|c| c.kind), sender) {
                         (Some(ChatKind::User), _) | (_, None) => preview,
@@ -846,12 +869,7 @@ impl Shell {
 
     fn rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = tokens(cx).clone();
-        let unread_total: i64 = self
-            .chats
-            .iter()
-            .filter(|c| c.mute_until == 0 && self.section != Section::Archived)
-            .map(|c| c.unread)
-            .sum();
+        let unread_total = self.unread_total;
         let chat_sections = [Section::Chats, Section::Unread, Section::Groups];
         let tile = |section: Section, name: &'static str, label: &'static str, cx: &mut Context<Self>| {
             let selected =
@@ -1028,7 +1046,7 @@ impl Shell {
         let t = tokens(cx).clone();
         let selected = self.selected.as_deref() == Some(chat.jid.as_str());
         let unread = chat.unread > 0 || chat.marked_unread;
-        let muted = chat.mute_until != 0;
+        let muted = crate::model::muted_now(chat.mute_until);
 
         let detail: AnyElement = if let Some(draft) = chat.draft.as_deref().filter(|d| !d.is_empty()) {
             div()
@@ -1799,11 +1817,11 @@ impl Shell {
             ),
             (
                 "bell-off",
-                if chat.mute_until != 0 { "Unmute" } else { "Mute notifications" },
+                if crate::model::muted_now(chat.mute_until) { "Unmute" } else { "Mute notifications" },
                 false,
                 Command::Mute {
                     chat: jid.clone(),
-                    until: if chat.mute_until != 0 { None } else { Some(0) },
+                    until: if crate::model::muted_now(chat.mute_until) { None } else { Some(0) },
                 },
             ),
             (
@@ -1815,7 +1833,17 @@ impl Shell {
                     archived: !chat.archived,
                 },
             ),
-            ("trash", "Delete chat", true, Command::DeleteChat { chat: jid.clone() }),
+            (
+                "trash",
+                // Deleting removes the chat on every device: it takes a second click.
+                if self.confirm_delete.as_deref() == Some(jid.as_str()) {
+                    "Click again to delete everywhere"
+                } else {
+                    "Delete chat"
+                },
+                true,
+                Command::DeleteChat { chat: jid.clone() },
+            ),
         ];
         let mut panel = div()
             .w(px(224.))
@@ -1834,6 +1862,20 @@ impl Shell {
             }
             panel = panel.child(item(slot, glyph, label, danger).on_click(cx.listener(
                 move |this, _, _, cx| {
+                    if let Command::DeleteChat { chat } = &command {
+                        if this.confirm_delete.as_deref() != Some(chat.as_str()) {
+                            // First click: ask. The menu stays open.
+                            this.confirm_delete = Some(chat.clone());
+                            cx.notify();
+                            return;
+                        }
+                        // The deleted chat must not stay open and usable.
+                        if this.selected.as_deref() == Some(chat.as_str()) {
+                            this.selected = None;
+                            this.chat = None;
+                        }
+                    }
+                    this.confirm_delete = None;
                     this.backend.send(command.clone());
                     this.chat_menu = None;
                     cx.notify();
@@ -1844,10 +1886,12 @@ impl Shell {
         let size = window.viewport_size();
         let close = cx.listener(|this, _: &MouseDownEvent, _, cx| {
             this.chat_menu = None;
+            this.confirm_delete = None;
             cx.notify();
         });
         let close_right = cx.listener(|this, _: &MouseDownEvent, _, cx| {
             this.chat_menu = None;
+            this.confirm_delete = None;
             cx.notify();
         });
         Some(
@@ -2322,6 +2366,26 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf::frame();
         let _perf = crate::perf::scope("shell.render");
+        // A new problem (a message that could not be sent, a request the server refused)
+        // is shown at the bottom of the window for a few seconds. It used to be visible
+        // only in Settings.
+        if self.last_error != self.toast_seen {
+            self.toast_seen = self.last_error.clone();
+            if let Some(problem) = self.last_error.clone() {
+                let since = std::time::Instant::now();
+                self.toast = Some((problem, since));
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(std::time::Duration::from_secs(7)).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.toast.as_ref().is_some_and(|(_, shown)| *shown == since) {
+                            this.toast = None;
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
         // Development aid: WA_FAKE_CALL=ringing, calling or connected shows the call card
         // without any call, for screenshots.
         if !self.fake_call_shown
@@ -2428,6 +2492,38 @@ impl Render for Shell {
             )
             .children(chat_menu)
             .children(self.call_card(cx))
+            .children(self.toast.clone().map(|(problem, _)| {
+                let t = tokens(cx);
+                // A row that only centres the toast; a click on the toast dismisses it.
+                div().absolute().bottom(px(20.)).left_0().right_0().flex().justify_center().child(
+                    super::motion::settle(
+                        div()
+                            .id("toast")
+                            .occlude()
+                            .max_w(px(560.))
+                            .px(px(14.))
+                            .py(px(10.))
+                            .rounded(R_LG)
+                            .border_1()
+                            .border_color(t.border)
+                            .bg(t.popover)
+                            .shadow(t.shadow_dialog())
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .text_size(px(13.))
+                            .cursor_pointer()
+                            .child(icon("circle-alert").text_color(t.destructive))
+                            .child(div().min_w_0().child(SharedString::from(problem)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toast = None;
+                                cx.notify();
+                            })),
+                        "toast-settle",
+                        super::motion::From::Below,
+                    ),
+                )
+            }))
             // The marker of a middle-button auto-scroll, where the button was pressed.
             .children(window.auto_scroll_anchor().map(|anchor| {
                 let t = tokens(cx);

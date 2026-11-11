@@ -58,6 +58,19 @@ pub fn run() {
         }
     };
 
+    // Started from inside a packaged program (a terminal in one, a Run button), the app
+    // works on that program's private copy of its data folder: a different set of chats,
+    // and a different linked device, from the app started the usual way. Say so.
+    let repair_notice = if crate::paths::is_private_copy() && std::env::var_os("WA_DATA_DIR").is_none() {
+        let note = "This copy was started from inside another program, so it uses that program's private data folder, not the one WhatsApp uses when you start it from the Start menu or Explorer. Chats and the linked device here are separate.";
+        Some(match repair_notice {
+            Some(other) => format!("{other} {note}"),
+            None => note.to_string(),
+        })
+    } else {
+        repair_notice
+    };
+
     gpui_platform::application().with_assets(Assets).run(move |cx: &mut App| {
         gpui_component::init(cx);
         if let Some(font) = Embedded::get("fonts/Figtree-Variable.ttf") {

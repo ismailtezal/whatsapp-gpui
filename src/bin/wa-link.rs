@@ -17,12 +17,7 @@ use whatsapp_rust::waproto::whatsapp::device_props::{HistorySyncConfig, Platform
 static PAGE_OPENED: AtomicBool = AtomicBool::new(false);
 
 fn data_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let dir = base.join("whatsapp-gpui");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+    whatsapp_gpui::paths::data_dir()
 }
 
 fn write_page(body: &str, refresh: bool) -> PathBuf {

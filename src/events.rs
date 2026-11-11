@@ -35,6 +35,9 @@ pub enum UiEvent {
         id: String,
         sender: Option<String>,
         preview: String,
+        /// Delivered from the backlog after a reconnect, not as it was sent: no
+        /// notification is raised for it.
+        backlog: bool,
     },
     Activity {
         chat: String,
@@ -294,6 +297,11 @@ pub enum Command {
         reply_to: Option<String>,
         /// People mentioned in the caption.
         mentions: Vec<String>,
+    },
+    /// Sends again a message of ours that failed, or is still waiting, under the same ID.
+    Resend {
+        chat: String,
+        id: String,
     },
     React {
         chat: String,

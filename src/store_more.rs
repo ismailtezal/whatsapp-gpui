@@ -381,3 +381,21 @@ impl Store {
             .or_else(|| self.known_name(&format!("{digits}@lid")))
     }
 }
+
+impl Store {
+    /// Messages of ours that were stored but never confirmed sent since `since`, oldest
+    /// first, as (chat, ID): what a restart finds half-sent. Status posts and channel
+    /// posts are left out.
+    pub fn pending_outgoing(&self, since: i64) -> Result<Vec<(String, String)>> {
+        self.with(|tx| {
+            let mut statement = tx.conn.prepare(
+                "SELECT chat, id FROM messages
+                 WHERE from_me = 1 AND status = 1 AND ts >= ?1
+                   AND chat != 'status@broadcast' AND chat NOT LIKE '%@newsletter'
+                 ORDER BY ts, rowid",
+            )?;
+            let rows = statement.query_map([since], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect()
+        })
+    }
+}

@@ -37,7 +37,7 @@ connection. Windows only. Private now, open source later.
 - `src/bin/wa-link.rs`: QR linking tool. `src/bin/wactl.rs`: inspect the store (masked).
   `src/bin/wa-test.rs`: end-to-end checks. `src/bin/wa-audio.rs`: audio playback check.
 - `.reference/whatsapp-rust-docs/`: local copy of the library docs (not committed).
-- Runtime data: `%LOCALAPPDATA%\whatsapp-gpui\`.
+- Runtime data: `%LOCALAPPDATA%\whatsapp-gpui\` (but see "Two data folders" below).
 
 ## Working notes
 
@@ -48,17 +48,43 @@ connection. Windows only. Private now, open source later.
   Their sources under `~/.cargo/registry/src` are the API reference.
 - `whatsapp-rust` is pinned to a git commit; it bundles SQLite via `libsqlite3-sys 0.38`,
   so `rusqlite` must stay on 0.40.x.
-- Only one process may use `session.db` at a time. Close the app before `wa-test`.
-- **The chat database is the owner's data. Protect it.** On 2026-11-11 `chats.db` was
-  found damaged (SQLite could not read its schema; recent writes had been lost between
-  processes sharing the file). It was rebuilt with nothing known to be missing, but the
-  cause was not proven: force-killing concurrent writers and the voice codec were both
-  stress-tested and neither reproduced it. Rules since then:
+- **Two data folders, two linked devices.** A program started from a packaged app (the
+  Claude desktop app's shell: every command an assistant runs, and anything the owner
+  starts with a Run button there) sees a redirected `AppData\Local`. Its writes go to
+  `AppData\Local\Packages\Claude_…\LocalCache\Local\whatsapp-gpui` (the *container
+  copy*), and a file that copy lacks is silently read, written or deleted in the real
+  `AppData\Local\whatsapp-gpui` (the *owner's copy*, used when the app is started from
+  Explorer, the Start menu or `run.bat`). Each copy is a separately linked WhatsApp
+  device with its own `session.db` and `chats.db`.
+  - `src/paths.rs` finds the true folder (it writes a marker file and looks where it
+    landed) and everything opens files by that true path. Never build a data path from
+    `LOCALAPPDATA` yourself; use `paths::data_dir()` or `paths::default_data_dir()`.
+  - Tools and tests run from the shell act on the container copy and its device. They
+    cannot disturb the owner's running app, and they say nothing about the owner's copy.
+  - To read or repair the owner's copy, run the command outside the container, with
+    full paths and its output sent to a file in the project:
+    `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='cmd /c "… > C:\Projects\whatsapp-gpui\.reference\out.txt 2>&1"'}`.
+    Only while the owner's app is not running. Never delete anything there.
+  - A folder link whose target is written with the real path is followed to the owner's
+    copy even from inside the container. Do not make such links into the app's data.
+- Only one process may use a `session.db` at a time. Close the app that uses the same
+  copy before `wa-test`.
+- **The chat database is the owner's data. Protect it.** On 2026-11-11 it was damaged
+  twice, both times by the redirection above, before that was understood: a tool run
+  from the shell opened the container copy's `chats.db` through the merged view while
+  that copy had no write-ahead log of its own, so SQLite took the *owner's copy's* log,
+  applied it to the wrong database and deleted it; the repair's fallback then deleted
+  what it took for the damaged file, which was the owner's copy's `chats.db`. Both
+  copies were restored the same evening from their own backups and merged with each
+  other and with what could be read from the damaged file (`wa-merge`); each passes
+  its integrity check with 73,919 messages. What the owner's copy wrote between 19:53
+  and 20:15 that day survives only as far as it could be read back. Rules:
   - Interface tests never open the real database. `scripts/uitest.sh` works on a
-    snapshot in `%LOCALAPPDATA%\whatsapp-gpui-uitest` (`scripts/uitest.sh refresh`
-    takes a new one).
-  - `wa-test` (real sends) uses the real database: run it only while the app is closed,
-    and let it finish; do not kill it.
+    snapshot in `target/uitest-data` (`scripts/uitest.sh refresh` takes a new one from
+    the container copy; a failed refresh leaves the previous snapshot standing).
+  - `wa-test` (real sends) uses the container copy: run it only while no app is using
+    that copy, and let it finish; do not kill it. It leaves half-sent messages found in
+    the store alone (`backend::HOLD_PENDING`).
   - Never copy or move a database file without its `-wal` and `-shm` files, and never
     put a database file next to another database's `-wal`: SQLite would apply it.
   - The Opus encoder (machine-translated C) runs only in a child process
@@ -67,7 +93,9 @@ connection. Windows only. Private now, open source later.
     and rebuilt (`src/salvage.rs`); a background check and a daily backup follow
     (`backups\`, three kept).
   - Tools: `wa-dbcheck` (integrity per table), `wa-dbscan` (raw pages), `wa-salvage`
-    (rebuild), `wa-guard` (the app's open-and-repair path), `wa-sql` (read-only counts),
+    (rebuild), `wa-guard` (the app's open-and-repair path; `--where` only prints the
+    folder it would use), `wa-merge` (add missing rows from other databases, restore a
+    backup, refresh pointers), `wa-sql` (read-only counts),
     `wa-dbstress` + `scripts/dbstress.sh` (try to break a scratch copy).
 - **Testing the interface never touches the owner's running app.** `scripts/uitest.sh`
   builds a separate copy (`target/uitest`, run as `wa-uitest.exe`) that is off the

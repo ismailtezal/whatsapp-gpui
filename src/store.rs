@@ -251,7 +251,7 @@ impl Store {
         work(&conn)
     }
 
-    fn with<T>(&self, work: impl FnOnce(&Tx<'_>) -> Result<T>) -> Result<T> {
+    pub(crate) fn with<T>(&self, work: impl FnOnce(&Tx<'_>) -> Result<T>) -> Result<T> {
         let conn = self.lock();
         work(&Tx { conn: &conn })
     }
@@ -913,6 +913,22 @@ impl Tx<'_> {
             .prepare_cached("SELECT rowid FROM messages WHERE chat = ?1 AND id = ?2 AND from_me = ?3")?
             .query_row(params![chat, id, from_me], |row| row.get(0))?;
 
+        // A receipt can get here before the message it is about: when a message is sent
+        // from the phone, the other person's "delivered" and "read" often overtake our
+        // own copy of it. Those receipts are on record, so the new row takes its ticks
+        // from them instead of staying on one grey tick for ever.
+        if from_me {
+            self.conn
+                .prepare_cached(
+                    "UPDATE messages SET status = MAX(status, COALESCE((
+                         SELECT MAX(CASE WHEN played > 0 THEN 5 WHEN read > 0 THEN 4
+                                         WHEN delivered > 0 THEN 3 ELSE 0 END)
+                         FROM receipts WHERE chat = ?1 AND msg_id = ?2), 0))
+                     WHERE rowid = ?3",
+                )?
+                .execute(params![chat, id, rowid])?;
+        }
+
         self.conn
             .prepare_cached(
                 "UPDATE chats SET last_ts = ?2, last_rowid = ?3
@@ -982,6 +998,47 @@ impl Tx<'_> {
             params![chat, id, status as i32],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Raises the status of a message of ours found by its ID alone, for a receipt that
+    /// names the chat by an address not yet tied to the person. Returns the chat the
+    /// message is in when its status changed. Group chats are left to the exact match.
+    pub fn set_status_by_id(&self, id: &str, status: Ack) -> Result<Option<String>> {
+        let found: Option<String> = self
+            .conn
+            .prepare_cached(
+                "SELECT chat FROM messages
+                 WHERE id = ?1 AND from_me = 1 AND status < ?2 AND chat NOT LIKE '%@g.us' LIMIT 1",
+            )?
+            .query_row(params![id, status as i32], |row| row.get(0))
+            .optional()?;
+        if let Some(chat) = &found {
+            self.conn.execute(
+                "UPDATE messages SET status = ?3 WHERE chat = ?1 AND id = ?2 AND from_me = 1 AND status < ?3",
+                params![chat, id, status as i32],
+            )?;
+        }
+        Ok(found)
+    }
+
+    /// Brings the ticks of every message of ours up to the receipts on record. Receipts
+    /// that arrived before their message used to be lost; this repairs those rows.
+    /// A time of zero counts as "not yet": imported history writes zeros.
+    /// Returns how many messages changed.
+    pub fn reapply_receipts(&self) -> Result<usize> {
+        let level = "MAX(CASE WHEN r.played > 0 THEN 5 WHEN r.read > 0 THEN 4
+                          WHEN r.delivered > 0 THEN 3 ELSE 0 END)";
+        let changed = self.conn.execute(
+            &format!(
+                "UPDATE messages SET status = (
+                     SELECT {level} FROM receipts r WHERE r.chat = messages.chat AND r.msg_id = messages.id)
+                 WHERE from_me = 1 AND status BETWEEN 1 AND 4
+                   AND status < COALESCE((
+                     SELECT {level} FROM receipts r WHERE r.chat = messages.chat AND r.msg_id = messages.id), 0)"
+            ),
+            [],
+        )?;
+        Ok(changed)
     }
 
     pub fn set_starred(&self, chat: &str, id: &str, starred: bool) -> Result<()> {

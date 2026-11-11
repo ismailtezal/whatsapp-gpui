@@ -92,6 +92,8 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let action = args.first().map(String::as_str).unwrap_or("online");
     let store = Arc::new(Store::open_default()?);
+    // A test sends only what it is asked to: half-sent messages in the store stay put.
+    whatsapp_gpui::backend::HOLD_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
     let backend = Backend::start(store.clone());
 
     let mut own_name: Option<String> = None;

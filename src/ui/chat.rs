@@ -142,6 +142,12 @@ pub struct ChatView {
     reactors: Option<ReactorsState>,
     emoji: Option<EmojiState>,
     viewer: Option<PathBuf>,
+    /// The header notice last seen by the clearing timer.
+    notice_seen: Option<String>,
+    /// The first unread message when the chat was opened: the "New" line stays above it.
+    unread_anchor: Option<String>,
+    /// When the other side was last seen typing or recording.
+    activity_at: std::time::Instant,
     /// Messages that have just arrived or been sent, and when: they rise into place.
     fresh: (std::time::Instant, Vec<String>),
     /// How the open photo is being looked at.
@@ -297,6 +303,9 @@ impl ChatView {
             reactors: None,
             emoji: None,
             viewer: None,
+            notice_seen: None,
+            unread_anchor: None,
+            activity_at: std::time::Instant::now(),
             fresh: (std::time::Instant::now(), Vec::new()),
             look: Look::default(),
             photos: Vec::new(),
@@ -483,10 +492,39 @@ view.reload(cx);
         if self.info_open || self.chat.kind != ChatKind::User {
             self.refresh_members();
         }
-        let rows = self
+        let mut rows = self
             .store
             .messages(&self.chat.jid, None, self.loaded)
             .unwrap_or_default();
+        // New messages must be added at the end, not push the oldest loaded ones out:
+        // sliding the window would change every row's place, re-measure them all and
+        // throw a scrolled-up view to the top of the page. So when the oldest message
+        // that was loaded has slid out, the page grows by the number of new ones.
+        let oldest_loaded = self.items.iter().find_map(|item| match item {
+            Item::Msg(view) => Some(view.row.id.clone()),
+            _ => None,
+        });
+        if let Some(oldest) = oldest_loaded
+            && rows.len() >= self.loaded
+            && !rows.iter().any(|row| row.id == oldest)
+        {
+            let known: HashSet<&str> = self
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Msg(view) => Some(view.row.id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let arrived = rows.iter().filter(|row| !known.contains(row.id.as_str())).count();
+            if arrived > 0 && arrived < rows.len() {
+                self.loaded += arrived;
+                rows = self
+                    .store
+                    .messages(&self.chat.jid, None, self.loaded)
+                    .unwrap_or_default();
+            }
+        }
         self.has_older = rows.len() >= self.loaded;
         self.photos = rows
             .iter()
@@ -510,15 +548,22 @@ view.reload(cx);
         // The "New" line goes before the first of the last `unread_at_open` incoming messages.
         let mut unread_from: Option<usize> = None;
         if self.unread_at_open > 0 {
-            let mut remaining = self.unread_at_open;
-            for (index, row) in rows.iter().enumerate().rev() {
-                if row.from_me {
-                    break;
-                }
-                unread_from = Some(index);
-                remaining -= 1;
-                if remaining == 0 {
-                    break;
+            match &self.unread_anchor {
+                // Placed once; later messages do not move it down.
+                Some(anchor) => unread_from = rows.iter().position(|row| row.id == *anchor),
+                None => {
+                    let mut remaining = self.unread_at_open;
+                    for (index, row) in rows.iter().enumerate().rev() {
+                        if row.from_me {
+                            break;
+                        }
+                        unread_from = Some(index);
+                        remaining -= 1;
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                    self.unread_anchor = unread_from.map(|index| rows[index].id.clone());
                 }
             }
         }
@@ -873,6 +918,21 @@ view.reload(cx);
             Activity::Idle => None,
             other => Some((sender, other)),
         };
+        self.activity_at = std::time::Instant::now();
+        if self.activity.is_some() {
+            // The other side repeats "typing" every few seconds while it lasts; without
+            // a repeat (it went offline, the message arrived) it lapses.
+            let seen = self.activity_at;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(std::time::Duration::from_secs(20)).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.activity_at == seen && this.activity.take().is_some() {
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -1020,6 +1080,8 @@ view.reload(cx);
                 });
             }
             self.input.update(cx, |input, cx| input.set_value("", window, cx));
+            self.editing = None;
+            let _ = self.store.batch(|tx| tx.set_draft(&self.chat.jid, None));
             self.notice = Some("Sending…".to_string());
             cx.notify();
             return;
@@ -1050,7 +1112,10 @@ view.reload(cx);
             }),
         }
         self.input.update(cx, |input, cx| input.set_value("", window, cx));
+        // What was sent is no longer a draft.
+        let _ = self.store.batch(|tx| tx.set_draft(&self.chat.jid, None));
         self.unread_at_open = 0;
+        self.unread_anchor = None;
         self.typing_sent = None;
         cx.notify();
     }
@@ -1511,6 +1576,21 @@ view.reload(cx);
                 })),
         );
         panel = panel.child(quick).child(separator());
+
+        // A message that could not be sent offers another try first.
+        if row.from_me && row.ack == crate::model::Ack::Error {
+            let id = row.id.clone();
+            panel = panel.child(item(11, "refresh-cw", "Send again", false).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.backend.send(Command::Resend {
+                        chat: this.chat.jid.clone(),
+                        id: id.clone(),
+                    });
+                    this.menu = None;
+                    cx.notify();
+                },
+            )));
+        }
 
         let id = row.id.clone();
         panel = panel.child(item(0, "corner-up-left", "Reply", false).on_click(cx.listener(
@@ -2319,6 +2399,24 @@ impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _perf = crate::perf::scope("chat.render");
         self.pump_video(window);
+        // The notice in the header ("Sending…", "Downloading…") clears itself: it used to
+        // stay until something else replaced it.
+        if self.notice != self.notice_seen {
+            self.notice_seen = self.notice.clone();
+            if let Some(shown) = self.notice.clone() {
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(std::time::Duration::from_secs(5)).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.notice.as_ref() == Some(&shown) {
+                            this.notice = None;
+                            this.notice_seen = None;
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
         if std::mem::take(&mut self.edit_when_ready) {
             self.edit_pending(0, window, cx);
         }
@@ -2389,6 +2487,10 @@ impl Render for ChatView {
                         this.search_hits.clear();
                         cx.notify();
                     } else if this.reply_to.take().is_some() {
+                        cx.notify();
+                    } else if this.editing.take().is_some() {
+                        // Leaving edit mode drops the text that was being edited.
+                        this.input.update(cx, |input, cx| input.set_value("", window, cx));
                         cx.notify();
                     }
                 }

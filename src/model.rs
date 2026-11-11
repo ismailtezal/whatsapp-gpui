@@ -217,3 +217,21 @@ pub fn display_number(jid: &str) -> String {
         user.to_string()
     }
 }
+
+/// Whether a chat is muted right now. `mute_until` is 0 for not muted, -1 for muted
+/// until further notice, else the moment the mute ends (seconds; imported history
+/// gives milliseconds).
+pub fn muted_now(mute_until: i64) -> bool {
+    if mute_until < 0 {
+        return true;
+    }
+    if mute_until == 0 {
+        return false;
+    }
+    let ends = if mute_until > 100_000_000_000 { mute_until / 1000 } else { mute_until };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+    ends > now
+}

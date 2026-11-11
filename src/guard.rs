@@ -93,6 +93,7 @@ pub fn open() -> Result<Opened> {
     if !marked {
         match open_and_probe(&path) {
             Ok(store) => {
+                repair_ticks_once(&store);
                 return Ok(Opened {
                     store,
                     notice: None,
@@ -107,6 +108,19 @@ pub fn open() -> Result<Opened> {
         store: open_and_probe(&path)?,
         notice: Some(notice),
     })
+}
+
+/// Once per database: messages whose "delivered" or "read" receipt arrived before the
+/// message itself were left on one grey tick by earlier versions. The receipts are on
+/// record, so the ticks are brought up to them.
+fn repair_ticks_once(store: &Store) {
+    const DONE: &str = "receipts-reapplied";
+    if store.kv(DONE).ok().flatten().is_some() {
+        return;
+    }
+    if store.batch(|tx| tx.reapply_receipts()).is_ok() {
+        let _ = store.set_kv(DONE, "1");
+    }
 }
 
 /// Sets the damaged database aside and builds a new one at `path` from everything that
@@ -191,7 +205,7 @@ fn repair(path: &Path) -> Result<String> {
 }
 
 /// Copies rows that `backup` has and `path` lacks. Existing rows are never replaced.
-fn merge_from(path: &Path, backup: &Path) -> Result<()> {
+pub fn merge_from(path: &Path, backup: &Path) -> Result<()> {
     let db = Connection::open(path)?;
     db.execute("ATTACH DATABASE ?1 AS old", [backup.to_string_lossy().to_string()])?;
     db.execute_batch(

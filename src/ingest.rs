@@ -116,7 +116,17 @@ fn apply_inner(store: &Store, event: &Event, out: &mut Vec<UiEvent>) -> DbResult
                 {
                     for id in &receipt.message_ids {
                         let id = id.to_string();
-                        changed |= tx.set_status(&chat, &id, status)?;
+                        let mut raised = tx.set_status(&chat, &id, status)?;
+                        if !raised
+                            && !chat.ends_with("@g.us")
+                            && let Some(home) = tx.set_status_by_id(&id, status)?
+                        {
+                            // The receipt named the person by an address this device
+                            // had not tied to them; the message says where it lives.
+                            out.push(UiEvent::ChatChanged { chat: home });
+                            raised = true;
+                        }
+                        changed |= raised;
                         let (delivered, read, played) = match status {
                             Ack::Delivered => (Some(ts), None, None),
                             Ack::Read => (None, Some(ts), None),
@@ -132,6 +142,26 @@ fn apply_inner(store: &Store, event: &Event, out: &mut Vec<UiEvent>) -> DbResult
                 }
                 Ok(())
             })?;
+        }
+
+        Event::UndecryptableMessage(lost) => {
+            // A message arrived that this device cannot read yet. The connection has
+            // already asked the sender's phone for it again; until that copy arrives
+            // the chat shows "Waiting for this message", as the official client does.
+            // The real message has the same ID and takes the placeholder's place.
+            use whatsapp_rust::wacore::types::events::DecryptFailMode;
+            let info = &lost.info;
+            let id = info.id.to_string();
+            let chat = store.canonical(&info.source.chat.to_non_ad_string())?;
+            let shown = lost.decrypt_fail_mode == DecryptFailMode::Show && !lost.is_unavailable;
+            if shown && !info.source.is_from_me && store.message(&chat, &id)?.is_none() {
+                let mut record = to_record(info, &wa::Message::default());
+                record.message = MessageField::none();
+                record.message_stub_type = Some(wa::web_message_info::StubType::CIPHERTEXT.into());
+                store.put_message(&record)?;
+                out.push(UiEvent::ChatsChanged);
+                out.push(UiEvent::ChatChanged { chat });
+            }
         }
 
         Event::ServerAck(ack) => {
@@ -440,6 +470,7 @@ fn apply_message(tx: &Tx<'_>, inbound: &InboundMessage, out: &mut Vec<UiEvent>) 
                 id: info.id.to_string(),
                 sender: Some(sender),
                 preview: preview_label(digest.kind, digest.text.as_deref()),
+                backlog: info.is_offline,
             });
         }
     } else if info.source.is_from_me {
@@ -544,6 +575,35 @@ mod tests {
         let chats = store.chats(false).expect("chat list");
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].unread, 1);
+    }
+
+    #[test]
+    fn a_receipt_that_arrives_before_its_message_still_ticks_it() {
+        let store = temp_store("early-receipt");
+        // The other person's "read" for a message sent from the phone gets here first.
+        store
+            .batch(|tx| tx.put_receipt(ADA, "MSG9", ADA, Some(1_700_000_001), Some(1_700_000_002), None))
+            .expect("receipt");
+        apply(&store, &inbound(ADA, ADA, true, "MSG9", text("typed on my phone")));
+        let rows = store.messages(ADA, None, 10).expect("read messages");
+        assert_eq!(rows[0].ack, Ack::Read);
+    }
+
+    #[test]
+    fn old_rows_are_repaired_from_the_receipts_on_record() {
+        let store = temp_store("repair-receipts");
+        apply(&store, &inbound(ADA, ADA, true, "MSG7", text("one tick for ever")));
+        apply(&store, &inbound(ADA, ADA, true, "MSG8", text("no receipt")));
+        // Put the row back to how the old code left it, then record a receipt for it.
+        store.batch(|tx| tx.force_status(ADA, "MSG7", Ack::Sent)).expect("reset");
+        store
+            .batch(|tx| tx.put_receipt(ADA, "MSG7", ADA, Some(1_700_000_001), None, None))
+            .expect("receipt");
+        assert_eq!(store.batch(|tx| tx.reapply_receipts()).expect("repair"), 1);
+        let rows = store.messages(ADA, None, 10).expect("read messages");
+        let status = |id: &str| rows.iter().find(|row| row.id == id).map(|row| row.ack);
+        assert_eq!(status("MSG7"), Some(Ack::Delivered));
+        assert_eq!(status("MSG8"), Some(Ack::Sent));
     }
 
     #[test]

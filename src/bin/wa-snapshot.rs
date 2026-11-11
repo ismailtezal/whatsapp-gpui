@@ -15,29 +15,32 @@ use rusqlite::Connection;
 fn main() -> Result<()> {
     let folder = std::env::args().nth(1).ok_or_else(|| anyhow::anyhow!("usage: wa-snapshot <folder>"))?;
     let folder = Path::new(&folder);
-    // The real data folder: whatever WA_DATA_DIR says is ignored on purpose.
-    let real = std::env::var_os("LOCALAPPDATA")
-        .map(|dir| Path::new(&dir).join("whatsapp-gpui"))
-        .context("LOCALAPPDATA is not set")?;
-    if folder == real {
+    // The app's own data folder, by its true location (see `paths`): whatever
+    // WA_DATA_DIR says is ignored on purpose.
+    let real = whatsapp_gpui::paths::default_data_dir();
+    if folder == real || std::fs::canonicalize(folder).ok() == std::fs::canonicalize(&real).ok() {
         bail!("the snapshot folder must not be the real data folder");
     }
     std::fs::create_dir_all(folder)?;
 
-    // A fresh copy each time; the old one goes together with its write-ahead log.
-    for name in ["chats.db", "chats.db-wal", "chats.db-shm"] {
-        let _ = std::fs::remove_file(folder.join(name));
-    }
     let source = real.join("chats.db");
     if source.exists() {
-        let db = Connection::open(&source)?;
-        db.busy_timeout(Duration::from_secs(30))?;
-        db.execute(
-            "VACUUM INTO ?1",
-            [folder.join("chats.db").to_string_lossy().to_string()],
-        )
-        .context("copying the chat database")?;
-        println!("copied the chat database");
+        // The copy is made beside the old snapshot and only then takes its place, so a
+        // copy that fails (a damaged source) leaves the previous snapshot standing.
+        let fresh = folder.join("chats.new.db");
+        let _ = std::fs::remove_file(&fresh);
+        {
+            let db = Connection::open(&source)?;
+            db.busy_timeout(Duration::from_secs(30))?;
+            db.execute("VACUUM INTO ?1", [fresh.to_string_lossy().to_string()])
+                .context("copying the chat database")?;
+        }
+        // The old snapshot goes together with its write-ahead log.
+        for name in ["chats.db", "chats.db-wal", "chats.db-shm"] {
+            let _ = std::fs::remove_file(folder.join(name));
+        }
+        std::fs::rename(&fresh, folder.join("chats.db")).context("putting the new snapshot in place")?;
+        println!("copied the chat database from {}", real.display());
     } else {
         println!("there is no chat database yet; the test copy will start empty");
     }

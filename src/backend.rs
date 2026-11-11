@@ -101,6 +101,23 @@ impl Backend {
     }
 }
 
+/// Set by test tools before they connect: half-sent messages found in the store are left
+/// alone, so that a test run never sends anything the test did not ask for.
+pub static HOLD_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the connection is up. Sends wait on this instead of failing while the app is
+/// still connecting or the network is briefly away.
+static ONLINE: std::sync::LazyLock<tokio::sync::watch::Sender<bool>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(false).0);
+
+/// Waits until the connection is up, at most `limit`. False when it stayed down.
+async fn wait_online(limit: std::time::Duration) -> bool {
+    let mut state = ONLINE.subscribe();
+    tokio::time::timeout(limit, state.wait_for(|up| *up))
+        .await
+        .is_ok_and(|waited| waited.is_ok())
+}
+
 fn full_history_config() -> HistorySyncConfig {
     let mut config = default_history_sync_config();
     config.full_sync_days_limit = Some(365);
@@ -138,13 +155,26 @@ async fn run(
                 .with_require_full_sync(true)
                 .with_history_sync_config(full_history_config()),
         )
+        // One at a time, in the order they arrive. The library's default runs sixteen
+        // at once (an edit or a receipt could then be applied before its message) and
+        // drops events once 256 are waiting, which a reconnect after hours offline or a
+        // history sync easily exceeds.
+        .with_event_delivery(whatsapp_rust::EventDelivery::Ordered { capacity: 200_000 })
         .on_event(move |event, client| {
             let store = handler_store.clone();
             let events = handler_events.clone();
             async move {
-                if matches!(&*event, Event::Connected(_)) {
-                    on_connected(&client, &events).await;
-                    replay_account_state_once(client.clone(), store.clone());
+                match &*event {
+                    Event::Connected(_) => {
+                        ONLINE.send_replace(true);
+                        on_connected(&client, &events).await;
+                        replay_account_state_once(client.clone(), store.clone());
+                        resend_pending_once(client.clone(), store.clone(), events.clone());
+                    }
+                    Event::Disconnected(_) | Event::LoggedOut(_) => {
+                        ONLINE.send_replace(false);
+                    }
+                    _ => {}
                 }
                 for update in ingest::apply(&store, &event) {
                     let _ = events.send(update).await;
@@ -183,6 +213,10 @@ async fn run(
         });
     }
 
+    // Messages to one chat go out one after another, in the order they were written:
+    // each chat has a lane. Everything else runs side by side.
+    let mut lanes: std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<Command>> =
+        std::collections::HashMap::new();
     while let Some(command) = commands.recv().await {
         if matches!(command, Command::Shutdown) {
             break;
@@ -194,21 +228,80 @@ async fn run(
         let client = client.clone();
         let store = store.clone();
         let events = events.clone();
-        tokio::spawn(async move {
-            let label = format!("{command:?}");
-            if let Err(error) = execute(&client, &store, &events, command).await {
-                let short: String = label.chars().take(40).collect();
-                let _ = events
-                    .send(UiEvent::Error(format!("{short}: {error:#}")))
-                    .await;
+        let lane_chat = match &command {
+            Command::SendText { chat, .. } | Command::SendFile { chat, .. } | Command::Resend { chat, .. } => {
+                Some(chat.clone())
             }
-        });
+            _ => None,
+        };
+        if let Some(chat) = lane_chat {
+            let lane = lanes.entry(chat).or_insert_with(|| {
+                let (lane, mut waiting) = tokio::sync::mpsc::unbounded_channel::<Command>();
+                tokio::spawn(async move {
+                    while let Some(command) = waiting.recv().await {
+                        run_command(&client, &store, &events, command).await;
+                    }
+                });
+                lane
+            });
+            let _ = lane.send(command);
+            continue;
+        }
+        tokio::spawn(async move { run_command(&client, &store, &events, command).await });
     }
     let _ = handle.shutdown().await;
     Ok(())
 }
 
+/// Runs one command and tells the interface if it failed.
+async fn run_command(
+    client: &Arc<Client>,
+    store: &Arc<Store>,
+    events: &async_channel::Sender<UiEvent>,
+    command: Command,
+) {
+    let label = format!("{command:?}");
+    if let Err(error) = execute(client, store, events, command).await {
+        let short: String = label.chars().take(40).collect();
+        let _ = events.send(UiEvent::Error(format!("{short}: {error:#}"))).await;
+    }
+}
+
+/// Once per run, after the first connection: messages that an earlier run stored but
+/// never got confirmed (the app was closed or lost the network mid-send) go out again
+/// under their own IDs, oldest first. A message that did arrive is recognised by its ID
+/// on the other side and not shown twice.
+fn resend_pending_once(client: Arc<Client>, store: Arc<Store>, events: async_channel::Sender<UiEvent>) {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let held = HOLD_PENDING.load(std::sync::atomic::Ordering::SeqCst);
+    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) || read_only() || held {
+        return;
+    }
+    tokio::spawn(async move {
+        // Only recent ones: something half-sent days ago is no longer wanted.
+        let since = now_secs() - 6 * 3600;
+        for (chat, id) in store.pending_outgoing(since).unwrap_or_default() {
+            let Ok(Some(record)) = store.record(&chat, &id) else {
+                continue;
+            };
+            if let Some(message) = record.message.as_option() {
+                let _ = deliver(&client, &store, &events, &chat, &id, message.clone()).await;
+            }
+        }
+    });
+}
+
+/// This account's phone-number address, known once connected.
+static OWN_JID: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+fn own_jid() -> Option<String> {
+    OWN_JID.read().ok().and_then(|jid| jid.clone())
+}
+
 async fn on_connected(client: &Arc<Client>, events: &async_channel::Sender<UiEvent>) {
+    if let (Ok(mut own), Some(pn)) = (OWN_JID.write(), client.pn()) {
+        *own = Some(pn.to_non_ad_string());
+    }
     let _ = events
         .send(UiEvent::Identity {
             pn: client.pn().map(|j| j.to_non_ad_string()),
@@ -289,7 +382,8 @@ pub(crate) fn quote_context(record: &wa::WebMessageInfo, chat: &str) -> Option<w
     context.stanza_id = key.id.clone();
     let from_me = key.from_me.unwrap_or(false);
     context.participant = if from_me {
-        None
+        // Our own message: the author is this account.
+        own_jid()
     } else {
         original_sender(record).or_else(|| {
             (ChatKind::of_jid(chat) == ChatKind::User).then(|| key.remote_jid.clone().unwrap_or_default())
@@ -432,29 +526,66 @@ pub(crate) async fn send_prepared(
     chat: &str,
     message: wa::Message,
 ) -> Result<String> {
-    let to = jid(chat)?;
+    jid(chat)?;
     let id = client.generate_message_id();
     let id_text = id.as_str().to_string();
     store_outgoing(store, chat, &id_text, &message)?;
     store.batch(|tx| tx.set_unread(chat, 0))?;
     notify(events, chat).await;
+    deliver(client, store, events, chat, &id_text, message).await?;
+    Ok(id_text)
+}
 
-    let options = SendOptions::default().with_message_id(id);
-    let outcome = client
-        .send(SendRequest::new(&to, message).with_options(options))
-        .await;
-    match outcome {
-        Ok(_) => {
-            store.batch(|tx| tx.set_status(chat, &id_text, Ack::Sent))?;
-            notify(events, chat).await;
-            Ok(id_text)
+/// Sends a message that is already in the store under `id`, and records the outcome.
+/// It waits for the connection when that is down, and tries again, under the same ID,
+/// when the connection drops in the middle; only then is the message marked failed.
+pub(crate) async fn deliver(
+    client: &Arc<Client>,
+    store: &Arc<Store>,
+    events: &async_channel::Sender<UiEvent>,
+    chat: &str,
+    id: &str,
+    message: wa::Message,
+) -> Result<()> {
+    use std::time::Duration;
+    let to = jid(chat)?;
+    let mut problem = String::from("no connection");
+    for _attempt in 0..3 {
+        if !wait_online(Duration::from_secs(600)).await {
+            problem = "there was no connection for ten minutes".to_string();
+            break;
         }
-        Err(error) => {
-            store.batch(|tx| tx.force_status(chat, &id_text, Ack::Error))?;
-            notify(events, chat).await;
-            Err(anyhow!("send failed: {error}"))
+        let mut options = SendOptions::default().with_message_id(MessageId::new(id)?);
+        // In a chat with disappearing messages, the message says when it disappears.
+        let timer = store.chat_timer(chat).unwrap_or(0);
+        if timer > 0 {
+            options = options.with_ephemeral_expiration(timer as u32);
+        }
+        match client
+            .send(SendRequest::new(&to, message.clone()).with_options(options))
+            .await
+        {
+            Ok(_) => {
+                store.batch(|tx| tx.set_status(chat, id, Ack::Sent))?;
+                notify(events, chat).await;
+                return Ok(());
+            }
+            Err(error) => {
+                let detail = format!("{error} {error:?}").to_lowercase();
+                problem = format!("{error}");
+                // Only a lost connection is worth another try; anything else would
+                // fail the same way again.
+                if !(detail.contains("notconnected") || detail.contains("not connected") || detail.contains("socket"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
         }
     }
+    store.batch(|tx| tx.force_status(chat, id, Ack::Error))?;
+    notify(events, chat).await;
+    Err(anyhow!("the message could not be sent: {problem}"))
 }
 
 async fn execute(
@@ -476,6 +607,21 @@ async fn execute(
             };
             let message = text_message(&text, context, &mentions);
             send_prepared(client, store, events, &chat, message).await?;
+        }
+
+        Command::Resend { chat, id } => {
+            let record = store
+                .record(&chat, &id)?
+                .ok_or_else(|| anyhow!("message not found"))?;
+            let message = record
+                .message
+                .as_option()
+                .ok_or_else(|| anyhow!("message has no content"))?
+                .clone();
+            // Back to "waiting" (a clock) while it is tried again.
+            store.batch(|tx| tx.force_status(&chat, &id, Ack::Pending))?;
+            notify(events, &chat).await;
+            deliver(client, store, events, &chat, &id, message).await?;
         }
 
         Command::PostStatus {
@@ -615,7 +761,13 @@ async fn execute(
             mentions,
         } => {
             let to = jid(&chat)?;
-            let replacement = text_message(&text, None, &mentions);
+            // An edited reply is still a reply: the quote travels with the new text.
+            let quote = store.record(&chat, &id)?.and_then(|record| {
+                let message = record.message.as_option()?;
+                let context = message.extended_text_message.as_option()?.context_info.as_option()?;
+                context.stanza_id.is_some().then(|| context.clone())
+            });
+            let replacement = text_message(&text, quote, &mentions);
             client
                 .edit_message_raw(to, id.clone(), replacement.clone(), EditOptions::default())
                 .await?;
