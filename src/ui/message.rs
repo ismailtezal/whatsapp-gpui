@@ -725,6 +725,35 @@ fn content(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> Div {
                 _ => card.into_any_element(),
             });
         }
+        Event => {
+            let name = text.map(str::to_string).unwrap_or_else(|| "Event".to_string());
+            let mut detail = String::new();
+            let mut about = String::new();
+            if let Some((start, place, description)) = &view.extras.event {
+                if *start > 0 {
+                    detail = header_time(*start);
+                }
+                if !place.is_empty() {
+                    detail = if detail.is_empty() {
+                        place.clone()
+                    } else {
+                        format!("{detail} · {place}")
+                    };
+                }
+                about = description.clone();
+            }
+            column = column.child(info_card("calendar", name, detail, t));
+            if !about.is_empty() {
+                column = column.child(
+                    div()
+                        .max_w(px(384.))
+                        .text_size(px(13.))
+                        .line_height(px(18.))
+                        .text_color(t.fg(0.8))
+                        .child(SharedString::from(about)),
+                );
+            }
+        }
         other => {
             let label = preview_label(other, None);
             column = column.child(info_card(
@@ -1009,6 +1038,8 @@ pub struct Extras {
     /// The WhatsApp number on a shared contact card, digits only.
     pub contact_number: Option<String>,
     pub link: Option<LinkPreview>,
+    /// An event's start time, place and description.
+    pub event: Option<(i64, String, String)>,
 }
 
 /// The WhatsApp number in a vCard: the digits of its `waid=` parameter.
@@ -1032,6 +1063,15 @@ pub fn extras_of(record: &wa::WebMessageInfo) -> Extras {
         extras.lon = m.degrees_longitude;
     } else if let Some(m) = base.contact_message.as_option() {
         extras.contact_number = m.vcard.as_deref().and_then(vcard_number);
+    } else if let Some(m) = base.event_message.as_option() {
+        extras.event = Some((
+            m.start_time.unwrap_or(0),
+            m.location
+                .as_option()
+                .and_then(|place| place.name.clone())
+                .unwrap_or_default(),
+            m.description.clone().unwrap_or_default(),
+        ));
     } else if let Some(m) = base.extended_text_message.as_option() {
         let title = m.title.clone().unwrap_or_default();
         let url = m.matched_text.clone().unwrap_or_default();

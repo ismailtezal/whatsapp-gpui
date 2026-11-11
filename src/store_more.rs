@@ -285,3 +285,32 @@ impl Store {
         })
     }
 }
+
+impl Tx<'_> {
+    /// Marks a message as pinned in its chat, or removes the pin.
+    pub fn set_pinned(&self, chat: &str, id: &str, pinned: bool, ts: i64) -> Result<()> {
+        let chat = self.canonical(chat)?;
+        if pinned {
+            self.conn.execute(
+                "INSERT INTO pins (chat, msg_id, ts) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (chat, msg_id) DO UPDATE SET ts = excluded.ts",
+                params![chat, id, ts],
+            )?;
+        } else {
+            self.conn
+                .execute("DELETE FROM pins WHERE chat = ?1 AND msg_id = ?2", params![chat, id])?;
+        }
+        Ok(())
+    }
+}
+
+impl Store {
+    /// IDs of the pinned messages of a chat, newest pin first.
+    pub fn pinned(&self, chat: &str) -> Result<Vec<String>> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare_cached("SELECT msg_id FROM pins WHERE chat = ?1 ORDER BY ts DESC")?;
+            let rows = stmt.query_map([chat], |row| row.get(0))?;
+            rows.collect()
+        })
+    }
+}

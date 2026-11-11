@@ -471,6 +471,31 @@ fn main() -> Result<()> {
                 None => println!("download timed out"),
             }
         }
+        "pin" => {
+            // Pin the newest own text message of a group, then unpin it again.
+            let chat = group(&store, &args[1])?;
+            let target = store
+                .messages(&chat, None, 40)?
+                .into_iter()
+                .rev()
+                .find(|m| m.from_me && m.kind == whatsapp_gpui::model::MsgKind::Text)
+                .ok_or_else(|| anyhow!("no own text message to pin"))?;
+            backend.send(Command::PinMessage {
+                chat: chat.clone(),
+                id: target.id.clone(),
+                pinned: true,
+            });
+            std::thread::sleep(Duration::from_secs(4));
+            let pinned = store.pinned(&chat)?.contains(&target.id);
+            backend.send(Command::PinMessage {
+                chat: chat.clone(),
+                id: target.id.clone(),
+                pinned: false,
+            });
+            std::thread::sleep(Duration::from_secs(4));
+            let unpinned = !store.pinned(&chat)?.contains(&target.id);
+            println!("pinned={pinned} then unpinned={unpinned}");
+        }
         "listen" => {
             let seconds: u64 = args.get(1).and_then(|n| n.parse().ok()).unwrap_or(15);
             let mut counts = std::collections::BTreeMap::new();

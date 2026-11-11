@@ -142,6 +142,12 @@ pub enum Command {
     /// Read a group's current subject, description and members from the server.
     RefreshGroup { chat: String },
     LeaveGroup { chat: String },
+    /// Pin a message for everyone in the chat (for a week), or unpin it.
+    PinMessage {
+        chat: String,
+        id: String,
+        pinned: bool,
+    },
     /// Read the privacy settings and the block list.
     FetchAccountInfo,
     Block { jid: String, blocked: bool },

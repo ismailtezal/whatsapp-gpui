@@ -835,6 +835,28 @@ async fn execute(
             Box::pin(execute(client, store, events, Command::FetchAccountInfo)).await?;
         }
 
+        Command::PinMessage { chat, id, pinned } => {
+            use whatsapp_rust::PinDuration;
+            let record = store
+                .record(&chat, &id)?
+                .ok_or_else(|| anyhow!("message not found"))?;
+            let (chat_jid, sender, from_me) = target_parts(&record, &chat)?;
+            let target = MessageRef::new(&chat_jid, MessageId::new(&id)?, sender.as_ref(), from_me)?;
+            if pinned {
+                client
+                    .pin_message(&target, PinDuration::Days7)
+                    .await
+                    .map_err(|error| anyhow!("could not pin: {error}"))?;
+            } else {
+                client
+                    .unpin_message(&target)
+                    .await
+                    .map_err(|error| anyhow!("could not unpin: {error}"))?;
+            }
+            store.batch(|tx| tx.set_pinned(&chat, &id, pinned, now_secs()))?;
+            notify(events, &chat).await;
+        }
+
         Command::LoadOlder { chat } => {
             // The phone answers with a history-sync blob, which arrives as an event and is
             // imported like any other.

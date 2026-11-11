@@ -47,13 +47,14 @@ member) and in an empty test group created for the purpose, never with another p
 | Formatting (bold, italic, strike, code), links | Verified | Unit tests. |
 | Link previews | Partial | Shown for received and stored messages. Not generated when sending a link. |
 | Polls | Verified | Create (`/poll Question \| A \| B` in the composer), show, vote. Gaps: no dialog for creating one. Decoding of other people's votes as they arrive is built but unproven, since nobody else could vote in the test group (votes in history are read). |
-| Events | Not done | Shown as a card with the name only. |
+| Events | Partial | Shown with name, time, place and description. No responding, no creating. |
 | Location | Partial | Card that opens the place in the browser's maps. No sending, no live location. |
 | Contact cards | Partial | Card with a "message" action. No sending. |
 | Disappearing messages | Partial | The timer is tracked per chat; it cannot be changed, and expired messages are not removed locally. |
 | View-once | Partial | Placeholder, as on any linked device. |
 | Phone-only messages | Verified | Shown with the same notice the official client uses. |
-| Pin a message, keep in chat | Not done | |
+| Pin a message | Verified | Pin (for a week) and unpin from the message menu; the newest pin shows under the header. Pins made before this device was linked are not known. |
+| Keep in chat | Not done | |
 | Search inside a chat | Built | Full-text, with jump to the message. |
 | Drafts | Built | Kept per chat when switching away. |
 
@@ -97,7 +98,7 @@ member) and in an empty test group created for the purpose, never with another p
 | Add, remove, promote, demote members | Built | Deliberately not exercised: it would affect real people. |
 | Group settings (who can send, approval, invite links) | Not done | The library supports them. |
 | Communities, channels | Not done | Shown as plain chats; the Channels section only filters. |
-| Block, report | Partial | Unblock from Settings is built; there is no "block" button on a chat and no report. |
+| Block, report | Built / Not done | Block from a person's info panel and unblock from Settings are built but not exercised. No report. |
 | Labels (business) | Not done | |
 
 ## Other surfaces

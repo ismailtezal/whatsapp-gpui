@@ -377,6 +377,15 @@ fn apply_message(tx: &Tx<'_>, inbound: &InboundMessage, out: &mut Vec<UiEvent>) 
         return Ok(Some(chat));
     }
 
+    // Someone pinned or unpinned a message for everyone.
+    if let Some(pin) = base.pin_in_chat_message.as_option() {
+        if let Some(target) = pin.key.as_option().and_then(|k| k.id.as_deref()) {
+            let pinned = !format!("{:?}", pin.r#type).to_uppercase().contains("UNPIN");
+            tx.set_pinned(&chat, target, pinned, ts)?;
+        }
+        return Ok(Some(chat));
+    }
+
     if let Some(protocol) = base.protocol_message.as_option() {
         use wa::message::protocol_message::Type;
         let target = protocol.key.as_option().and_then(|k| k.id.clone());

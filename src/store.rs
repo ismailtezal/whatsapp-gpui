@@ -128,6 +128,13 @@ CREATE TABLE IF NOT EXISTS poll_votes (
     PRIMARY KEY (chat, poll_id, voter)
 );
 
+CREATE TABLE IF NOT EXISTS pins (
+    chat   TEXT NOT NULL,
+    msg_id TEXT NOT NULL,
+    ts     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (chat, msg_id)
+);
+
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

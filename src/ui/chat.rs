@@ -107,6 +107,8 @@ pub struct ChatView {
     forward_targets: Vec<ChatRow>,
     /// ID of the own message whose receipts are being shown.
     info_for: Option<String>,
+    /// IDs of the pinned messages of this chat, newest pin first.
+    pins: Vec<String>,
     video: Option<VideoPlay>,
     /// A video to start on the next frame: (message ID, file, whether it loops).
     pending_video: Option<(String, PathBuf, bool)>,
@@ -202,6 +204,7 @@ impl ChatView {
             forwarding: None,
             forward_targets: Vec::new(),
             info_for: None,
+            pins: Vec::new(),
             video: None,
             pending_video: None,
             pending: Vec::new(),
@@ -296,6 +299,7 @@ impl ChatView {
 
     /// Re-reads the loaded window of messages from the store and rebuilds the rows.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.pins = self.store.pinned(&self.chat.jid).unwrap_or_default();
         if self.info_open || self.chat.kind != ChatKind::User {
             self.refresh_members();
         }
@@ -1117,6 +1121,22 @@ impl ChatView {
             )));
         }
 
+        let pin_id = row.id.clone();
+        let is_pinned = self.pins.contains(&row.id);
+        panel = panel.child(
+            item(10, "pin", if is_pinned { "Unpin" } else { "Pin" }, false).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.backend.send(Command::PinMessage {
+                        chat: this.chat.jid.clone(),
+                        id: pin_id.clone(),
+                        pinned: !is_pinned,
+                    });
+                    this.menu = None;
+                    cx.notify();
+                },
+            )),
+        );
+
         let forward_id = row.id.clone();
         panel = panel.child(item(8, "forward", "Forward", false).on_click(cx.listener(
             move |this, _, _, cx| this.start_forward(&forward_id, cx),
@@ -1543,6 +1563,7 @@ impl Render for ChatView {
             }))
             .child(self.header(cx))
             .children(self.search_bar(cx))
+            .children(self.pinned_bar(cx))
             .child(
                 div()
                     .flex_1()
@@ -1984,6 +2005,9 @@ impl ChatView {
                 )),
             );
 
+        if is_person {
+            panel = panel.children(self.person_actions(cx));
+        }
         if !is_person {
             panel = panel.children(self.group_actions(cx));
         }
@@ -3308,5 +3332,94 @@ impl ChatView {
                 .child(body)
                 .into_any_element(),
         )
+    }
+}
+
+impl ChatView {
+    /// The newest pinned message, shown under the header; a click jumps to it.
+    fn pinned_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let id = self.pins.first()?.clone();
+        let t = tokens(cx).clone();
+        let text = match self.store.message(&self.chat.jid, &id).ok().flatten() {
+            Some(message) => preview_label(message.kind, message.text.as_deref()),
+            None => "Pinned message".to_string(),
+        };
+        let more = self.pins.len().saturating_sub(1);
+        let hover = t.fg(0.03);
+        Some(
+            div()
+                .id("pinned-bar")
+                .px(px(16.))
+                .h(px(36.))
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(8.))
+                .border_b_1()
+                .border_color(Tokens::with_alpha(t.border, t.border.a * 0.7))
+                .text_size(px(13.))
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .child(icon("pin").size(px(14.)).text_color(t.primary))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(t.fg(0.9))
+                        .child(SharedString::from(text)),
+                )
+                .when(more > 0, |this| {
+                    this.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(t.muted_foreground)
+                            .child(format!("+{more} more")),
+                    )
+                })
+                .on_click(cx.listener(move |this, _, _, cx| this.jump_to(&id, cx)))
+                .into_any_element(),
+        )
+    }
+
+    /// The person-only rows of the info panel's action list.
+    fn person_actions(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let t = tokens(cx).clone();
+        let hover = t.fg(0.06);
+        vec![
+            div()
+                .id("info-block")
+                .h(px(36.))
+                .px(px(8.))
+                .rounded(R_LG)
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(10.))
+                .text_size(px(14.))
+                .cursor_pointer()
+                .text_color(t.destructive)
+                .hover(move |style| style.bg(hover))
+                .child(icon("ban").text_color(t.destructive))
+                .child(if self.confirm_leave {
+                    "Click again to block"
+                } else {
+                    "Block contact"
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.confirm_leave {
+                        this.backend.send(Command::Block {
+                            jid: this.chat.jid.clone(),
+                            blocked: true,
+                        });
+                        this.confirm_leave = false;
+                        this.notice = Some("Blocked".to_string());
+                    } else {
+                        this.confirm_leave = true;
+                    }
+                    cx.notify();
+                }))
+                .into_any_element(),
+        ]
     }
 }
