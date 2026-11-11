@@ -49,6 +49,13 @@ struct MenuState {
     at: Point<Pixels>,
 }
 
+/// The panel that lists who reacted to a message, opened by clicking its reaction chips.
+#[derive(Clone)]
+struct ReactorsState {
+    id: String,
+    at: Point<Pixels>,
+}
+
 #[derive(Clone, PartialEq)]
 enum EmojiTarget {
     Composer,
@@ -93,6 +100,7 @@ pub struct ChatView {
     requested: HashSet<String>,
     open_when_ready: Option<String>,
     menu: Option<MenuState>,
+    reactors: Option<ReactorsState>,
     emoji: Option<EmojiState>,
     viewer: Option<PathBuf>,
     notice: Option<String>,
@@ -234,6 +242,7 @@ impl ChatView {
             requested: HashSet::new(),
             open_when_ready: None,
             menu: None,
+            reactors: None,
             emoji: None,
             viewer: None,
             notice: None,
@@ -974,7 +983,10 @@ view.reload(cx);
         .detach();
     }
 
+    /// Reacts to a message. Choosing the emoji that is already mine takes the reaction
+    /// back (an empty reaction removes it, as in the official client).
     fn react(&mut self, id: &str, emoji: &str, cx: &mut Context<Self>) {
+        let emoji = if self.my_reaction(id).as_deref() == Some(emoji) { "" } else { emoji };
         self.backend.send(Command::React {
             chat: self.chat.jid.clone(),
             id: id.to_string(),
@@ -982,7 +994,121 @@ view.reload(cx);
         });
         self.menu = None;
         self.emoji = None;
+        self.reactors = None;
         cx.notify();
+    }
+
+    /// The emoji I reacted to this message with, if any.
+    fn my_reaction(&self, id: &str) -> Option<String> {
+        self.items.iter().find_map(|item| match item {
+            Item::Msg(view) if view.row.id == id => view
+                .reactions
+                .iter()
+                .find(|chip| chip.mine)
+                .map(|chip| chip.emoji.clone()),
+            _ => None,
+        })
+    }
+
+    /// The panel listing who reacted to a message. My own line takes my reaction back.
+    fn reactors_overlay(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let state = self.reactors.clone()?;
+        let t = tokens(cx).clone();
+        let hover = t.accent;
+        // (emoji, who or how many, whether it is mine)
+        let mut lines: Vec<(String, String, bool)> = Vec::new();
+        if self.chat.kind == ChatKind::Newsletter {
+            // A channel reports totals only.
+            let view = self.items.iter().find_map(|item| match item {
+                Item::Msg(view) if view.row.id == state.id => Some(view),
+                _ => None,
+            })?;
+            for chip in &view.reactions {
+                lines.push((chip.emoji.clone(), super::message::short_count(chip.count), chip.mine));
+            }
+        } else {
+            let rows = self
+                .store
+                .reactions(&self.chat.jid, std::slice::from_ref(&state.id))
+                .unwrap_or_default();
+            for (_, sender, emoji) in rows {
+                let mine = sender == "me";
+                lines.push((emoji, self.name_of(&sender), mine));
+            }
+            // My own line first.
+            lines.sort_by_key(|line| !line.2);
+        }
+        if lines.is_empty() {
+            self.reactors = None;
+            return None;
+        }
+        let mut panel = div()
+            .w(px(240.))
+            .max_h(px(320.))
+            .p(px(6.))
+            .rounded(R_XL)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover_fill())
+            .shadow(t.shadow_popover())
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .px(px(8.))
+                    .pt(px(4.))
+                    .pb(px(6.))
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(t.muted_foreground)
+                    .child(if lines.len() == 1 {
+                        "1 reaction".to_string()
+                    } else {
+                        format!("{} reactions", lines.len())
+                    }),
+            );
+        let mut list = div().id("reactors-list").flex().flex_col().overflow_y_scroll();
+        for (index, (emoji, who, mine)) in lines.into_iter().enumerate() {
+            let id = state.id.clone();
+            let glyph = emoji.clone();
+            let mut line = div()
+                .id(("reactor", index))
+                .min_h(px(40.))
+                .px(px(8.))
+                .rounded(R_MD)
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(10.))
+                .child(div().text_size(px(18.)).child(emoji))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_size(px(14.)).truncate().child(who))
+                        .when(mine, |this| {
+                            this.child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(t.muted_foreground)
+                                    .child("Click to remove"),
+                            )
+                        }),
+                );
+            if mine {
+                // `react` with the emoji that is mine removes it.
+                line = line
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .on_click(cx.listener(move |this, _, _, cx| this.react(&id, &glyph, cx)));
+            }
+            list = list.child(line);
+        }
+        panel = panel.child(list);
+        Some(self.overlay(state.at, panel, window, cx))
     }
 
     /// Works out which emoji the picker lists: the matches of the search, or the group.
@@ -1040,7 +1166,6 @@ view.reload(cx);
 
     fn render_item(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let _perf = crate::perf::scope("chat.item");
-        let t = tokens(cx).clone();
         let Some(item) = self.items.get(index) else {
             return div().into_any_element();
         };
@@ -1058,6 +1183,19 @@ view.reload(cx);
             })),
             audio: self.audio.as_ref().and_then(|player| player.playback()),
             rate: self.audio.as_ref().map(|player| player.rate() as f32).unwrap_or(1.),
+            reactions: Some({
+                let entity = cx.entity().downgrade();
+                let chips_id = id.clone();
+                Rc::new(move |event: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                    let _ = entity.update(cx, |this, cx| {
+                        this.reactors = Some(ReactorsState {
+                            id: chips_id.clone(),
+                            at: event.position(),
+                        });
+                        cx.notify();
+                    });
+                })
+            }),
             seek: Some({
                 let entity = cx.entity().downgrade();
                 Rc::new(move |id: String, fraction: f32, _: &mut Window, cx: &mut App| {
@@ -1096,85 +1234,10 @@ view.reload(cx);
                 }) as super::message::ClickFn
             }),
         };
-        let hover = if t.dark { t.accent } else { t.muted };
-        let mut toolbar = div()
-            .flex_none()
-            .h(px(34.))
-            .when(!std::env::var("WA_HOVER").is_ok_and(|on| !on.is_empty()), |bar| bar.invisible())
-            .group_hover("row", |style| style.visible())
-            .flex()
-            .items_center()
-            .gap(px(2.))
-            .p(px(2.))
-            .rounded(R_LG)
-            .border_1()
-            .border_color(t.border)
-            .bg(t.popover_fill())
-            .shadow(t.shadow_raised());
-        for (slot, emoji) in QUICK_REACTIONS.iter().take(3).enumerate() {
-            let react_id = id.clone();
-            toolbar = toolbar.child(
-                div()
-                    .id(("quick", index * 8 + slot))
-                    .size(px(28.))
-                    .rounded(R_MD)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(16.))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(hover))
-                    .child(*emoji)
-                    .on_click(cx.listener(move |this, _, _, cx| this.react(&react_id, emoji, cx))),
-            );
-        }
-        let tool = |name: &'static str, slot: usize| {
-            div()
-                .id(("tool", index * 8 + slot))
-                .size(px(28.))
-                .rounded(R_MD)
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(t.muted_foreground)
-                .cursor_pointer()
-                .hover(move |style| style.bg(hover))
-                .child(icon(name))
-        };
-        let reply_id = id.clone();
-        let more_id = id.clone();
-        let emoji_id = id.clone();
-        toolbar = toolbar
-            .child(tool("smile-plus", 0).tooltip(tip("React")).on_click(cx.listener(
-                move |this, event: &gpui::ClickEvent, _, cx| {
-                    this.emoji = Some(EmojiState {
-                        target: EmojiTarget::Message(emoji_id.clone()),
-                        at: event.position(),
-                    });
-                    cx.notify();
-                },
-            )))
-            .child(tool("corner-up-left", 1).tooltip(tip("Reply")).on_click(cx.listener(
-                move |this, _, window, cx| {
-                    this.reply_to = this.row(&reply_id).cloned();
-                    this.editing = None;
-                    this.focus_input(window, cx);
-                    cx.notify();
-                },
-            )))
-            .child(tool("ellipsis", 2).tooltip(tip("More")).on_click(cx.listener(
-                move |this, event: &gpui::ClickEvent, _, cx| {
-                    this.menu = Some(MenuState {
-                        id: more_id.clone(),
-                        at: event.position(),
-                    });
-                    cx.notify();
-                },
-            )));
-
-        // Notices and deleted messages have no actions; everything else gets the bar.
+        // Notices and deleted messages have no actions; everything else opens the menu
+        // on a right click. Nothing appears on hover.
         let plain = matches!(view.row.kind, MsgKind::System | MsgKind::Revoked);
-        let row = message_row(view, &hooks, (!plain).then(|| toolbar.into_any_element()), cx);
+        let row = message_row(view, &hooks, cx);
         if plain {
             return row;
         }
@@ -1211,11 +1274,13 @@ view.reload(cx);
         let close = cx.listener(|this, _: &MouseDownEvent, _, cx| {
             this.menu = None;
             this.emoji = None;
+            this.reactors = None;
             cx.notify();
         });
         let close_right = cx.listener(|this, _: &MouseDownEvent, _, cx| {
             this.menu = None;
             this.emoji = None;
+            this.reactors = None;
             cx.notify();
         });
         deferred(
@@ -1280,25 +1345,52 @@ view.reload(cx);
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
 
         // Quick reactions across the top, as in the official client.
+        // The one that is mine is marked; choosing it again takes the reaction back.
+        let mine = self.my_reaction(&row.id);
         let mut quick = div().flex().items_center().justify_between().px(px(2.)).pb(px(4.));
         for (slot, emoji) in QUICK_REACTIONS.iter().enumerate() {
             let id = row.id.clone();
             let hover = t.accent;
+            let chosen = mine.as_deref() == Some(*emoji);
             quick = quick.child(
                 div()
                     .id(("menu-quick", slot))
-                    .size(px(30.))
+                    .size(px(28.))
                     .rounded(R_MD)
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(18.))
+                    .text_size(px(17.))
                     .cursor_pointer()
+                    .when(chosen, |this| this.bg(t.tint(0.22)))
                     .hover(move |style| style.bg(hover))
                     .child(*emoji)
                     .on_click(cx.listener(move |this, _, _, cx| this.react(&id, emoji, cx))),
             );
         }
+        // Any other emoji: the full picker, opened where the menu was.
+        let (picker_id, picker_at, hover) = (row.id.clone(), menu.at, t.accent);
+        quick = quick.child(
+            div()
+                .id("menu-quick-more")
+                .size(px(28.))
+                .rounded(R_MD)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(t.muted_foreground)
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .child(icon("plus"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.menu = None;
+                    this.emoji = Some(EmojiState {
+                        target: EmojiTarget::Message(picker_id.clone()),
+                        at: picker_at,
+                    });
+                    cx.notify();
+                })),
+        );
         panel = panel.child(quick).child(separator());
 
         let id = row.id.clone();
@@ -1902,6 +1994,7 @@ impl Render for ChatView {
         let older = self.has_older;
         let menu = self.menu_overlay(window, cx);
         let emoji = self.emoji_overlay(window, cx);
+        let reactors = self.reactors_overlay(window, cx);
         if let Some((id, path, looping)) = self.pending_video.take() {
             self.start_video(&id, path, looping, window, cx);
         }
@@ -1974,6 +2067,7 @@ impl Render for ChatView {
             .children(self.member_menu_overlay(window, cx))
             .children(menu)
             .children(emoji)
+            .children(reactors)
     }
 }
 
@@ -4327,6 +4421,7 @@ fn item_key(item: &Item) -> (String, u64) {
             for chip in &view.reactions {
                 chip.emoji.hash(&mut hasher);
                 chip.count.hash(&mut hasher);
+                chip.mine.hash(&mut hasher);
             }
             (view.row.id.clone(), hasher.finish())
         }

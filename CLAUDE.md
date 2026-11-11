@@ -83,8 +83,7 @@ connection. Windows only. Private now, open source later.
 - GPUI is vendored in `vendor/` with patches (glass backgrounds, smooth wheel
   scrolling, frame timing); see `vendor/README.md`.
 - Development aids: `WA_OPEN_CHAT`, `WA_SECTION` (calls, status, starred, settings,
-  archived), `WA_INFO`, `WA_HOVER=1` (keeps every message's hover bar visible),
-  `WA_STYLE`, `WA_THEME`, `WA_PALETTE`.
+  archived), `WA_INFO`, `WA_STYLE`, `WA_THEME`, `WA_PALETTE`.
 - Source files are reformatted after being written, so line-exact text replacement is
   fragile. Insert by anchor line, or append a new `impl` block.
 - Icons are Lucide SVGs in `assets/icons` at stroke width 1.75; add new ones there.

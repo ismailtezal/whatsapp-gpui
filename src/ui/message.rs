@@ -103,6 +103,8 @@ pub struct RowHooks {
     pub speed: Option<ClickFn>,
     /// The playback speed in use.
     pub rate: f32,
+    /// Show who reacted to this message (a click on its reaction chips).
+    pub reactions: Option<ClickFn>,
 }
 
 /// Extracts what a row needs from the stored record.
@@ -856,11 +858,22 @@ fn content(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> Div {
 }
 
 /// The reaction chips that hang off the bottom of a bubble.
-fn reaction_chips(view: &MsgView, t: &Tokens) -> Option<Div> {
+fn reaction_chips(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> Option<gpui::Stateful<Div>> {
     if view.reactions.is_empty() {
         return None;
     }
-    let mut chips = div().flex().flex_wrap().gap(px(4.)).mt(px(-6.)).px(px(6.));
+    let mut chips = div()
+        .id(("chips", view.row.rowid as usize))
+        .flex()
+        .flex_wrap()
+        .gap(px(4.))
+        .mt(px(-6.))
+        .px(px(6.));
+    if let Some(open) = hooks.reactions.clone() {
+        chips = chips
+            .cursor_pointer()
+            .on_click(move |event, window, cx| open(event, window, cx));
+    }
     // The most used first; past five, the rest are summed into one "+N" chip.
     let mut ordered: Vec<&ReactionChip> = view.reactions.iter().collect();
     ordered.sort_by_key(|chip| std::cmp::Reverse(chip.count));
@@ -983,7 +996,7 @@ fn footer(view: &MsgView, t: &Tokens) -> Div {
 
 /// Draws one message as a WhatsApp bubble: ours on the right, theirs on the left, with
 /// the time and ticks inside. Colours, radii and type come from the design tokens.
-pub fn message_row(view: &MsgView, hooks: &RowHooks, toolbar: Option<AnyElement>, cx: &App) -> AnyElement {
+pub fn message_row(view: &MsgView, hooks: &RowHooks, cx: &App) -> AnyElement {
     let t = tokens(cx);
     let row = &view.row;
 
@@ -1121,7 +1134,7 @@ pub fn message_row(view: &MsgView, hooks: &RowHooks, toolbar: Option<AnyElement>
         .when(mine, |this| this.items_end())
         .when(!mine, |this| this.items_start())
         .child(bubble);
-    if let Some(chips) = reaction_chips(view, t) {
+    if let Some(chips) = reaction_chips(view, hooks, t) {
         stack = stack.child(chips);
     }
 
@@ -1141,13 +1154,7 @@ pub fn message_row(view: &MsgView, hooks: &RowHooks, toolbar: Option<AnyElement>
             div().w(px(28.)).flex_shrink_0()
         });
     }
-    // The reaction bar sits beside the bubble, on its inner side.
-    match (toolbar, mine) {
-        (Some(bar), true) => line.child(bar).child(stack),
-        (Some(bar), false) => line.child(stack).child(bar),
-        (None, _) => line.child(stack),
-    }
-    .into_any_element()
+    line.child(stack).into_any_element()
 }
 
 /// A date separator: a centred pill, as WhatsApp shows it.

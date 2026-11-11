@@ -30,6 +30,13 @@ Glass is drawn only by the Windows DirectX renderer. This app is Windows only.
 - `gpui-pre/src/elements/list.rs`, `gpui-pre/src/elements/div.rs`: lists and scrolling
   elements use it for wheel input. Upstream applies each notch at once (a 60px jump).
 
+**Middle-button auto-scroll**
+
+- `gpui-pre/src/window.rs`: a middle click drops an anchor (`Window::auto_scroll_anchor`)
+  and, each frame, a scroll sized by the pointer's distance from it is sent to whatever
+  is under the anchor. Any click, key or wheel notch ends it; so does releasing the
+  button after a press-and-drag. Upstream has no auto-scroll.
+
 **Frame timing for development**
 
 - `gpui-pre/src/window.rs`: with `WA_PERF` set, prints the average and worst time of the

@@ -37,7 +37,7 @@ tried without touching someone else or changing the account.
 | Send text | Verified | |
 | Reply (quote), jump to the quoted message | Verified (send) / Built (jump) | |
 | Reactions: send, show | Verified | Quick reactions and the full emoji picker. |
-| Reaction bar on hover | Verified | Sits right next to the bubble, level with its top. Seen on a real mouse hover and with the bar forced visible (`WA_HOVER=1`). |
+| Reactions from the right-click menu | Built | Nothing appears on hover any more (the owner found the hover bar distracting). The menu's top row has six quick reactions and a plus for the full picker; the one that is mine is marked and choosing it again takes it back. Clicking a message's reaction chips lists who reacted; my own line removes my reaction. |
 | Emoji picker | Verified (shown) | Every emoji the system font draws (Unicode 15 and earlier), in nine groups plus recents, with search by name. Seen on screen. No skin-tone choice. |
 | Edit own message | Verified | 15-minute window. |
 | Delete for everyone | Verified | Text, photo and document. |

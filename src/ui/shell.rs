@@ -2409,6 +2409,29 @@ impl Render for Shell {
             )
             .children(chat_menu)
             .children(self.call_card(cx))
+            // The marker of a middle-button auto-scroll, where the button was pressed.
+            .children(window.auto_scroll_anchor().map(|anchor| {
+                let t = tokens(cx);
+                deferred(
+                    anchored()
+                        .position(point(anchor.x - px(15.), anchor.y - px(15.)))
+                        .child(
+                            div()
+                                .size(px(30.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(t.border)
+                                .bg(t.popover)
+                                .shadow(t.shadow_raised())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(t.muted_foreground)
+                                .child(icon("chevrons-up-down")),
+                        ),
+                )
+                .with_priority(20)
+            }))
     }
 }
 

@@ -1,11 +1,13 @@
 # Development aid: clicks inside the app window at a point given in window pixels (as
 # in a screenshot from shot.ps1), without moving the real mouse. Works on the off-screen
-# test copy. -Right sends a right-click; -Move only moves the pointer there (hover).
+# test copy. -Right sends a right-click; -Middle a middle click; -Move only moves the
+# pointer there (hover).
 #   powershell -File scripts\click.ps1 -ProcessName wa-uitest -X 1246 -Y 756
 param(
     [int]$X = 0,
     [int]$Y = 0,
     [switch]$Right,
+    [switch]$Middle,
     [switch]$Move,
     [string]$ProcessName = "wa-uitest"
 )
@@ -25,7 +27,11 @@ $lparam = [IntPtr](([int64]($Y -band 0xFFFF) -shl 16) -bor [int64]($X -band 0xFF
 [void][Click]::PostMessage($hwnd, 0x0200, [IntPtr]0, $lparam)            # WM_MOUSEMOVE
 Start-Sleep -Milliseconds 60
 if (-not $Move) {
-    if ($Right) {
+    if ($Middle) {
+        [void][Click]::PostMessage($hwnd, 0x0207, [IntPtr]0x10, $lparam) # WM_MBUTTONDOWN
+        Start-Sleep -Milliseconds 40
+        [void][Click]::PostMessage($hwnd, 0x0208, [IntPtr]0, $lparam)    # WM_MBUTTONUP
+    } elseif ($Right) {
         [void][Click]::PostMessage($hwnd, 0x0204, [IntPtr]2, $lparam)    # WM_RBUTTONDOWN
         Start-Sleep -Milliseconds 40
         [void][Click]::PostMessage($hwnd, 0x0205, [IntPtr]0, $lparam)    # WM_RBUTTONUP

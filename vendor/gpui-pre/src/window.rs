@@ -1264,6 +1264,8 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    /// whatsapp-gpui patch: the auto-scroll started with the middle mouse button.
+    auto_scroll: Option<AutoScroll>,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -2444,6 +2446,7 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            auto_scroll: None,
             modifiers,
             capslock,
             scale_factor,
@@ -5953,6 +5956,14 @@ impl Window {
         cx.propagate_event = true;
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
+
+        // whatsapp-gpui patch: the middle button starts and stops an auto-scroll.
+        if self.auto_scroll_intercept(&event, cx) {
+            return DispatchEventResult {
+                propagate: false,
+                default_prevented: true,
+            };
+        }
 
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
@@ -10744,5 +10755,113 @@ mod inspector_tests {
             }
         })
         .expect("closed inspector has no bookkeeping and no style overrides");
+    }
+}
+
+/// whatsapp-gpui patch: auto-scroll with the middle mouse button, as browsers and
+/// native Windows apps do it. A middle click drops an anchor; while the pointer is away
+/// from it, whatever scrolls under the anchor moves at a speed that grows with the
+/// distance. Any click, key or wheel notch ends it; so does releasing the button after
+/// a press-and-drag.
+struct AutoScroll {
+    anchor: Point<Pixels>,
+    last_tick: std::time::Instant,
+    /// The middle button has not been released since it started the scroll.
+    held: bool,
+    /// The pointer left the anchor while the button was held: releasing it then ends
+    /// the scroll (press, drag, release) instead of leaving it running (click, move).
+    dragged: bool,
+}
+
+impl Window {
+    /// whatsapp-gpui patch: where a middle-button auto-scroll is anchored while one is
+    /// running, so the app can draw a marker there.
+    pub fn auto_scroll_anchor(&self) -> Option<Point<Pixels>> {
+        self.auto_scroll.as_ref().map(|state| state.anchor)
+    }
+
+    /// Starts, steers or stops the auto-scroll. Returns true when the event was used up.
+    fn auto_scroll_intercept(&mut self, event: &PlatformInput, cx: &mut App) -> bool {
+        match event {
+            PlatformInput::MouseDown(down) => {
+                if self.auto_scroll.take().is_some() {
+                    // The click that ends it does nothing else.
+                    self.mouse_position = down.position;
+                    self.refresh();
+                    return true;
+                }
+                if down.button != crate::MouseButton::Middle {
+                    return false;
+                }
+                self.mouse_position = down.position;
+                self.auto_scroll = Some(AutoScroll {
+                    anchor: down.position,
+                    last_tick: std::time::Instant::now(),
+                    held: true,
+                    dragged: false,
+                });
+                self.refresh();
+                self.auto_scroll_tick(cx);
+                true
+            }
+            PlatformInput::MouseUp(up) if up.button == crate::MouseButton::Middle => {
+                let Some(state) = self.auto_scroll.as_mut() else {
+                    return false;
+                };
+                if state.dragged {
+                    self.auto_scroll = None;
+                    self.refresh();
+                } else {
+                    state.held = false;
+                }
+                true
+            }
+            PlatformInput::KeyDown(_) | PlatformInput::Scroll(_) => {
+                if self.auto_scroll.take().is_some() {
+                    self.refresh();
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// One frame of the auto-scroll: a scroll at the anchor, sized by how far the
+    /// pointer is from it, then the next frame is asked for.
+    fn auto_scroll_tick(&mut self, cx: &mut App) {
+        let real = self.mouse_position;
+        let Some(state) = self.auto_scroll.as_mut() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let elapsed = (now - state.last_tick).as_secs_f32().clamp(0., 0.05);
+        state.last_tick = now;
+        let anchor = state.anchor;
+        // Nothing moves within this distance of the anchor.
+        const DEAD_ZONE: f32 = 14.;
+        let distance = (real.y - anchor.y) / px(1.);
+        let beyond = distance.abs() - DEAD_ZONE;
+        if beyond > 0. {
+            if state.held {
+                state.dragged = true;
+            }
+            // Pixels a second: gentle near the anchor, fast far from it.
+            let speed = distance.signum() * beyond.powf(1.4) * 3.;
+            let event = crate::ScrollEvent {
+                position: anchor,
+                // The pointer below the anchor moves the content up.
+                delta: crate::ScrollDelta::Pixels(point(px(0.), px(-speed * elapsed))),
+                modifiers: Modifiers::default(),
+                touch_phase: crate::TouchPhase::Moved,
+                source: crate::ScrollSource::Pointer,
+            };
+            // The scroll belongs to what is under the anchor, wherever the pointer is.
+            self.mouse_position = anchor;
+            cx.propagate_event = true;
+            self.dispatch_mouse_event(&event, cx);
+            self.mouse_position = real;
+            self.mouse_hit_test = self.rendered_frame.hit_test(real);
+        }
+        self.on_next_frame(|window, cx| window.auto_scroll_tick(cx));
     }
 }
