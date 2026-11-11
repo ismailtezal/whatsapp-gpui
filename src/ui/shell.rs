@@ -156,6 +156,8 @@ pub struct Shell {
     /// The name field must be refilled from the account (done at the next render, which
     /// has the window an input needs).
     profile_name_stale: bool,
+    /// Whether new messages raise a Windows notification (a setting, on by default).
+    notify_on: bool,
     /// Whether the app is set to start with Windows (read once at start).
     autostart: bool,
     fake_call_shown: bool,
@@ -207,6 +209,7 @@ fn now_secs() -> i64 {
 impl Shell {
     pub fn new(backend: Backend, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = backend.store().clone();
+        let notify_on = store.kv("notifications").ok().flatten().as_deref() != Some("off");
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let group_name = cx.new(|cx| InputState::new(window, cx).placeholder("Group name"));
         let status_text = cx.new(|cx| {
@@ -325,6 +328,7 @@ impl Shell {
             channel_link,
             channel_name,
             channel_found: None,
+            notify_on,
             autostart: crate::tray::starts_with_windows(),
             join_link,
             profile_name_stale: true,
@@ -552,7 +556,7 @@ impl Shell {
                 }
                 let row = self.chats.iter().find(|c| c.jid == chat);
                 let muted = row.is_some_and(|c| c.mute_until != 0);
-                if !open_and_focused && !muted && chat != "status@broadcast" {
+                if self.notify_on && !open_and_focused && !muted && chat != "status@broadcast" {
                     let title = row.map(|c| c.title.clone()).unwrap_or_else(|| display_number(&chat));
                     let body = match (row.map(|c| c.kind), sender) {
                         (Some(ChatKind::User), _) | (_, None) => preview,
@@ -3325,9 +3329,23 @@ impl Shell {
         };
         let keep = crate::tray::keep_running();
         let autostart = self.autostart;
+        let notify_on = self.notify_on;
         div()
             .flex()
             .flex_col()
+            .child(
+                row(
+                    "setting-notifications",
+                    "Notifications for new messages",
+                    "A Windows notification when a message arrives in a chat that is not in front. Muted chats never notify.",
+                    notify_on,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.notify_on = !notify_on;
+                    let _ = this.store.set_kv("notifications", if notify_on { "off" } else { "on" });
+                    cx.notify();
+                })),
+            )
             .child(
                 row(
                     "setting-background",

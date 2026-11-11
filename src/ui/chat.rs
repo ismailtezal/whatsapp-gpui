@@ -136,6 +136,9 @@ pub struct ChatView {
     edit_field: Option<GroupField>,
     edit_input: Entity<gpui_component::input::InputState>,
     info_open: bool,
+    /// Communities this account is in, as (address, name, whether this group is in it),
+    /// for putting a group into one or taking it out.
+    communities: Vec<(String, String, bool)>,
     /// For a channel: its role, followers and mute, as last read from the server.
     channel: Option<crate::events::ChannelInfo>,
     /// A group's switches as last read from the server (kept in the store).
@@ -261,6 +264,7 @@ impl ChatView {
             edit_field: None,
             edit_input,
             info_open: false,
+            communities: Vec::new(),
             channel: None,
             group_settings: None,
             timer: 0,
@@ -376,6 +380,23 @@ view.reload(cx);
                 .ok()
                 .flatten()
                 .and_then(|text| crate::events::ChannelInfo::decode(&text));
+        }
+        if self.chat.kind == ChatKind::Group {
+            self.communities = self
+                .store
+                .kv(crate::events::Community::KEY)
+                .ok()
+                .flatten()
+                .map(|text| crate::events::Community::decode(&text))
+                .unwrap_or_default()
+                .into_iter()
+                // A community's own announcement group cannot be moved.
+                .filter(|community| community.jid != self.chat.jid)
+                .map(|community| {
+                    let inside = community.groups.iter().any(|group| group.jid == self.chat.jid);
+                    (community.jid, community.name, inside)
+                })
+                .collect();
         }
         self.timer = self.store.chat_timer(&self.chat.jid).unwrap_or(0);
         self.group_settings = self
@@ -3307,6 +3328,44 @@ impl ChatView {
                     }))
                     .into_any_element(),
             );
+            // Put this group into a community, or take it out of the one it is in.
+            let inside = self.communities.iter().any(|(_, _, inside)| *inside);
+            for (index, (community, name, is_inside)) in self.communities.iter().enumerate() {
+                if inside != *is_inside {
+                    continue;
+                }
+                let (parent, linked) = (community.clone(), !*is_inside);
+                let hover = t.fg(0.06);
+                rows.push(
+                    div()
+                        .id(("info-community", index))
+                        .h(px(36.))
+                        .px(px(8.))
+                        .rounded(R_LG)
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(px(10.))
+                        .text_size(px(14.))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(hover))
+                        .child(icon("users").text_color(t.muted_foreground))
+                        .child(div().truncate().child(SharedString::from(if linked {
+                            format!("Add to community {name}")
+                        } else {
+                            format!("Remove from community {name}")
+                        })))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.backend.send(Command::LinkGroup {
+                                parent: parent.clone(),
+                                group: this.chat.jid.clone(),
+                                linked,
+                            });
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
             rows.push(
                 action("info-add", "user-plus", "Add a member", false)
                     .on_click(cx.listener(|this, _, _, cx| {
