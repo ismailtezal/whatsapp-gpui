@@ -67,7 +67,7 @@ fn apply_inner(store: &Store, event: &Event, out: &mut Vec<UiEvent>) -> DbResult
                 valid_secs: qr.timeout.as_secs(),
             });
         }
-        Event::PairingCode(code) => out.push(UiEvent::PairCode(format!("{:?}", code))),
+        Event::PairingCode(code) => out.push(UiEvent::PairCode(code.code.clone())),
         Event::PairSuccess(_) => out.push(UiEvent::Connection(ConnState::Connecting)),
 
         Event::Messages(batch) => {

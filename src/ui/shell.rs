@@ -134,6 +134,14 @@ pub struct Shell {
     selected: Option<String>,
     chat: Option<Entity<ChatView>>,
     search: Entity<InputState>,
+    /// The phone number typed on the welcome screen, for linking without the camera.
+    link_phone: Entity<InputState>,
+    /// Whether the welcome screen is on its "link with a phone number" side.
+    link_by_phone: bool,
+    /// The code WhatsApp gave for linking by phone number.
+    pair_code: Option<String>,
+    /// While this lies ahead, the title bar says that chats are being fetched.
+    sync_until: Option<std::time::Instant>,
     query: String,
     hits: Vec<MsgRow>,
     /// Choosing a contact to start a chat with.
@@ -221,6 +229,7 @@ impl Shell {
         let store = backend.store().clone();
         let notify_on = store.kv("notifications").ok().flatten().as_deref() != Some("off");
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
+        let link_phone = cx.new(|cx| InputState::new(window, cx).placeholder("Country code and number, e.g. 44 7700 900123"));
         let group_name = cx.new(|cx| InputState::new(window, cx).placeholder("Group name"));
         let status_text = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -314,6 +323,10 @@ impl Shell {
             selected: None,
             chat: None,
             search,
+            link_phone,
+            link_by_phone: false,
+            pair_code: None,
+            sync_until: None,
             query: String::new(),
             hits: Vec::new(),
             picking: false,
@@ -531,6 +544,12 @@ impl Shell {
                     self.stale_chats = true;
                 }
                 if state == ConnState::Online {
+                    if self.unlinked() {
+                        // Just linked: the phone now sends the chats, which takes a while.
+                        self.sync_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(90));
+                    }
+                    self.pair_code = None;
+                    self.link_by_phone = false;
                     // Groups whose name never arrived get it fetched now.
                     for chat in self
                         .chats
@@ -550,6 +569,7 @@ impl Shell {
                 self.conn = state;
             }
             UiEvent::Qr { code, .. } => self.qr = Some(code),
+            UiEvent::PairCode(code) => self.pair_code = Some(code),
             UiEvent::Identity { pn, push_name, .. } => {
                 self.me_jid = pn;
                 if !push_name.is_empty() {
@@ -563,6 +583,7 @@ impl Shell {
             }
             UiEvent::ChatsChanged => self.stale_chats = true,
             UiEvent::HistoryProgress { .. } => {
+                self.sync_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(20));
                 // History arrived (first sync or an answer to "get earlier messages").
                 self.stale_chats = true;
                 self.stale_open_chat = true;
@@ -696,7 +717,6 @@ impl Shell {
                 }
             }
             UiEvent::Error(message) => self.last_error = Some(message),
-            _ => {}
         }
         cx.notify();
     }
@@ -812,7 +832,9 @@ impl Shell {
                 .window_control_area(area)
                 .child(icon(name).size(px(13.)))
         };
+        let syncing = self.sync_until.is_some_and(|until| until > std::time::Instant::now());
         let status = match &self.conn {
+            ConnState::Online if syncing => Some("Getting your chats from your phone…".to_string()),
             ConnState::Online => None,
             ConnState::Starting | ConnState::Connecting => Some("Connecting…".to_string()),
             ConnState::Pairing => Some("Waiting for you to link this device".to_string()),
@@ -2209,7 +2231,7 @@ impl Shell {
                     )
                     .child(self.profile_editor(cx))
                     .child(rule())
-                    .child(heading("Appearance", "The look follows diskurt's modern design."))
+                    .child(heading("Appearance", "Style, colours and background of the app."))
                     .child(self.style_row(cx))
                     .children(self.backdrop_row(cx))
                     .child(self.palette_row(cx))
@@ -2301,6 +2323,263 @@ impl Shell {
                                     .child(SharedString::from(error)),
                             )
                     }),
+            )
+            .into_any_element()
+    }
+
+    /// Whether no account is linked to this copy: the welcome screen is shown instead
+    /// of the chats.
+    fn unlinked(&self) -> bool {
+        match self.conn {
+            ConnState::Pairing | ConnState::LoggedOut => true,
+            ConnState::Online => false,
+            // Before the connection has said anything: unlinked if nothing is known.
+            _ => self.me_jid.is_none() && self.chats.is_empty() && self.section == Section::Chats,
+        }
+    }
+
+    /// The first screen of an unlinked copy: how to link, the code to scan, and the way
+    /// to link with a phone number instead.
+    fn welcome(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = tokens(cx).clone();
+        let step = |number: &'static str, text: &'static str| {
+            div()
+                .flex()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .size(px(24.))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .bg(t.tint(0.14))
+                        .text_color(t.primary)
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(number),
+                )
+                // The text takes the room that is left and wraps within it.
+                .child(div().flex_1().min_w_0().pt(px(2.)).text_size(px(14.)).line_height(px(20.)).child(text))
+        };
+        let link = |id: &'static str, text: &'static str| {
+            div()
+                .id(id)
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(t.primary)
+                .cursor_pointer()
+                .hover(|style| style.opacity(0.8))
+                .child(text)
+        };
+
+        // The right-hand side: the code to scan, or the code to type on the phone.
+        let waiting = |text: &'static str| {
+            div()
+                .size(px(264.))
+                .rounded(R_XL)
+                .border_1()
+                .border_color(t.border)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(13.))
+                .text_color(t.muted_foreground)
+                .child(text)
+        };
+        let side: AnyElement = if self.link_by_phone {
+            match &self.pair_code {
+                Some(code) => {
+                    // Eight characters, shown four and four.
+                    let mut boxes = div().flex().items_center().gap(px(6.));
+                    for (index, letter) in code.chars().filter(|c| c.is_alphanumeric()).enumerate() {
+                        if index == 4 {
+                            boxes = boxes.child(div().w(px(8.)).h(px(2.)).bg(t.muted_foreground));
+                        }
+                        boxes = boxes.child(
+                            div()
+                                .w(px(34.))
+                                .h(px(44.))
+                                .rounded(R_MD)
+                                .border_1()
+                                .border_color(t.border)
+                                .bg(t.fg(0.04))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(20.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(letter.to_string()),
+                        );
+                    }
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(14.))
+                        .child(boxes)
+                        .child(
+                            div()
+                                .max_w(px(320.))
+                                .text_size(px(13.))
+                                .line_height(px(19.))
+                                .text_color(t.muted_foreground)
+                                .child("Enter this code on your phone. It is valid for about three minutes."),
+                        )
+                        .into_any_element()
+                }
+                None => div()
+                    .w(px(320.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .h(px(40.))
+                            .rounded(R_LG)
+                            .border_1()
+                            .border_color(t.border)
+                            .bg(t.fg(0.04))
+                            .flex()
+                            .items_center()
+                            .child(Input::new(&self.link_phone).appearance(false).bordered(false)),
+                    )
+                    .child(
+                        div()
+                            .id("welcome-get-code")
+                            .h(px(40.))
+                            .rounded(R_LG)
+                            .bg(t.primary)
+                            .text_color(t.primary_foreground)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(14.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|style| style.opacity(0.8))
+                            .child("Get a code")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let number = this.link_phone.read(cx).value().to_string();
+                                this.backend.send(Command::LinkWithPhone { number });
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            }
+        } else {
+            match (&self.conn, &self.qr) {
+                (ConnState::Pairing, Some(code)) => match qrcode::QrCode::new(code.as_bytes()) {
+                    Ok(qr) => {
+                        let svg = qr
+                            .render::<qrcode::render::svg::Color>()
+                            .min_dimensions(264, 264)
+                            .dark_color(qrcode::render::svg::Color("#000000"))
+                            .light_color(qrcode::render::svg::Color("#ffffff"))
+                            .build();
+                        div()
+                            .p(px(14.))
+                            .rounded(R_XL)
+                            .bg(gpui::white())
+                            .child(gpui::img(Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes()))).size(px(264.)))
+                            .into_any_element()
+                    }
+                    Err(_) => waiting("The code could not be drawn.").into_any_element(),
+                },
+                (ConnState::LoggedOut, _) => waiting("Logged out. A new code is on its way…").into_any_element(),
+                (ConnState::Offline(_), _) => waiting("No connection. Trying again…").into_any_element(),
+                _ => waiting("Getting a code…").into_any_element(),
+            }
+        };
+
+        let steps = if self.link_by_phone {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(14.))
+                .child(step("1", "Type your phone number with its country code and choose Get a code."))
+                .child(step("2", "On your phone open WhatsApp, then Settings, Linked devices, Link a device."))
+                .child(step("3", "Choose \"Link with phone number instead\" and enter the code shown here."))
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(14.))
+                .child(step("1", "Open WhatsApp on your phone."))
+                .child(step("2", "Go to Settings, Linked devices, and choose Link a device."))
+                .child(step("3", "Point your phone at the code on this screen."))
+        };
+        let by_phone = self.link_by_phone;
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(28.))
+            .p(px(24.))
+            .child(
+                div()
+                    .max_w(px(820.))
+                    .w_full()
+                    .p(px(36.))
+                    .rounded(px(20.))
+                    .border_1()
+                    .border_color(t.panel_border())
+                    .bg(t.surface(Surface::Panel, t.background))
+                    .shadow(t.panel_shadow())
+                    .flex()
+                    .items_center()
+                    .gap(px(40.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(20.))
+                            .child(
+                                div()
+                                    .text_size(px(24.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Link this PC to your WhatsApp"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .line_height(px(20.))
+                                    .text_color(t.muted_foreground)
+                                    .child("Your chats stay on your phone and are copied here, end-to-end encrypted. The phone can stay offline afterwards."),
+                            )
+                            .child(steps)
+                            .child(
+                                link(
+                                    "welcome-switch",
+                                    if by_phone { "Scan a code with the camera instead" } else { "Link with a phone number instead" },
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.link_by_phone = !this.link_by_phone;
+                                    this.pair_code = None;
+                                    if this.link_by_phone {
+                                        this.link_phone.update(cx, |input, cx| input.focus(window, cx));
+                                    }
+                                    cx.notify();
+                                })),
+                            ),
+                    )
+                    .child(div().flex_shrink_0().child(side)),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(t.muted_foreground)
+                    .child(SharedString::from(format!(
+                        "Version {}. An unofficial client, not affiliated with WhatsApp or Meta.",
+                        env!("CARGO_PKG_VERSION")
+                    ))),
             )
             .into_any_element()
     }
@@ -2473,6 +2752,8 @@ impl Render for Shell {
                     }]),
             );
         }
+        let unlinked = self.unlinked();
+        let mut welcome = unlinked.then(|| self.welcome(cx));
         div()
             .size_full()
             .relative()
@@ -2484,7 +2765,8 @@ impl Render for Shell {
             .text_size(px(14.))
             .when(t.liquid(), |this| this.child(ambient))
             .child(self.title_bar(window, cx))
-            .child(
+            .when(unlinked, |this| this.child(welcome.take().unwrap_or_else(|| div().into_any_element())))
+            .when(!unlinked, |this| this.child(
                 div()
                     .flex_1()
                     .min_h_0()
@@ -2511,7 +2793,7 @@ impl Render for Shell {
                                 ),
                             ),
                     ),
-            )
+            ))
             .children(chat_menu)
             .children(self.call_card(cx))
             .children(self.toast.clone().map(|(problem, _)| {

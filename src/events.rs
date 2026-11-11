@@ -298,6 +298,11 @@ pub enum Command {
         /// People mentioned in the caption.
         mentions: Vec<String>,
     },
+    /// Asks for a code to link this device by phone number instead of the QR picture.
+    /// The number is in international form, digits only.
+    LinkWithPhone {
+        number: String,
+    },
     /// Sends again a message of ours that failed, or is still waiting, under the same ID.
     Resend {
         chat: String,

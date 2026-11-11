@@ -680,6 +680,23 @@ async fn execute(
             send_prepared(client, store, events, &chat, message).await?;
         }
 
+        Command::LinkWithPhone { number } => {
+            let digits: String = number.chars().filter(char::is_ascii_digit).collect();
+            if digits.len() < 7 {
+                return Err(anyhow!("Enter the phone number with its country code, for example 44 7700 900123."));
+            }
+            let options = whatsapp_rust::wacore::pair_code::PairCodeOptions {
+                phone_number: digits,
+                ..Default::default()
+            };
+            // The code also arrives as an event; sending it here covers both ways.
+            let code = client
+                .pair_with_code(options)
+                .await
+                .map_err(|error| anyhow!("WhatsApp did not give a code for that number: {error}"))?;
+            let _ = events.send(UiEvent::PairCode(code)).await;
+        }
+
         Command::Resend { chat, id } => {
             let record = store
                 .record(&chat, &id)?

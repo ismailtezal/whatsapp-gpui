@@ -19,16 +19,16 @@ entry and an uninstaller, and can add a desktop shortcut and start with Windows.
 installer is not signed, so Windows SmartScreen asks for confirmation. The portable zip
 on the same page holds just the program.
 
-A release is made by pushing a version tag; the workflow in
-`.github/workflows/release.yml` builds and publishes it:
+The first start shows how to link: scan the code with your phone (WhatsApp, Settings,
+Linked devices, Link a device), or choose "Link with a phone number instead" and type the
+code the app shows into your phone. Your chats then arrive from the phone; the title bar
+says so while it lasts.
 
-```bash
-git tag v0.1.0
-```
+To stop using it: Settings, Log out. That unlinks the device and removes the chats, media
+and backups from the PC. The uninstaller removes the program.
 
-```bash
-git push origin v0.1.0
-```
+A release is made by pushing a version tag (`git tag v0.3.0`, `git push origin v0.3.0`);
+the workflow in `.github/workflows/release.yml` builds and publishes it.
 
 ## Run it from source
 
@@ -68,7 +68,8 @@ Everything is kept on this PC under `%LOCALAPPDATA%\whatsapp-gpui`:
 | `history\` | The raw history the phone sent, kept so `chats.db` can be rebuilt. |
 | `media\`, `avatars\` | Downloaded media and profile pictures. |
 
-Deleting the folder unlinks nothing by itself; use Settings, Log out, to unlink the device.
+Settings, Log out, unlinks the device and empties this folder of everything that belongs
+to the account. Deleting the folder by hand unlinks nothing by itself.
 
 ## Layout
 
@@ -86,7 +87,8 @@ Deleting the folder unlinks nothing by itself; use Settings, Log out, to unlink 
 
 ## Design
 
-The look uses the design tokens of diskurt's "modern" design: a frameless window with a
+Four styles (Modern, Glass, Liquid Glass, Futuristic) and ten colour palettes, chosen in
+Settings. The base look is a frameless window with a
 slim title bar, a rail, a floating main panel, the Figtree typeface and translucent
 fills. The conversation keeps WhatsApp's shape: bubbles, with your messages on the right.
 
