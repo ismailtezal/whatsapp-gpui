@@ -70,7 +70,7 @@ member) and in an empty test group created for the purpose, never with another p
 | Voice messages and audio: play in app | Verified (player) / Built (control) | The player was checked on this PC with a real voice message. The play button and progress bar in the conversation were not clicked. |
 | Voice messages: record | Not done | Needs an Opus encoder. |
 | Media that expired on the server | Verified | Re-requested from the phone, then downloaded. |
-| Stickers: show | Verified (still) / Built (animated) | Animated stickers are now set up to play on their own (the picture was missing the identity GPUI needs to animate). Not yet confirmed on screen with an animated sticker. |
+| Stickers: show | Verified | Animated stickers play on their own. Checked on screen: two captures a second apart showed different frames of the animated sticker in "Dosyalar". |
 | Stickers: send | Verified | |
 | Sticker picker | Built | Lists stickers already downloaded to this PC. No favourites, no sticker packs. |
 | Video and GIF previews | Verified | GIFs and videos up to 16 MB download on view; Windows makes the preview picture. |
@@ -119,7 +119,7 @@ member) and in an empty test group created for the purpose, never with another p
 | Installer, start with Windows | Built | `installer/whatsapp-gpui.iss` (Inno Setup): installs for the current user without administrator rights, Start menu entry, optional desktop shortcut and "Start with Windows", uninstaller. Built by the release workflow; see "Releases" below for whether it has been run. Not signed, so Windows SmartScreen will warn. |
 | Build and release workflows | Built | `.github/workflows/ci.yml` tests and builds every push to `main`. `release.yml` runs on a `v*` tag and publishes the installer and a portable zip as a GitHub release. |
 | Interface styles | Verified (shown) | Modern, Glass and Futuristic, chosen in Settings and remembered. Glass is a translucent window over the Windows blur with light rims; it is not Apple's Liquid Glass (no refraction or lensing, which GPUI cannot draw). Futuristic adds accent glows and sharper borders. Both were seen on screen once; neither was checked in the light theme or with every palette. |
-| Reaction bar on hover | Built | Sits next to the bubble (left of own messages, right of others) instead of at the edge of the window. Not checked on screen, because hovering cannot be done in the unattended screenshot. |
+| Reaction bar on hover | Verified (position) / Built (hover) | Sits right next to the bubble, level with its top (left of own messages, right of others), not at the edge of the window. The position was checked on screen with the bar forced visible (`WA_HOVER=1`). Showing it on a real mouse hover was not captured. |
 | Colour palettes of the design | Partial | Neutral, Turquoise, Midnight, Mono and Amber, in dark and light, chosen in Settings and remembered. Turquoise dark was checked on screen. The other five palettes of diskurt (ocean, violet, rose, pomegranate, forest) are not included. |
 
 ## Design

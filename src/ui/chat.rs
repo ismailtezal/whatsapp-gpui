@@ -853,7 +853,7 @@ impl ChatView {
         let mut toolbar = div()
             .flex_none()
             .h(px(34.))
-            .invisible()
+            .when(!std::env::var("WA_HOVER").is_ok_and(|on| !on.is_empty()), |bar| bar.invisible())
             .group_hover("row", |style| style.visible())
             .flex()
             .items_center()
