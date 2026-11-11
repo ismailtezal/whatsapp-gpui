@@ -439,3 +439,178 @@ impl Tx<'_> {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use whatsapp_rust::wacore::types::events::{BatchOrigin, MessageBatch};
+    use whatsapp_rust::wacore::types::message::MessageSource;
+    use whatsapp_rust::Jid;
+
+    use super::*;
+    use crate::model::MsgKind;
+
+    const ADA: &str = "15550001111@s.whatsapp.net";
+    const GROUP: &str = "120363000000000001@g.us";
+
+    fn temp_store(name: &str) -> Store {
+        let path = std::env::temp_dir().join(format!(
+            "whatsapp-gpui-test-{name}-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        Store::open(&path).expect("open test store")
+    }
+
+    fn text(body: &str) -> wa::Message {
+        let mut message = wa::Message::default();
+        message.conversation = Some(body.to_string());
+        message
+    }
+
+    /// An event carrying one message, as the connection delivers it.
+    fn inbound(chat: &str, sender: &str, from_me: bool, id: &str, message: wa::Message) -> Event {
+        let mut info = MessageInfo::default();
+        info.source = MessageSource {
+            chat: chat.parse::<Jid>().expect("chat jid"),
+            sender: sender.parse::<Jid>().expect("sender jid"),
+            is_from_me: from_me,
+            is_group: chat.ends_with("@g.us"),
+            ..Default::default()
+        };
+        info.id = id.into();
+        info.push_name = "Ada".into();
+        info.timestamp = whatsapp_rust::chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("time");
+        let message = InboundMessage::builder()
+            .message(Arc::new(message))
+            .info(Arc::new(info))
+            .build();
+        Event::Messages(
+            MessageBatch::builder()
+                .messages(Arc::from(vec![message]))
+                .origin(BatchOrigin::Live)
+                .build(),
+        )
+    }
+
+    #[test]
+    fn an_incoming_text_is_stored_counted_and_announced() {
+        let store = temp_store("incoming");
+        let updates = apply(&store, &inbound(ADA, ADA, false, "MSG1", text("hello there")));
+
+        let rows = store.messages(ADA, None, 10).expect("read messages");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text.as_deref(), Some("hello there"));
+        assert!(!rows[0].from_me);
+        assert_eq!(store.unread_count(ADA).expect("unread"), 1);
+        // The sender's display name comes from the message.
+        assert_eq!(store.display_name(ADA).expect("name"), "Ada");
+
+        assert!(updates.iter().any(|u| matches!(u, UiEvent::ChatsChanged)));
+        assert!(updates.iter().any(|u| matches!(u, UiEvent::ChatChanged { chat } if chat == ADA)));
+        assert!(updates.iter().any(
+            |u| matches!(u, UiEvent::Incoming { chat, preview, .. } if chat == ADA && preview == "hello there")
+        ));
+        let chats = store.chats(false).expect("chat list");
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].unread, 1);
+    }
+
+    #[test]
+    fn a_message_from_our_other_device_does_not_count_as_unread() {
+        let store = temp_store("own");
+        let updates = apply(&store, &inbound(ADA, ADA, true, "MSG1", text("sent from my phone")));
+        assert_eq!(store.unread_count(ADA).expect("unread"), 0);
+        assert!(!updates.iter().any(|u| matches!(u, UiEvent::Incoming { .. })));
+        assert!(store.messages(ADA, None, 10).expect("read")[0].from_me);
+    }
+
+    #[test]
+    fn a_group_message_keeps_its_author() {
+        let store = temp_store("group");
+        apply(&store, &inbound(GROUP, ADA, false, "MSG1", text("hi all")));
+        let rows = store.messages(GROUP, None, 10).expect("read");
+        assert_eq!(rows[0].sender.as_deref(), Some(ADA));
+        let chats = store.chats(false).expect("chat list");
+        assert_eq!(chats[0].kind, crate::model::ChatKind::Group);
+    }
+
+    #[test]
+    fn a_reaction_attaches_to_its_message_instead_of_becoming_one() {
+        let store = temp_store("reaction");
+        apply(&store, &inbound(ADA, ADA, false, "MSG1", text("nice")));
+
+        let mut key = wa::MessageKey::default();
+        key.id = Some("MSG1".to_string());
+        let mut reaction = wa::message::ReactionMessage::default();
+        reaction.key = MessageField::some(key);
+        reaction.text = Some("👍".to_string());
+        let mut message = wa::Message::default();
+        message.reaction_message = MessageField::some(reaction);
+        apply(&store, &inbound(ADA, ADA, false, "REACT1", message));
+
+        assert_eq!(store.messages(ADA, None, 10).expect("read").len(), 1);
+        let reactions = store.reactions(ADA, &["MSG1".to_string()]).expect("reactions");
+        assert_eq!(reactions, vec![("MSG1".to_string(), ADA.to_string(), "👍".to_string())]);
+    }
+
+    #[test]
+    fn deleting_for_everyone_leaves_a_placeholder() {
+        let store = temp_store("revoke");
+        apply(&store, &inbound(ADA, ADA, false, "MSG1", text("oops")));
+
+        let mut key = wa::MessageKey::default();
+        key.id = Some("MSG1".to_string());
+        let mut protocol = wa::message::ProtocolMessage::default();
+        protocol.key = MessageField::some(key);
+        protocol.r#type = Some(wa::message::protocol_message::Type::REVOKE);
+        let mut message = wa::Message::default();
+        message.protocol_message = MessageField::some(protocol);
+        apply(&store, &inbound(ADA, ADA, false, "REVOKE1", message));
+
+        let rows = store.messages(ADA, None, 10).expect("read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, MsgKind::Revoked);
+        assert_eq!(rows[0].text, None);
+    }
+
+    #[test]
+    fn an_edit_replaces_the_text_and_marks_the_message() {
+        let store = temp_store("edit");
+        apply(&store, &inbound(ADA, ADA, false, "MSG1", text("teh")));
+
+        let mut key = wa::MessageKey::default();
+        key.id = Some("MSG1".to_string());
+        let mut protocol = wa::message::ProtocolMessage::default();
+        protocol.key = MessageField::some(key);
+        protocol.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+        protocol.edited_message = MessageField::some(text("the"));
+        let mut message = wa::Message::default();
+        message.protocol_message = MessageField::some(protocol);
+        apply(&store, &inbound(ADA, ADA, false, "EDIT1", message));
+
+        let rows = store.messages(ADA, None, 10).expect("read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text.as_deref(), Some("the"));
+        assert!(rows[0].edited);
+    }
+
+    #[test]
+    fn a_lid_and_phone_number_fold_into_one_chat() {
+        let store = temp_store("lid");
+        let lid = "99990000111122@lid";
+        apply(&store, &inbound(lid, lid, false, "MSG1", text("from my hidden id")));
+        assert_eq!(store.messages(lid, None, 10).expect("read").len(), 1);
+
+        store.learn_lid(lid, ADA).expect("learn mapping");
+        // The message moved to the phone-number chat, and new LID traffic lands there too.
+        assert_eq!(store.messages(ADA, None, 10).expect("read").len(), 1);
+        apply(&store, &inbound(lid, lid, false, "MSG2", text("again")));
+        assert_eq!(store.messages(ADA, None, 10).expect("read").len(), 2);
+        assert_eq!(store.chats(false).expect("chats").len(), 1);
+    }
+}

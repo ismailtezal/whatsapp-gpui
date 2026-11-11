@@ -385,6 +385,60 @@ fn main() -> Result<()> {
             std::thread::sleep(Duration::from_secs(4));
             println!("leave sent for group");
         }
+        "sticker" => {
+            // Fetch a sticker from history (download only), then send it to a group.
+            let chat = group(&store, &args[1])?;
+            let mut path = store.sticker_paths(1)?.into_iter().next();
+            if path.is_none() {
+                let mut found = None;
+                for candidate in store.chats(false)? {
+                    if let Some(msg) = store
+                        .messages(&candidate.jid, None, 600)?
+                        .into_iter()
+                        .rev()
+                        .find(|m| m.kind == whatsapp_gpui::model::MsgKind::Sticker)
+                    {
+                        found = Some((candidate.jid.clone(), msg.id));
+                        break;
+                    }
+                }
+                let (from, id) = found.ok_or_else(|| anyhow!("no sticker in history"))?;
+                backend.send(Command::DownloadMedia { chat: from, id });
+                let _ = wait_for(&backend, "sticker download", Duration::from_secs(40), |event| {
+                    if let UiEvent::MediaReady { path: ready, .. } = event {
+                        path = ready.clone();
+                        return true;
+                    }
+                    false
+                });
+            }
+            let path = std::path::PathBuf::from(path.ok_or_else(|| anyhow!("could not get a sticker file"))?);
+            let before = newest(&store, &chat, true).map(|m| m.id).unwrap_or_default();
+            backend.send(Command::SendFile {
+                chat: chat.clone(),
+                kind: whatsapp_gpui::events::Attach::Sticker,
+                path,
+                caption: None,
+                reply_to: None,
+            });
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let sent = loop {
+                let newest = newest(&store, &chat, true)?;
+                if newest.id != before {
+                    break newest;
+                }
+                if Instant::now() > deadline {
+                    bail!("sticker upload did not finish in time");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            println!(
+                "sent sticker id={} kind={:?} ack={:?}",
+                sent.id,
+                sent.kind,
+                wait_ack(&store, &chat, &sent.id, Duration::from_secs(30))?
+            );
+        }
         "listen" => {
             let seconds: u64 = args.get(1).and_then(|n| n.parse().ok()).unwrap_or(15);
             let mut counts = std::collections::BTreeMap::new();

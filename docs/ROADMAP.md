@@ -3,115 +3,135 @@
 Goal: everything the official WhatsApp client does, on Windows, in GPUI and Rust.
 This file is the honest checklist. Each line is one of:
 
-- **Verified**: exercised against the real account or covered by a test.
-- **Built**: implemented and compiles, not yet exercised end to end.
+- **Verified**: exercised against the real account, or covered by an automated test.
+- **Built**: implemented and compiles, not yet exercised end to end. Treat as unproven.
 - **Partial**: some of it works; the gap is stated.
 - **Not done**: nothing useful exists yet.
 
-Real-account checks were run in the owner's "Dosyalar" group only (see `CLAUDE.md`).
+Real-account checks were run only in the owner's "Dosyalar" group (which has no other
+member) and in an empty test group created for the purpose, never with another person.
+`wa-test` refuses to send anywhere but a group.
 
 ## Foundation
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Link by QR code | Verified | `wa-link`; the app itself shows the pairing state but does not draw the QR yet. |
-| Session persistence, reconnect | Verified | Reconnected across many runs of `wa-test` and the app. |
-| History sync import | Verified | 151 conversations, 10,514 messages imported from the phone's sync. |
-| Full (one-year) history | Partial | Requested at pairing; the phone sent the recent set only. Older messages need the on-demand request (`LoadOlder`), which is not implemented. |
-| Local chat database | Verified | SQLite, full protocol record per message, full-text index. |
-| Account state replay | Verified | Saved contact names, pins, mutes, archive, stars arrive on first run. |
-| LID / phone-number identity merge | Built | Mappings from history and live messages fold chats together. |
+| Link by QR code | Verified | Linked with `wa-link`. The app draws the QR itself when not linked (Built: this path has not been run, since the device is already linked). |
+| Session persistence, reconnect | Verified | Reconnected across dozens of runs. |
+| History sync import | Verified | About 73,700 messages in 130 chats arrived from the phone and are stored. |
+| Local chat database | Verified | SQLite; the full protocol record of every message; full-text index. |
+| Account state replay | Verified | Saved contact names, pins, mutes, archive flags and stars arrive on first run. |
+| LID / phone-number identity merge | Verified | Unit test; mappings also learned from history and group details. |
+| Get earlier messages from the phone | Built | Request is sent; the phone did not answer during the night test, so the result is unconfirmed. |
 
 ## Messaging
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Receive text, live | Built | Stored and shown; not observed live yet (no incoming message during testing). |
-| Send text | Verified | Server acknowledged. |
-| Reply (quote) | Built | Composer reply bar and quote context; not sent to the server in a test yet. |
-| Reactions: send, show | Verified | Sent 👍; chips show with own-reaction styling. |
-| Edit own message | Verified | Server accepted; "(edited)" shown. 15-minute window enforced in the menu. |
-| Delete for everyone | Verified | Text and photo revoked. |
+| Receive messages | Partial | The handling is covered by tests (text, own-device messages, groups, reactions, deletes, edits). No real incoming message arrived during the night, so it has not been watched working live. |
+| Send text | Verified | |
+| Reply (quote), jump to the quoted message | Verified (send) / Built (jump) | |
+| Reactions: send, show | Verified | Quick reactions and a picker of about 190 emoji. |
+| Edit own message | Verified | 15-minute window. |
+| Delete for everyone | Verified | Text, photo and document. |
 | Delete for me | Built | |
-| Star / unstar | Built | |
-| Forward | Built (backend) | No chat picker in the interface yet. |
+| Star / unstar, starred list | Built | |
+| Forward, with a chat picker | Built | |
 | Copy text | Built | |
-| Read receipts (blue ticks) | Built | Disabled in test runs (`WA_READONLY=1`), so never sent for real yet. |
-| Delivery ticks | Partial | Sent / delivered / read states stored and drawn; only "sent" observed. |
+| Message info (who received and read) | Built | From stored receipts. |
+| Read receipts (blue ticks) | Built | Test runs set `WA_READONLY=1`, so none has been sent for real. |
+| Delivery ticks | Partial | Sent, delivered, read are stored and drawn; history shows all three, live only "sent" was observed. |
 | Typing indicator: send, show | Built | Sending is disabled in test runs. |
-| Presence (online / last seen) | Built | |
-| Mentions | Partial | Shown as name pills; cannot be inserted from the composer yet. |
-| Formatting (bold, italic, strike, code), links | Verified | Unit tests; links open in the browser. |
-| Disappearing messages | Partial | Timer is tracked per chat; expired messages are not removed locally. |
-| View-once | Partial | Shown as a placeholder, as on linked devices. |
-| Polls: show, vote, create | Not done | Shown as a card with the question only. |
-| Events: show, respond, create | Not done | Card only. |
-| Location, contacts cards | Partial | Card with the name; no map, no "add contact". |
-| Pin message, keep in chat | Not done | |
-| Message info (who read it) | Not done | Per-user receipts are stored. |
-| Search inside a chat | Not done | Store has full-text search; no interface. |
-| Drafts | Not done | Column exists. |
+| Presence (online, last seen) | Built | |
+| Mentions | Partial | Shown as name pills. Cannot be inserted from the composer. |
+| Formatting (bold, italic, strike, code), links | Verified | Unit tests. |
+| Link previews | Partial | Shown for received and stored messages. Not generated when sending a link. |
+| Polls | Verified | Create (`/poll Question \| A \| B` in the composer), show, vote. Gaps: no dialog for creating one, and other people's votes that arrive live are not decoded yet (votes in history are). |
+| Events | Not done | Shown as a card with the name only. |
+| Location | Partial | Card that opens the place in the browser's maps. No sending, no live location. |
+| Contact cards | Partial | Card with a "message" action. No sending. |
+| Disappearing messages | Partial | The timer is tracked per chat; it cannot be changed, and expired messages are not removed locally. |
+| View-once | Partial | Placeholder, as on any linked device. |
+| Phone-only messages | Verified | Shown with the same notice the official client uses. |
+| Pin a message, keep in chat | Not done | |
+| Search inside a chat | Built | Full-text, with jump to the message. |
+| Drafts | Built | Kept per chat when switching away. |
 
 ## Media
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Photos: download, show, viewer | Verified | Auto-download, in-app viewer. |
-| Send photo | Verified | Uploaded and sent with thumbnail and dimensions. |
-| Send video, audio, document | Built | Same path as photos; not sent in a test yet. |
-| Drag and drop files, file picker | Built | |
-| Stickers: show | Built | Auto-download; animated stickers show their first frame at best. |
-| Stickers: send, sticker picker | Not done | |
+| Photos: download, show, viewer | Verified | Download on view; in-app viewer. |
+| Send photo | Verified | With thumbnail and dimensions. |
+| Send document | Verified | |
+| Send video, audio | Built | Same path as photos and documents. Videos are sent without a preview image. |
+| File picker, drag and drop | Built | |
+| Voice messages and audio: play in app | Verified (player) / Built (control) | The player was checked on this PC with a real voice message. The play button and progress bar in the conversation were not clicked. |
+| Voice messages: record | Not done | Needs an Opus encoder. |
+| Media that expired on the server | Verified | Re-requested from the phone, then downloaded. |
+| Stickers: show | Built | First frame only for animated ones. |
+| Stickers: send, picker | Not done | |
 | Video: play in app | Not done | Downloads, then opens in the default player. |
 | GIFs: play in app | Not done | Shown as a still. |
-| Voice messages: play in app | Not done | Downloads, then opens in the default player. |
-| Voice messages: record | Not done | |
 | Documents: open | Built | Downloads and opens with the default app. |
-| Albums | Partial | Photos show one below another; no grid. |
-| Link previews | Not done | |
-| Media expired on the server (re-request from phone) | Not done | |
-| Paste image from clipboard | Not done | |
-| Camera capture | Not done | |
+| Albums | Partial | Photos are shown one under another, not as a grid. |
+| Paste an image, camera | Not done | |
 
-## Chats and contacts
+## Chats, contacts, groups
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Chat list with previews, unread, pins, mutes | Verified | |
-| Filters: all, unread, groups | Built | |
-| Search chats by name | Built | |
-| Global message search | Not done | Store supports it. |
-| Archive, pin, mute, mark unread, delete chat | Built (backend) | No context menu on chat rows yet. |
-| Archived list | Built | Rail button. |
-| New chat / contact list | Not done | |
-| Profile pictures | Verified | Fetched one at a time and cached on disk. |
-| Contact / group info panel | Not done | |
-| Group management (create, add, remove, admins, settings, invite links) | Not done | Library supports it. |
-| Communities | Not done | Shown as chats. |
-| Block / report | Not done | |
+| Chat list: previews, unread, pins, mutes, ticks | Verified | |
+| Filters: all, unread, groups; archived list | Built | |
+| Search chats and messages | Built | |
+| Right-click a chat: read/unread, pin, mute, archive, delete | Built | |
+| New chat from saved contacts | Built | |
+| Profile pictures | Verified | Fetched one at a time, cached on disk. |
+| Chat info panel: about, photos, members | Built | |
+| Group details from the server (members, admins, description) | Verified | |
+| Create a group | Verified | Tested with nobody else in it. |
+| Rename a group, change its description | Verified | |
+| Leave a group | Verified | |
+| Add, remove, promote, demote members | Built | Deliberately not exercised: it would affect real people. |
+| Group settings (who can send, approval, invite links) | Not done | The library supports them. |
+| Communities, channels | Not done | Shown as plain chats; the Channels section only filters. |
+| Block, report | Not done | |
 | Labels (business) | Not done | |
 
 ## Other surfaces
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Status (stories): view, post, reply | Not done | Status messages are stored; no viewer. |
-| Channels (newsletters) | Not done | |
-| Calls list | Not done | Call log records arrive but are not stored yet. |
-| Voice and video calls | Not done | The library handles the call protocol; microphone, camera, playback and H.264 are the app's job and are not started. |
-| Incoming call notice (ring, decline) | Not done | |
-| Starred messages list | Not done | |
-| Settings (profile, privacy, notifications, theme, storage) | Not done | |
-| Notifications (Windows toasts, taskbar badge) | Not done | |
-| Light theme | Built | Tokens exist; no switch in the interface. |
+| Calls list | Verified | 197 calls from history, with direction, duration and missed state. |
+| Voice and video calls | Not done | The library handles the call protocol. Microphone, camera, playback and video coding are the app's job and are not started. The call buttons say so. |
+| Incoming call notice | Not done | |
+| Status: view | Built | Text and photo statuses of the last 24 hours; other media open in the default player. Viewing does not send a "seen" receipt. |
+| Status: post, reply | Not done | |
+| Settings: profile, dark / light, data folder, log out | Built | |
+| Settings: privacy, notifications, edit name / about / photo | Not done | |
+| Notifications | Built | Windows notification for a new message when its chat is not in front; clicking opens the chat. No real incoming message has triggered one yet. |
+| Taskbar badge, tray icon, start with Windows, installer | Not done | |
 | Other colour palettes of the design | Not done | Neutral only. |
-| Log out / unlink | Built (backend) | No button yet. |
-| Auto-start, tray icon, installer | Not done | |
 
 ## Design
 
 The interface follows `docs/design-spec.md` (diskurt's modern design): frameless window
 with a 32px title bar, rail, floating main panel, Figtree, translucent fills, flat message
-rows. Known gaps: no open/close motion on menus, no cut-out presence dots, chat column is
-320px instead of 248px to fit previews, and the modern design was reproduced from source
-code without a rendered reference to compare against.
+rows, roomy menus. Known differences:
+
+- The chat column is 320px, not 248px, to fit two-line rows with previews.
+- Chat rows show a preview and a time; diskurt's rows have neither, so this follows the
+  spec's suggested member-row shape.
+- No open / close motion on menus and dialogs.
+- Presence dots (the cut-out status dot on avatars) are not drawn.
+- The spec was extracted from diskurt's source; there was no screenshot of the modern
+  design to compare against, so small visual differences are likely.
+
+## Test leftovers on the account
+
+Left behind by the checks, all clearly labelled:
+
+- In "Dosyalar": one edited test message, one test reply, one test poll, and four
+  "This message was deleted" markers.
+- A group named "wagpui test group renamed", which the account has left. It can be
+  deleted from the chat list.

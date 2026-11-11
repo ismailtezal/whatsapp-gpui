@@ -270,3 +270,18 @@ impl Store {
         })
     }
 }
+
+impl Store {
+    /// Paths of stickers already downloaded, newest first, without repeats.
+    pub fn sticker_paths(&self, limit: usize) -> Result<Vec<String>> {
+        self.read(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT media_path FROM messages
+                 WHERE kind = 7 AND media_path IS NOT NULL
+                 GROUP BY media_path ORDER BY MAX(ts) DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map([limit as i64], |row| row.get(0))?;
+            rows.collect()
+        })
+    }
+}

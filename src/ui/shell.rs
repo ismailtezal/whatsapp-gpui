@@ -122,6 +122,18 @@ impl Shell {
         })
         .detach();
 
+        // Clicking a notification brings the window forward on that chat.
+        let handle = window.window_handle();
+        let shell = cx.entity().downgrade();
+        cx.on_system_notification_response(move |response, cx| {
+            let chat = response.tag.to_string();
+            let shell = shell.clone();
+            let _ = handle.update(cx, |_, window, cx| {
+                window.activate_window();
+                let _ = shell.update(cx, |this, cx| this.open_chat(&chat, window, cx));
+            });
+        });
+
         let events = backend.events();
         let pump = cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {

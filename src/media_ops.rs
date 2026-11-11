@@ -418,7 +418,39 @@ pub async fn send_file(
             options.context_info = context;
             media::audio_message(upload, options)
         }
-        Attach::Document | Attach::Sticker => {
+        Attach::Sticker => {
+            // A sticker is a WebP sent under its own media type, with its pixel size.
+            let size_data = data.clone();
+            let size = tokio::task::spawn_blocking(move || {
+                image::load_from_memory(&size_data)
+                    .ok()
+                    .map(|picture| (picture.width(), picture.height()))
+            })
+            .await?;
+            let upload = client
+                .upload(data, MediaType::Sticker, Default::default())
+                .await?;
+            let mut sticker = crate::wa::message::StickerMessage::default();
+            sticker.url = Some(upload.url.clone());
+            sticker.direct_path = Some(upload.direct_path.clone());
+            sticker.media_key = Some(upload.media_key.to_vec());
+            sticker.file_sha256 = Some(upload.file_sha256.to_vec());
+            sticker.file_enc_sha256 = Some(upload.file_enc_sha256.to_vec());
+            sticker.file_length = Some(upload.file_length);
+            sticker.media_key_timestamp = Some(upload.media_key_timestamp);
+            sticker.mimetype = Some("image/webp".to_string());
+            if let Some((width, height)) = size {
+                sticker.width = Some(width);
+                sticker.height = Some(height);
+            }
+            if let Some(context) = context {
+                sticker.context_info = whatsapp_rust::buffa::MessageField::from_box(context);
+            }
+            let mut message = crate::wa::Message::default();
+            message.sticker_message = whatsapp_rust::buffa::MessageField::some(sticker);
+            message
+        }
+        Attach::Document => {
             let upload = client
                 .upload(data, MediaType::Document, Default::default())
                 .await?;

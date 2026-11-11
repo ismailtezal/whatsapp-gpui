@@ -107,6 +107,11 @@ pub struct ChatView {
     forward_targets: Vec<ChatRow>,
     /// ID of the own message whose receipts are being shown.
     info_for: Option<String>,
+    /// People picked from the mention list: (name shown, JID).
+    mention_map: Vec<(String, String)>,
+    /// Where the sticker picker is anchored while it is open.
+    stickers_at: Option<Point<Pixels>>,
+    sticker_choices: Vec<PathBuf>,
     member_menu: Option<(String, Point<Pixels>)>,
     adding_members: bool,
     add_candidates: Vec<crate::model::ContactRow>,
@@ -190,6 +195,9 @@ impl ChatView {
             forwarding: None,
             forward_targets: Vec::new(),
             info_for: None,
+            mention_map: Vec::new(),
+            stickers_at: None,
+            sticker_choices: Vec::new(),
             member_menu: None,
             adding_members: false,
             add_candidates: Vec::new(),
@@ -204,6 +212,12 @@ impl ChatView {
             search_hits: Vec::new(),
         };
         view.reload(cx);
+        if view.chat.kind != ChatKind::User {
+            // Members are needed for @-mentions; ask the server for the current list.
+            view.backend.send(Command::RefreshGroup {
+                chat: view.chat.jid.clone(),
+            });
+        }
         view.backend.send(Command::MarkRead {
             chat: view.chat.jid.clone(),
         });
@@ -259,7 +273,7 @@ impl ChatView {
 
     /// Re-reads the loaded window of messages from the store and rebuilds the rows.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        if self.info_open {
+        if self.info_open || self.chat.kind != ChatKind::User {
             self.refresh_members();
         }
         let rows = self
@@ -602,6 +616,10 @@ impl ChatView {
             cx.notify();
             return;
         }
+        let (resolved, mentions) = {
+            let typed = text.to_string();
+            self.resolve_mentions(&typed)
+        };
         match self.editing.take() {
             Some(id) => self.backend.send(Command::Edit {
                 chat: self.chat.jid.clone(),
@@ -610,9 +628,9 @@ impl ChatView {
             }),
             None => self.backend.send(Command::SendText {
                 chat: self.chat.jid.clone(),
-                text: text.to_string(),
+                text: resolved,
                 reply_to: self.reply_to.take().map(|r| r.id),
-                mentions: Vec::new(),
+                mentions,
             }),
         }
         self.input.update(cx, |input, cx| input.set_value("", window, cx));
@@ -1311,6 +1329,22 @@ impl ChatView {
                                 .child(Textarea::new(&self.input).appearance(false).bordered(false)),
                         )
                         .child(
+                            icon_button("stickers", "sticker", cx)
+                                .tooltip(tip("Stickers"))
+                                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                                    this.sticker_choices = this
+                                        .store
+                                        .sticker_paths(40)
+                                        .unwrap_or_default()
+                                        .into_iter()
+                                        .map(PathBuf::from)
+                                        .filter(|path| path.exists())
+                                        .collect();
+                                    this.stickers_at = Some(event.position());
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
                             icon_button("emoji", "smile", cx)
                                 .tooltip(tip("Emoji"))
                                 .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
@@ -1373,6 +1407,7 @@ impl Render for ChatView {
                             .flex()
                             .flex_col()
                             .child(self.messages_area(older, view, &t, cx))
+                            .children(self.mention_popup(cx))
                             .child(self.composer(cx)),
                     )
                     .children(self.info_panel(cx)),
@@ -1380,6 +1415,7 @@ impl Render for ChatView {
             .children(viewer)
             .children(self.forward_overlay(window, cx))
             .children(self.info_overlay(window, cx))
+            .children(self.sticker_overlay(window, cx))
             .children(self.group_edit_overlay(window, cx))
             .children(self.add_members_overlay(window, cx))
             .children(self.member_menu_overlay(window, cx))
@@ -2571,5 +2607,208 @@ impl ChatView {
             .into_any_element(),
         );
         rows
+    }
+}
+
+impl ChatView {
+    /// The `@query` being typed at the end of the message box, if any.
+    fn mention_query(&self, cx: &App) -> Option<String> {
+        if self.chat.kind == ChatKind::User {
+            return None;
+        }
+        let text = self.input.read(cx).value().to_string();
+        let at = text.rfind('@')?;
+        let before_ok = text[..at].chars().last().is_none_or(char::is_whitespace);
+        let query = &text[at + 1..];
+        (before_ok && !query.contains(char::is_whitespace)).then(|| query.to_lowercase())
+    }
+
+    /// Members matching the `@query`, best first.
+    fn mention_candidates(&self, cx: &App) -> Vec<(String, String)> {
+        let Some(query) = self.mention_query(cx) else {
+            return Vec::new();
+        };
+        self.members
+            .iter()
+            .filter(|(jid, name, _)| {
+                self.me_jid.as_deref() != Some(jid.as_str()) && name.to_lowercase().contains(&query)
+            })
+            .take(6)
+            .map(|(jid, name, _)| (jid.clone(), name.clone()))
+            .collect()
+    }
+
+    /// Replaces the `@query` being typed with the chosen person's name.
+    fn pick_mention(&mut self, jid: &str, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).value().to_string();
+        let Some(at) = text.rfind('@') else {
+            return;
+        };
+        let completed = format!("{}@{name} ", &text[..at]);
+        self.input.update(cx, |input, cx| input.set_value(completed, window, cx));
+        if !self.mention_map.iter().any(|(_, known)| known == jid) {
+            self.mention_map.push((name.to_string(), jid.to_string()));
+        }
+        self.focus_input(window, cx);
+        cx.notify();
+    }
+
+    /// Turns the `@Name` texts picked from the list into the `@number` form the protocol
+    /// uses, and returns who was mentioned.
+    fn resolve_mentions(&mut self, text: &str) -> (String, Vec<String>) {
+        let mut out = text.to_string();
+        let mut mentioned = Vec::new();
+        for (name, jid) in std::mem::take(&mut self.mention_map) {
+            let shown = format!("@{name}");
+            if out.contains(&shown) {
+                let user = jid.split('@').next().unwrap_or_default();
+                out = out.replace(&shown, &format!("@{user}"));
+                mentioned.push(jid);
+            }
+        }
+        (out, mentioned)
+    }
+
+    /// The list of people shown above the message box while typing `@`.
+    fn mention_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let candidates = self.mention_candidates(cx);
+        if candidates.is_empty() {
+            return None;
+        }
+        let t = tokens(cx).clone();
+        let mut panel = div()
+            .mx(px(16.))
+            .mb(px(6.))
+            .p(px(4.))
+            .rounded(R_XL)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .shadow(t.shadow_popover())
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(8.))
+                    .pt(px(4.))
+                    .pb(px(2.))
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(t.muted_foreground)
+                    .child("Members"),
+            );
+        for (slot, (jid, name)) in candidates.into_iter().enumerate() {
+            let hover = t.accent;
+            let picked_jid = jid.clone();
+            let picked_name = name.clone();
+            panel = panel.child(
+                div()
+                    .id(("mention", slot))
+                    .h(px(32.))
+                    .px(px(8.))
+                    .rounded(R_MD)
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(14.))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .child(avatar(&jid, &name, 20., crate::avatars::get(&jid), cx))
+                    .child(div().truncate().child(SharedString::from(name)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.pick_mention(&picked_jid, &picked_name, window, cx)
+                    })),
+            );
+        }
+        Some(panel.into_any_element())
+    }
+
+    /// Stickers already on this PC, newest first, for the sticker picker.
+    fn sticker_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let at = self.stickers_at?;
+        let t = tokens(cx).clone();
+        let hover = t.accent;
+        let mut grid = div().flex().flex_wrap().gap(px(4.)).p(px(8.));
+        for (slot, path) in self.sticker_choices.iter().enumerate() {
+            let send = path.clone();
+            grid = grid.child(
+                div()
+                    .id(("sticker", slot))
+                    .size(px(72.))
+                    .rounded(R_MD)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .child(
+                        gpui::img(path.clone())
+                            .size(px(64.))
+                            .object_fit(gpui::ObjectFit::Contain),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.backend.send(Command::SendFile {
+                            chat: this.chat.jid.clone(),
+                            path: send.clone(),
+                            kind: crate::events::Attach::Sticker,
+                            caption: None,
+                            reply_to: this.reply_to.take().map(|r| r.id),
+                        });
+                        this.stickers_at = None;
+                        cx.notify();
+                    })),
+            );
+        }
+        let panel = div()
+            .w(px(336.))
+            .h(px(360.))
+            .rounded(R_XL)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .shadow(t.shadow_popover())
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .px(px(12.))
+                    .pt(px(8.))
+                    .pb(px(4.))
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(t.muted_foreground)
+                    .child(if self.sticker_choices.is_empty() {
+                        "No stickers yet: stickers you receive appear here"
+                    } else {
+                        "Stickers"
+                    }),
+            )
+            .child(div().id("sticker-scroll").flex_1().min_h_0().overflow_y_scroll().child(grid));
+        let size = window.viewport_size();
+        let close = cx.listener(|this, _: &MouseDownEvent, _, cx| {
+            this.stickers_at = None;
+            cx.notify();
+        });
+        Some(
+            deferred(
+                anchored().position(point(px(0.), px(0.))).child(
+                    div()
+                        .w(size.width)
+                        .h(size.height)
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, close)
+                        .child(
+                            anchored()
+                                .position(point(at.x - px(300.), at.y - px(380.)))
+                                .snap_to_window_with_margin(px(8.))
+                                .child(panel),
+                        ),
+                ),
+            )
+            .with_priority(10)
+            .into_any_element(),
+        )
     }
 }
