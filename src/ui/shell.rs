@@ -2276,8 +2276,17 @@ impl Shell {
                     )
                     .child(rule())
                     .child(heading(
+                        "About",
+                        concat!(
+                            "Version ",
+                            env!("CARGO_PKG_VERSION"),
+                            ". An unofficial client, not affiliated with WhatsApp or Meta."
+                        ),
+                    ))
+                    .child(rule())
+                    .child(heading(
                         "Account",
-                        "Logging out unlinks this device. Your chats stay on your phone.",
+                        "Logging out unlinks this device and removes its chats, media and backups from this PC. Your chats stay on your phone.",
                     ))
                     .child(
                         div().flex().child(
