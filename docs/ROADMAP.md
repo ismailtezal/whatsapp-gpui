@@ -28,7 +28,7 @@ member) and in an empty test group created for the purpose, never with another p
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Receive messages | Partial | The handling is covered by tests (text, own-device messages, groups, reactions, deletes, edits). No real incoming message arrived during the night, so it has not been watched working live. |
+| Receive messages | Partial | The handling is covered by tests (text, own-device messages, groups, reactions, deletes, edits). One real incoming message has since arrived while the app was running: it appeared in the chat list with its preview and unread badge. That chat was not opened, so the message was not seen inside a conversation. |
 | Send text | Verified | |
 | Reply (quote), jump to the quoted message | Verified (send) / Built (jump) | |
 | Reactions: send, show | Verified | Quick reactions and a picker of about 190 emoji. |
