@@ -65,7 +65,7 @@ member) and in an empty test group created for the purpose, never with another p
 | Send photo | Verified | With thumbnail and dimensions. |
 | Send document | Verified | |
 | Send video, audio | Built | Same path as photos and documents. Videos are sent without a preview image. |
-| File picker, drag and drop | Built | |
+| File picker, drag and drop, paste | Built | Files are staged above the message box with a preview and sent on Enter; what is typed becomes the caption. Pasting a copied image or copied files stages them too. |
 | Voice messages and audio: play in app | Verified (player) / Built (control) | The player was checked on this PC with a real voice message. The play button and progress bar in the conversation were not clicked. |
 | Voice messages: record | Not done | Needs an Opus encoder. |
 | Media that expired on the server | Verified | Re-requested from the phone, then downloaded. |
@@ -77,7 +77,7 @@ member) and in an empty test group created for the purpose, never with another p
 | GIFs: play in app | Not done | Shown as a still preview; a click opens the default player. |
 | Documents: open | Built | Downloads and opens with the default app. |
 | Albums | Built | Photos sent together are shown as a two-column grid. Videos in an album are still listed separately. |
-| Paste an image, camera | Not done | |
+| Camera capture | Not done | |
 
 ## Chats, contacts, groups
 

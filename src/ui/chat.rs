@@ -107,6 +107,8 @@ pub struct ChatView {
     forward_targets: Vec<ChatRow>,
     /// ID of the own message whose receipts are being shown.
     info_for: Option<String>,
+    /// Files picked, dropped or pasted that wait for Enter before they are sent.
+    pending: Vec<PathBuf>,
     /// When the typing indicator was last sent, to avoid sending it on every keystroke.
     typing_sent: Option<std::time::Instant>,
     /// People picked from the mention list: (name shown, JID).
@@ -197,6 +199,7 @@ impl ChatView {
             forwarding: None,
             forward_targets: Vec::new(),
             info_for: None,
+            pending: Vec::new(),
             typing_sent: None,
             mention_map: Vec::new(),
             stickers_at: None,
@@ -680,6 +683,24 @@ impl ChatView {
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().to_string();
         let text = text.trim();
+        if !self.pending.is_empty() {
+            // Staged files go out together; what is typed becomes the first one's caption.
+            let caption = (!text.is_empty()).then(|| text.to_string());
+            let reply = self.reply_to.take().map(|r| r.id);
+            for (index, path) in std::mem::take(&mut self.pending).into_iter().enumerate() {
+                self.backend.send(Command::SendFile {
+                    chat: self.chat.jid.clone(),
+                    kind: attach_kind_for(&path),
+                    path,
+                    caption: if index == 0 { caption.clone() } else { None },
+                    reply_to: if index == 0 { reply.clone() } else { None },
+                });
+            }
+            self.input.update(cx, |input, cx| input.set_value("", window, cx));
+            self.notice = Some("Sending…".to_string());
+            cx.notify();
+            return;
+        }
         if text.is_empty() {
             return;
         }
@@ -715,16 +736,8 @@ impl ChatView {
     }
 
     fn send_files(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        for path in paths.into_iter().filter(|p| p.is_file()) {
-            self.backend.send(Command::SendFile {
-                chat: self.chat.jid.clone(),
-                kind: attach_kind_for(&path),
-                path,
-                caption: None,
-                reply_to: self.reply_to.take().map(|r| r.id),
-            });
-        }
-        self.notice = Some("Sending…".to_string());
+        // Files are staged for review; Enter (or the send button) sends them.
+        self.pending.extend(paths.into_iter().filter(|p| p.is_file()));
         cx.notify();
     }
 
@@ -1339,7 +1352,7 @@ impl ChatView {
 
     fn composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = tokens(cx).clone();
-        let has_text = !self.input.read(cx).value().trim().is_empty();
+        let has_text = !self.input.read(cx).value().trim().is_empty() || !self.pending.is_empty();
         let banner = if self.editing.is_some() {
             Some(("pencil", "Editing message".to_string(), String::new()))
         } else {
@@ -1392,6 +1405,7 @@ impl ChatView {
                             ),
                     )
                 })
+                .children(self.pending_tray(cx))
                 .child(
                     div()
                         .p(px(6.))
@@ -1408,7 +1422,14 @@ impl ChatView {
                                 .flex_1()
                                 .min_w_0()
                                 .py(px(1.))
-                                .child(Textarea::new(&self.input).appearance(false).bordered(false)),
+                                .child(Textarea::new(&self.input).appearance(false).bordered(false).on_paste({
+                                    let entity = cx.entity().downgrade();
+                                    move |item, _window, cx| {
+                                        entity
+                                            .update(cx, |this, cx| this.stage_pasted(item, cx))
+                                            .unwrap_or(false)
+                                    }
+                                })),
                         )
                         .child(
                             icon_button("stickers", "sticker", cx)
@@ -2967,5 +2988,135 @@ impl ChatView {
             chat: self.chat.jid.clone(),
             activity,
         });
+    }
+}
+
+impl ChatView {
+    /// Saves pictures pasted from the clipboard and stages them like picked files.
+    fn stage_pasted(&mut self, item: &gpui::ClipboardItem, cx: &mut Context<Self>) -> bool {
+        let mut staged = Vec::new();
+        for entry in item.entries() {
+            match entry {
+                gpui::ClipboardEntry::Image(image) => {
+                    let extension = match image.format {
+                        gpui::ImageFormat::Png => "png",
+                        gpui::ImageFormat::Jpeg => "jpg",
+                        gpui::ImageFormat::Webp => "webp",
+                        gpui::ImageFormat::Gif => "gif",
+                        _ => "png",
+                    };
+                    let stamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    let path = crate::paths::media_dir().join(format!("pasted-{stamp}-{}.{extension}", staged.len()));
+                    if std::fs::write(&path, &image.bytes).is_ok() {
+                        staged.push(path);
+                    }
+                }
+                gpui::ClipboardEntry::ExternalPaths(paths) => {
+                    staged.extend(paths.paths().iter().filter(|p| p.is_file()).cloned());
+                }
+                _ => {}
+            }
+        }
+        if staged.is_empty() {
+            return false;
+        }
+        self.pending.extend(staged);
+        cx.notify();
+        true
+    }
+
+    /// The files waiting to be sent, shown above the message box until Enter is pressed.
+    fn pending_tray(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let t = tokens(cx).clone();
+        let mut tray = div()
+            .id("pending-tray")
+            .p(px(8.))
+            .flex()
+            .gap(px(8.))
+            .overflow_x_scroll()
+            .border_b_1()
+            .border_color(t.border);
+        for (slot, path) in self.pending.iter().enumerate() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let is_picture = matches!(
+                path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref(),
+                Some("jpg" | "jpeg" | "png" | "webp" | "gif")
+            );
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            tray = tray.child(
+                div()
+                    .w(px(144.))
+                    .flex_shrink_0()
+                    .rounded(R_LG)
+                    .border_1()
+                    .border_color(t.border)
+                    .bg(t.background)
+                    .p(px(6.))
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .h(px(96.))
+                            .rounded(R_MD)
+                            .bg(t.muted)
+                            .overflow_hidden()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(t.muted_foreground)
+                            .child(if is_picture {
+                                gpui::img(path.clone())
+                                    .w(px(132.))
+                                    .h(px(96.))
+                                    .object_fit(gpui::ObjectFit::Cover)
+                                    .into_any_element()
+                            } else {
+                                icon("file-text").size(px(28.)).into_any_element()
+                            }),
+                    )
+                    .child(div().truncate().text_size(px(12.)).child(SharedString::from(name)))
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(t.muted_foreground)
+                            .child(super::widgets::file_size(size)),
+                    )
+                    .child(
+                        div()
+                            .id(("pending-remove", slot))
+                            .absolute()
+                            .top(px(4.))
+                            .right(px(4.))
+                            .size(px(24.))
+                            .rounded(R_MD)
+                            .border_1()
+                            .border_color(t.border)
+                            .bg(t.popover)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .child(icon("x").size(px(14.)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if slot < this.pending.len() {
+                                    this.pending.remove(slot);
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        Some(tray.into_any_element())
     }
 }
