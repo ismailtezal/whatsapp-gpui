@@ -135,6 +135,15 @@ CREATE TABLE IF NOT EXISTS pins (
     PRIMARY KEY (chat, msg_id)
 );
 
+-- Channel posts are addressed by a number the server gives them; reactions and paging
+-- need it.
+CREATE TABLE IF NOT EXISTS channel_ids (
+    chat      TEXT NOT NULL,
+    id        TEXT NOT NULL,
+    server_id INTEGER NOT NULL,
+    PRIMARY KEY (chat, id)
+);
+
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -409,8 +418,29 @@ impl Store {
         self.with(|tx| {
             let marks = vec!["?"; ids.len()].join(",");
             let sql = format!(
-                "SELECT msg_id, sender, emoji FROM reactions
-                 WHERE chat = ? AND emoji != '' AND msg_id IN ({marks}) ORDER BY ts"
+"SELECT msg_id, sender, emoji FROM reactions
+                 WHERE chat = ? AND emoji != '' AND sender NOT LIKE 'count:%' AND msg_id IN ({marks}) ORDER BY ts"
+            );
+            let mut stmt = tx.conn.prepare(&sql)?;
+            let args = std::iter::once(chat.to_string()).chain(ids.iter().cloned());
+            let rows = stmt.query_map(rusqlite::params_from_iter(args), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// Reaction totals of channel posts, as (message, emoji, how many). A channel reports
+    /// only totals; they are kept as rows whose sender starts with `count:`.
+    pub fn reaction_counts(&self, chat: &str, ids: &[String]) -> Result<Vec<(String, String, i64)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with(|tx| {
+            let marks = vec!["?"; ids.len()].join(",");
+            let sql = format!(
+                "SELECT msg_id, emoji, ts FROM reactions
+                 WHERE chat = ? AND emoji != '' AND sender LIKE 'count:%' AND msg_id IN ({marks}) ORDER BY ts DESC"
             );
             let mut stmt = tx.conn.prepare(&sql)?;
             let args = std::iter::once(chat.to_string()).chain(ids.iter().cloned());

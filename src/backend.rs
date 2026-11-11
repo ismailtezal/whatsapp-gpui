@@ -293,6 +293,56 @@ pub(crate) fn quote_context(record: &wa::WebMessageInfo, chat: &str) -> Option<w
     Some(context)
 }
 
+/// The invite code of a channel link (its last path segment); a bare code passes through.
+fn channel_code(link: &str) -> Result<String> {
+    let code = link
+        .trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .split('?')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    if code.is_empty() {
+        return Err(anyhow!("that is not a channel link"));
+    }
+    Ok(code)
+}
+
+/// Saves what the server says about a channel: its row in the chat list and its details.
+fn remember_channel(store: &Arc<Store>, channel: &whatsapp_rust::NewsletterMetadata) -> Result<()> {
+    use whatsapp_rust::NewsletterRole;
+    let address = channel.jid.to_string();
+    store.patch_chat(
+        &address,
+        &ChatPatch {
+            name: Some(channel.name.clone()),
+            description: channel.description.clone(),
+            created_at: channel.creation_time.map(|time| time as i64),
+            mute_until: Some(if channel.muted == Some(true) { -1 } else { 0 }),
+            ..Default::default()
+        },
+    )?;
+    let info = crate::events::ChannelInfo {
+        role: match channel.role {
+            Some(NewsletterRole::Owner) => "owner",
+            Some(NewsletterRole::Admin) => "admin",
+            Some(NewsletterRole::Subscriber) => "subscriber",
+            _ => "guest",
+        }
+        .to_string(),
+        followers: channel.subscriber_count,
+        muted: channel.muted == Some(true),
+        verified: format!("{:?}", channel.verification).to_lowercase().contains("verified")
+            && !format!("{:?}", channel.verification).to_lowercase().contains("unverified"),
+        invite: channel.invite_code.clone().unwrap_or_default(),
+    };
+    store.set_kv(&crate::events::ChannelInfo::key(&address), &info.encode())?;
+    Ok(())
+}
+
 /// Who a status update goes to: this account, plus the saved contacts allowed by the
 /// status privacy setting last synced from the phone. With `only_me`, just this account.
 fn status_recipients(client: &Arc<Client>, store: &Arc<Store>, only_me: bool) -> Result<Vec<whatsapp_rust::Jid>> {
@@ -503,6 +553,22 @@ async fn execute(
                     .mark_as_read(&whatsapp_rust::Jid::status_broadcast(), Some(&poster), &[id.as_str()])
                     .await?;
             }
+        }
+
+        Command::React { chat, id, emoji } if ChatKind::of_jid(&chat) == ChatKind::Newsletter => {
+            let channel = jid(&chat)?;
+            let server_id = store
+                .channel_server_id(&chat, &id)?
+                .ok_or_else(|| anyhow!("this post cannot be reacted to yet"))?;
+            let message_id = (!id.starts_with("post")).then(|| MessageId::new(&id)).transpose()?;
+            let target = whatsapp_rust::NewsletterMessageRef::new(&channel, message_id, Some(server_id.into()))?;
+            client
+                .newsletter()
+                .send_reaction(&target, &emoji)
+                .await
+                .map_err(|error| anyhow!("the reaction could not be sent: {error}"))?;
+            store.batch(|tx| tx.put_reaction(&chat, &id, "me", &emoji, now_secs()))?;
+            notify(events, &chat).await;
         }
 
         Command::React { chat, id, emoji } => {
@@ -944,6 +1010,277 @@ async fn execute(
             outcome.map_err(|error| anyhow!("could not change the members: {error}"))?;
             // Read the result back from the server rather than guessing it.
             Box::pin(execute(client, store, events, Command::RefreshGroup { chat })).await?;
+        }
+
+        Command::SyncCommunities => {
+            let parents = client
+                .community()
+                .list_participating()
+                .await
+                .map_err(|error| anyhow!("the communities could not be read: {error}"))?;
+            let mut list = Vec::with_capacity(parents.len());
+            for parent in parents {
+                let address = parent.id.to_string();
+                let name = parent.subject.clone().unwrap_or_else(|| "Community".to_string());
+                store.patch_chat(
+                    &address,
+                    &ChatPatch {
+                        name: Some(name.clone()),
+                        is_parent: Some(true),
+                        ..Default::default()
+                    },
+                )?;
+                let mut groups = Vec::new();
+                // A community whose groups cannot be read is still listed.
+                if let Ok(subgroups) = client.community().get_subgroups(&parent.id).await {
+                    for subgroup in subgroups {
+                        if subgroup.is_hidden_group {
+                            continue;
+                        }
+                        groups.push(crate::events::CommunityGroup {
+                            jid: subgroup.id.to_string(),
+                            name: subgroup.subject.clone(),
+                            announcements: subgroup.is_default_sub_group,
+                            members: subgroup.participant_count.unwrap_or(0),
+                        });
+                    }
+                }
+                // Announcements first, then by name.
+                groups.sort_by_key(|group| (!group.announcements, group.name.to_lowercase()));
+                list.push(crate::events::Community {
+                    jid: address,
+                    name,
+                    groups,
+                });
+            }
+            list.sort_by_key(|community| community.name.to_lowercase());
+            store.set_kv(crate::events::Community::KEY, &crate::events::Community::encode(&list))?;
+            let _ = events.send(UiEvent::ChatsChanged).await;
+        }
+
+        Command::CreateCommunity { name } => {
+            let options = whatsapp_rust::CreateCommunityOptions::new(name.trim())
+                .map_err(|error| anyhow!("that name cannot be used: {error}"))?;
+            client
+                .community()
+                .create(options)
+                .await
+                .map_err(|error| anyhow!("the community could not be created: {error}"))?;
+            Box::pin(execute(client, store, events, Command::SyncCommunities)).await?;
+        }
+
+        Command::CreateSubgroup { parent, name } => {
+            client
+                .community()
+                .create_subgroup(name.trim(), &[], jid(&parent)?)
+                .await
+                .map_err(|error| anyhow!("the group could not be created: {error}"))?;
+            Box::pin(execute(client, store, events, Command::SyncCommunities)).await?;
+        }
+
+        Command::LinkGroup { parent, group, linked } => {
+            let community = jid(&parent)?;
+            let groups = [jid(&group)?];
+            if linked {
+                let result = client
+                    .community()
+                    .link_subgroups(community, &groups)
+                    .await
+                    .map_err(|error| anyhow!("the group could not be added to the community: {error}"))?;
+                if result.linked_jids.is_empty() {
+                    return Err(anyhow!("the community did not accept that group"));
+                }
+            } else {
+                let result = client
+                    .community()
+                    .unlink_subgroups(community, &groups, false)
+                    .await
+                    .map_err(|error| anyhow!("the group could not be taken out of the community: {error}"))?;
+                if result.unlinked_jids.is_empty() {
+                    return Err(anyhow!("the community did not release that group"));
+                }
+            }
+            Box::pin(execute(client, store, events, Command::SyncCommunities)).await?;
+        }
+
+        Command::JoinSubgroup { parent, group } => {
+            client
+                .community()
+                .join_subgroup(jid(&parent)?, jid(&group)?)
+                .await
+                .map_err(|error| anyhow!("that group could not be joined: {error}"))?;
+            store.ensure_chat(&group)?;
+            Box::pin(execute(client, store, events, Command::RefreshGroup { chat: group })).await?;
+            let _ = events.send(UiEvent::ChatsChanged).await;
+        }
+
+        Command::DeactivateCommunity { parent } => {
+            client
+                .community()
+                .deactivate(jid(&parent)?)
+                .await
+                .map_err(|error| anyhow!("the community could not be closed: {error}"))?;
+            Box::pin(execute(client, store, events, Command::SyncCommunities)).await?;
+        }
+
+        Command::SyncChannels => {
+            let channels = client
+                .newsletter()
+                .list_subscribed()
+                .await
+                .map_err(|error| anyhow!("the channels could not be read: {error}"))?;
+            for channel in &channels {
+                remember_channel(store, channel)?;
+            }
+            // Pictures arrive as web addresses; fetch the ones not held yet.
+            for channel in &channels {
+                let address = channel.jid.to_string();
+                if crate::avatars::get_any(&address).is_none()
+                    && let Some(url) = channel.preview_url.clone().or_else(|| channel.picture_url.clone())
+                {
+                    let fetched = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+                        let mut response = ureq::get(&url).call()?;
+                        Ok(response.body_mut().read_to_vec()?)
+                    })
+                    .await;
+                    if let Ok(Ok(bytes)) = fetched {
+                        let _ = crate::avatars::store(&address, &bytes);
+                    }
+                }
+            }
+            let _ = events.send(UiEvent::ChatsChanged).await;
+        }
+
+        Command::LoadChannel { chat, older } => {
+            let channel = jid(&chat)?;
+            let before = if older {
+                store.oldest_channel_server_id(&chat)?
+            } else {
+                None
+            };
+            let posts = client
+                .newsletter()
+                .get_messages(&channel, 50, before)
+                .await
+                .map_err(|error| anyhow!("the channel's posts could not be read: {error}"))?;
+            for post in posts {
+                let Some(message) = post.message.clone() else {
+                    continue;
+                };
+                let id = post
+                    .message_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_string())
+                    .unwrap_or_else(|| format!("post{}", post.server_id));
+                let mut key = wa::MessageKey::default();
+                key.remote_jid = Some(chat.clone());
+                key.from_me = Some(post.is_sender);
+                key.id = Some(id.clone());
+                let mut record = wa::WebMessageInfo::default();
+                record.key = MessageField::some(key);
+                record.message = MessageField::some(message);
+                record.message_timestamp = Some(post.timestamp);
+                store.put_message(&record)?;
+                store.put_channel_id(&chat, &id, post.server_id)?;
+                // A channel reports how many reacted with each emoji, not who.
+                store.batch(|tx| {
+                    for reaction in &post.reactions {
+                        tx.put_reaction(
+                            &chat,
+                            &id,
+                            &format!("count:{}", reaction.code),
+                            &reaction.code,
+                            reaction.count as i64,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+            }
+            store.batch(|tx| tx.refresh_last(&chat))?;
+            // While a channel is open, the server sends its changes as they happen.
+            let _ = client.newsletter().subscribe_live_updates(channel).await;
+            notify(events, &chat).await;
+            let _ = events.send(UiEvent::ChatsChanged).await;
+        }
+
+        Command::LookupChannel { link } => {
+            let code = channel_code(&link)?;
+            let found = client
+                .newsletter()
+                .get_metadata_by_invite(&code)
+                .await
+                .map_err(|error| anyhow!("no channel was found for that link: {error}"))?;
+            let verification = format!("{:?}", found.verification).to_lowercase();
+            let _ = events
+                .send(UiEvent::ChannelFound {
+                    link,
+                    jid: found.jid.to_string(),
+                    name: found.name.clone(),
+                    description: found.description.clone().unwrap_or_default(),
+                    followers: found.subscriber_count,
+                    verified: verification.contains("verified") && !verification.contains("unverified"),
+                })
+                .await;
+        }
+
+        Command::FollowChannel { link } => {
+            let code = channel_code(&link)?;
+            let found = client
+                .newsletter()
+                .get_metadata_by_invite(&code)
+                .await
+                .map_err(|error| anyhow!("no channel was found for that link: {error}"))?;
+            let joined = client
+                .newsletter()
+                .join(&found.jid)
+                .await
+                .map_err(|error| anyhow!("the channel could not be followed: {error}"))?;
+            remember_channel(store, &joined)?;
+            let _ = events.send(UiEvent::ChatsChanged).await;
+            let _ = events
+                .send(UiEvent::Error(format!("You now follow {}.", joined.name)))
+                .await;
+        }
+
+        Command::UnfollowChannel { chat } => {
+            client
+                .newsletter()
+                .leave(&jid(&chat)?)
+                .await
+                .map_err(|error| anyhow!("the channel could not be unfollowed: {error}"))?;
+            store.batch(|tx| tx.delete_chat(&chat))?;
+            let _ = events.send(UiEvent::ChatsChanged).await;
+        }
+
+        Command::MuteChannel { chat, muted } => {
+            client
+                .newsletter()
+                .set_follower_mute(&jid(&chat)?, muted)
+                .await
+                .map_err(|error| anyhow!("the channel's mute could not be changed: {error}"))?;
+            let key = crate::events::ChannelInfo::key(&chat);
+            if let Some(mut info) = store
+                .kv(&key)?
+                .and_then(|text| crate::events::ChannelInfo::decode(&text))
+            {
+                info.muted = muted;
+                store.set_kv(&key, &info.encode())?;
+            }
+            notify(events, &chat).await;
+        }
+
+        Command::CreateChannel { name, description } => {
+            let description = Some(description.trim()).filter(|text| !text.is_empty());
+            let created = client
+                .newsletter()
+                .create(name.trim(), description)
+                .await
+                .map_err(|error| anyhow!("the channel could not be created: {error}"))?;
+            remember_channel(store, &created)?;
+            let _ = events.send(UiEvent::ChatsChanged).await;
+            let _ = events
+                .send(UiEvent::Error(format!("Channel {} created.", created.name)))
+                .await;
         }
 
         Command::SetGroupSetting { chat, setting } => {

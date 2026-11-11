@@ -391,6 +391,139 @@ fn main() -> Result<()> {
             std::thread::sleep(Duration::from_secs(4));
             println!("leave sent for group");
         }
+        "communities" => {
+            // Read the communities this account is in. With "create": make a community
+            // with nobody else in it, add a group to it, then close it again.
+            use whatsapp_gpui::events::Community;
+            let read = |store: &Store| -> Vec<Community> {
+                store
+                    .kv(Community::KEY)
+                    .ok()
+                    .flatten()
+                    .map(|text| Community::decode(&text))
+                    .unwrap_or_default()
+            };
+            let sync = |what: &str| -> Result<()> {
+                wait_for(&backend, what, Duration::from_secs(60), |event| match event {
+                    UiEvent::ChatsChanged => true,
+                    UiEvent::Error(message) => {
+                        println!("{what}: {message}");
+                        true
+                    }
+                    _ => false,
+                })
+            };
+            backend.send(Command::SyncCommunities);
+            sync("community list")?;
+            let before = read(&store);
+            println!(
+                "communities: {}, groups in them: {}",
+                before.len(),
+                before.iter().map(|community| community.groups.len()).sum::<usize>()
+            );
+            if args.get(1).map(String::as_str) == Some("create") {
+                let name = format!("wagpui community {}", std::process::id());
+                backend.send(Command::CreateCommunity { name: name.clone() });
+                sync("community created")?;
+                let Some(made) = read(&store).into_iter().find(|community| community.name == name) else {
+                    bail!("the new community is not in the list");
+                };
+                println!("ok: community created with {} group(s)", made.groups.len());
+                backend.send(Command::CreateSubgroup {
+                    parent: made.jid.clone(),
+                    name: "wagpui subgroup".to_string(),
+                });
+                sync("group created")?;
+                let groups = read(&store)
+                    .into_iter()
+                    .find(|community| community.jid == made.jid)
+                    .map(|community| community.groups.len())
+                    .unwrap_or(0);
+                println!("ok: after adding a group it has {groups} group(s)");
+                backend.send(Command::DeactivateCommunity { parent: made.jid.clone() });
+                sync("community closed")?;
+                let still = read(&store).iter().any(|community| community.jid == made.jid);
+                println!("ok: community closed again (still listed: {still})");
+            }
+        }
+        "channels" => {
+            // Read-only: list the channels this account follows and, if a link is given,
+            // look that channel up without following it.
+            backend.send(Command::SyncChannels);
+            wait_for(&backend, "channel list", Duration::from_secs(40), |event| {
+                matches!(event, UiEvent::ChatsChanged)
+            })?;
+            let followed: Vec<_> = store
+                .chats(false)?
+                .into_iter()
+                .chain(store.chats(true)?)
+                .filter(|chat| chat.kind == ChatKind::Newsletter)
+                .collect();
+            println!("channels followed: {}", followed.len());
+            if let Some(channel) = followed.first() {
+                backend.send(Command::LoadChannel {
+                    chat: channel.jid.clone(),
+                    older: false,
+                });
+                wait_for(&backend, "channel posts", Duration::from_secs(40), |event| {
+                    matches!(event, UiEvent::ChatChanged { .. })
+                })?;
+                println!(
+                    "posts read from the first channel: {}",
+                    store.messages(&channel.jid, None, 60)?.len()
+                );
+            }
+            if let Some(link) = args.get(1) {
+                backend.send(Command::LookupChannel { link: link.clone() });
+                let mut found_jid = None;
+                wait_for(&backend, "channel lookup", Duration::from_secs(40), |event| match event {
+                    UiEvent::ChannelFound {
+                        jid,
+                        name,
+                        followers,
+                        verified,
+                        ..
+                    } => {
+                        println!("found channel: name length {}, followers {followers}, verified {verified}", name.len());
+                        found_jid = Some(jid.clone());
+                        true
+                    }
+                    UiEvent::Error(message) => {
+                        println!("lookup: {message}");
+                        true
+                    }
+                    _ => false,
+                })?;
+                // Read its newest posts without following, then forget them again.
+                if let Some(channel) = found_jid {
+                    backend.send(Command::LoadChannel {
+                        chat: channel.clone(),
+                        older: false,
+                    });
+                    let mut problem = None;
+                    wait_for(&backend, "channel posts", Duration::from_secs(40), |event| match event {
+                        UiEvent::ChatChanged { chat } if *chat == channel => true,
+                        UiEvent::Error(message) => {
+                            problem = Some(message.clone());
+                            true
+                        }
+                        _ => false,
+                    })?;
+                    let posts = store.messages(&channel, None, 60)?;
+                    let ids: Vec<String> = posts.iter().map(|post| post.id.clone()).collect();
+                    let kinds: std::collections::BTreeSet<String> =
+                        posts.iter().map(|post| format!("{:?}", post.kind)).collect();
+                    println!(
+                        "posts read without following: {} (kinds {:?}), reaction totals {}, problem: {}",
+                        posts.len(),
+                        kinds,
+                        store.reaction_counts(&channel, &ids)?.len(),
+                        problem.as_deref().unwrap_or("none")
+                    );
+                    store.batch(|tx| tx.delete_chat(&channel))?;
+                }
+            }
+        }
         "groupsettings" => {
             // On a group the tests own (nobody else in it): flip each admin switch on and
             // back off, set and clear the message timer, read the invite link, reset it.

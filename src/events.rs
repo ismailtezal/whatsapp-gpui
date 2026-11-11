@@ -65,6 +65,16 @@ pub enum UiEvent {
         lid: Option<String>,
         push_name: String,
     },
+    /// A channel found by its link: who it is, before deciding to follow.
+    ChannelFound {
+        link: String,
+        /// The channel's address, for reading its posts before following.
+        jid: String,
+        name: String,
+        description: String,
+        followers: u64,
+        verified: bool,
+    },
     /// A group's invite link, asked for with `Command::GroupInvite`.
     InviteLink { chat: String, link: String },
     /// The people waiting to be let into a group.
@@ -86,6 +96,114 @@ pub enum Attach {
     Voice,
     Document,
     Sticker,
+}
+
+/// A community and its groups, as last read from the server.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Community {
+    pub jid: String,
+    pub name: String,
+    pub groups: Vec<CommunityGroup>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommunityGroup {
+    pub jid: String,
+    pub name: String,
+    /// The announcements group every member is in.
+    pub announcements: bool,
+    pub members: u32,
+}
+
+impl Community {
+    /// Where the list of communities is kept in the store's settings table.
+    pub const KEY: &'static str = "communities";
+
+    /// The form kept in the store: one line per community or group, tab-separated;
+    /// a group's line starts with a tab.
+    pub fn encode(list: &[Community]) -> String {
+        let clean = |text: &str| text.replace(['\t', '\n'], " ");
+        let mut out = String::new();
+        for community in list {
+            out.push_str(&format!("{}\t{}\n", community.jid, clean(&community.name)));
+            for group in &community.groups {
+                out.push_str(&format!(
+                    "\t{}\t{}\t{}\t{}\n",
+                    group.jid,
+                    clean(&group.name),
+                    group.announcements as u8,
+                    group.members
+                ));
+            }
+        }
+        out
+    }
+
+    pub fn decode(text: &str) -> Vec<Community> {
+        let mut list: Vec<Community> = Vec::new();
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            match parts.as_slice() {
+                ["", jid, name, announcements, members] => {
+                    if let Some(community) = list.last_mut() {
+                        community.groups.push(CommunityGroup {
+                            jid: jid.to_string(),
+                            name: name.to_string(),
+                            announcements: *announcements == "1",
+                            members: members.parse().unwrap_or(0),
+                        });
+                    }
+                }
+                [jid, name] if !jid.is_empty() => list.push(Community {
+                    jid: jid.to_string(),
+                    name: name.to_string(),
+                    groups: Vec::new(),
+                }),
+                _ => {}
+            }
+        }
+        list
+    }
+}
+
+/// What is known about a channel, as last read from the server.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChannelInfo {
+    /// "owner", "admin", "subscriber" or "guest".
+    pub role: String,
+    pub followers: u64,
+    pub muted: bool,
+    pub verified: bool,
+    pub invite: String,
+}
+
+impl ChannelInfo {
+    pub fn can_post(&self) -> bool {
+        self.role == "owner" || self.role == "admin"
+    }
+
+    /// The form kept in the store's settings table.
+    pub fn encode(&self) -> String {
+        format!(
+            "{} {} {} {} {}",
+            self.role, self.followers, self.muted as u8, self.verified as u8, self.invite
+        )
+    }
+
+    pub fn decode(text: &str) -> Option<Self> {
+        let mut parts = text.splitn(5, ' ');
+        Some(ChannelInfo {
+            role: parts.next()?.to_string(),
+            followers: parts.next()?.parse().ok()?,
+            muted: parts.next()? == "1",
+            verified: parts.next()? == "1",
+            invite: parts.next().unwrap_or_default().to_string(),
+        })
+    }
+
+    pub fn key(chat: &str) -> String {
+        format!("channel-info:{chat}")
+    }
 }
 
 /// One of a group's switches.
@@ -178,6 +296,29 @@ pub enum Command {
         id: String,
         text: String,
     },
+    /// Read the communities this account is in, with their groups.
+    SyncCommunities,
+    CreateCommunity { name: String },
+    /// Start a new group inside a community.
+    CreateSubgroup { parent: String, name: String },
+    /// Put an existing group into a community, or take it out.
+    LinkGroup { parent: String, group: String, linked: bool },
+    /// Join a group of a community we are in.
+    JoinSubgroup { parent: String, group: String },
+    /// Close a community for everyone (its groups stay).
+    DeactivateCommunity { parent: String },
+    /// Read the list of channels this account follows.
+    SyncChannels,
+    /// Fetch a channel's newest posts, or the page before the oldest one held.
+    LoadChannel { chat: String, older: bool },
+    /// Look a channel up by its link or invite code, without following it.
+    LookupChannel { link: String },
+    /// Follow a channel from its link or invite code.
+    FollowChannel { link: String },
+    UnfollowChannel { chat: String },
+    MuteChannel { chat: String, muted: bool },
+    /// Start a channel of our own.
+    CreateChannel { name: String, description: String },
     /// Change one of a group's switches (admins only).
     SetGroupSetting { chat: String, setting: GroupSetting },
     /// The disappearing-message timer of a chat or group, in seconds; 0 turns it off.

@@ -861,7 +861,11 @@ fn reaction_chips(view: &MsgView, t: &Tokens) -> Option<Div> {
         return None;
     }
     let mut chips = div().flex().flex_wrap().gap(px(4.)).mt(px(-6.)).px(px(6.));
-    for chip in &view.reactions {
+    // The most used first; past five, the rest are summed into one "+N" chip.
+    let mut ordered: Vec<&ReactionChip> = view.reactions.iter().collect();
+    ordered.sort_by_key(|chip| std::cmp::Reverse(chip.count));
+    let rest: usize = ordered.iter().skip(5).map(|chip| chip.count).sum();
+    for chip in ordered.into_iter().take(5) {
         let (border, color) = if chip.mine {
             (t.tint(0.45), t.primary)
         } else {
@@ -886,12 +890,38 @@ fn reaction_chips(view: &MsgView, t: &Tokens) -> Option<Div> {
                             .text_size(px(11.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(color)
-                            .child(chip.count.to_string()),
+                            .child(short_count(chip.count)),
                     )
                 }),
         );
     }
+    if rest > 0 {
+        chips = chips.child(
+            div()
+                .h(px(24.))
+                .px(px(7.))
+                .rounded_full()
+                .border_1()
+                .border_color(t.fg(0.10))
+                .bg(t.popover)
+                .flex()
+                .items_center()
+                .text_size(px(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(t.muted_foreground)
+                .child(format!("+{}", short_count(rest))),
+        );
+    }
     Some(chips)
+}
+
+/// A large number in few characters: 1.2K, 3.4M.
+pub fn short_count(count: usize) -> String {
+    match count {
+        0..=999 => count.to_string(),
+        1_000..=999_999 => format!("{:.1}K", count as f64 / 1_000.).replace(".0K", "K"),
+        _ => format!("{:.1}M", count as f64 / 1_000_000.).replace(".0M", "M"),
+    }
 }
 
 /// A centred notice ("X added Y", "Missed voice call"), as WhatsApp shows them.

@@ -31,6 +31,9 @@ enum RowKey {
     Hit(usize),
     Contact(usize),
     Status(usize),
+    /// A community, and one of its groups: (community, group).
+    Community(usize),
+    CommunityGroup(usize, usize),
     /// "My status", shown when I have posted nothing in the last day.
     MyStatus,
 }
@@ -44,6 +47,7 @@ pub enum Section {
     Calls,
     Status,
     Channels,
+    Communities,
     Starred,
     Settings,
 }
@@ -65,6 +69,7 @@ impl Section {
             Section::Calls => "Calls",
             Section::Status => "Status",
             Section::Channels => "Channels",
+            Section::Communities => "Communities",
             Section::Starred => "Starred messages",
             Section::Settings => "Settings",
         }
@@ -131,6 +136,15 @@ pub struct Shell {
     profile_name_stale: bool,
     /// Whether the app is set to start with Windows (read once at start).
     autostart: bool,
+    /// Communities as last read from the server, and the create panel.
+    communities: Vec<crate::events::Community>,
+    community_panel: bool,
+    community_name: Entity<InputState>,
+    /// Channels: the find-or-create panel, its fields, and the channel a link led to.
+    channel_panel: bool,
+    channel_link: Entity<InputState>,
+    channel_name: Entity<InputState>,
+    channel_found: Option<(String, String, String, u64, bool)>,
     /// New chat panel: an invite link to join a group with.
     join_link: Entity<InputState>,
     /// Settings: the name and About fields.
@@ -177,6 +191,9 @@ impl Shell {
         });
         let status_reply = cx.new(|cx| InputState::new(window, cx).placeholder("Reply"));
         let join_link = cx.new(|cx| InputState::new(window, cx).placeholder("Paste a group invite link"));
+        let community_name = cx.new(|cx| InputState::new(window, cx).placeholder("Name of a new community or group"));
+        let channel_link = cx.new(|cx| InputState::new(window, cx).placeholder("Paste a channel link"));
+        let channel_name = cx.new(|cx| InputState::new(window, cx).placeholder("Name of a new channel"));
         let profile_name = cx.new(|cx| InputState::new(window, cx).placeholder("Your name"));
         let profile_about = cx.new(|cx| InputState::new(window, cx).placeholder("About (leave empty to remove it)"));
         cx.subscribe_in(&status_reply, window, |this, _, event: &InputEvent, window, cx| {
@@ -274,6 +291,13 @@ impl Shell {
             backdrop: None,
             stale_chats: false,
             stale_open_chat: false,
+            communities: Vec::new(),
+            community_panel: false,
+            community_name,
+            channel_panel: false,
+            channel_link,
+            channel_name,
+            channel_found: None,
             autostart: crate::tray::starts_with_windows(),
             join_link,
             profile_name_stale: true,
@@ -348,6 +372,15 @@ impl Shell {
     }
 
     fn reload_lists(&mut self) {
+        if self.section == Section::Communities {
+            self.communities = self
+                .store
+                .kv(crate::events::Community::KEY)
+                .ok()
+                .flatten()
+                .map(|text| crate::events::Community::decode(&text))
+                .unwrap_or_default();
+        }
         self.chats = self
             .store
             .chats(self.section == Section::Archived)
@@ -413,6 +446,13 @@ impl Shell {
     fn set_section(&mut self, section: Section, cx: &mut Context<Self>) {
         if section == Section::Settings {
             self.backend.send(Command::FetchAccountInfo);
+        }
+        if section == Section::Communities {
+            self.backend.send(Command::SyncCommunities);
+        }
+        if section == Section::Channels {
+            // The list of followed channels lives on the server.
+            self.backend.send(Command::SyncChannels);
         }
         self.section = section;
         self.picking = false;
@@ -523,6 +563,16 @@ impl Shell {
                 {
                     view.update(cx, |view, cx| view.set_presence(online, last_seen, cx));
                 }
+            }
+            UiEvent::ChannelFound {
+                link,
+                name,
+                description,
+                followers,
+                verified,
+                ..
+            } => {
+                self.channel_found = Some((link, name, description, followers, verified));
             }
             UiEvent::InviteLink { chat, link } => {
                 if self.selected.as_deref() == Some(chat.as_str())
@@ -814,6 +864,7 @@ impl Shell {
             .child(tile(Section::Calls, "phone", "Calls", cx))
             .child(tile(Section::Status, "circle-dashed", "Status", cx))
             .child(tile(Section::Channels, "megaphone", "Channels", cx))
+            .child(tile(Section::Communities, "users", "Communities", cx))
             .child(div().w(px(28.)).h(px(1.)).bg(t.sidebar_border))
             .child(tile(Section::Starred, "star", "Starred messages", cx))
             .child(tile(Section::Archived, "archive", "Archived", cx))
@@ -1106,6 +1157,14 @@ impl Shell {
                 keys.extend((0..self.statuses.len()).map(RowKey::Status));
                 (keys, "")
             }
+            Section::Communities => {
+                let mut keys = Vec::new();
+                for (index, community) in self.communities.iter().enumerate() {
+                    keys.push(RowKey::Community(index));
+                    keys.extend((0..community.groups.len()).map(|group| RowKey::CommunityGroup(index, group)));
+                }
+                (keys, "You are in no communities. Use + to start one.")
+            }
             Section::Settings => (Vec::new(), ""),
             _ => {
                 let mut keys = Vec::new();
@@ -1194,6 +1253,95 @@ impl Shell {
                 )
                 .on_click(cx.listener(move |this, _, window, cx| this.pick_contact(&jid, window, cx)))
                 .into_any_element()
+            }
+            RowKey::Community(index) => {
+                let Some(community) = self.communities.get(index) else {
+                    return nothing();
+                };
+                let count = community.groups.len();
+                let detail = div()
+                    .truncate()
+                    .child(format!("Community · {count} group{}", if count == 1 { "" } else { "s" }))
+                    .into_any_element();
+                let parent = community.jid.clone();
+                self.list_row(
+                    SharedString::from(format!("community-{index}")),
+                    &community.jid,
+                    &community.name,
+                    Some(&community.jid),
+                    String::new(),
+                    detail,
+                    Some(
+                        icon_button(("community-add", index), "plus", cx)
+                            .tooltip(tip("New group in this community (type its name above)"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                let name = this.community_name.read(cx).value().trim().to_string();
+                                if name.is_empty() {
+                                    this.community_panel = true;
+                                    this.last_error =
+                                        Some("Type the new group's name in the box above, then press + again.".to_string());
+                                } else {
+                                    this.backend.send(Command::CreateSubgroup {
+                                        parent: parent.clone(),
+                                        name,
+                                    });
+                                    this.community_name.update(cx, |input, cx| input.set_value("", window, cx));
+                                }
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    ),
+                    false,
+                    false,
+                    cx,
+                )
+                .into_any_element()
+            }
+            RowKey::CommunityGroup(index, slot) => {
+                let Some((community, group)) = self
+                    .communities
+                    .get(index)
+                    .and_then(|community| Some((community, community.groups.get(slot)?)))
+                else {
+                    return nothing();
+                };
+                let joined = self.chats.iter().any(|chat| chat.jid == group.jid);
+                let what = match (group.announcements, joined) {
+                    (true, _) => "Announcements".to_string(),
+                    (false, true) => format!("{} members", group.members),
+                    (false, false) => format!("{} members · click to join", group.members),
+                };
+                let detail = div().truncate().child(what).into_any_element();
+                let (parent, target) = (community.jid.clone(), group.jid.clone());
+                div()
+                    .pl(px(20.))
+                    .child(
+                        self.list_row(
+                            SharedString::from(format!("community-{index}-{slot}")),
+                            &group.jid,
+                            &group.name,
+                            Some(&group.jid),
+                            String::new(),
+                            detail,
+                            None,
+                            self.selected.as_deref() == Some(group.jid.as_str()),
+                            false,
+                            cx,
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if joined {
+                                this.open_chat(&target, window, cx);
+                            } else {
+                                this.backend.send(Command::JoinSubgroup {
+                                    parent: parent.clone(),
+                                    group: target.clone(),
+                                });
+                                cx.notify();
+                            }
+                        })),
+                    )
+                    .into_any_element()
             }
             RowKey::MyStatus => {
                 let detail = div().truncate().child("Add a status update").into_any_element();
@@ -1326,6 +1474,27 @@ impl Shell {
                             .text_color(t.foreground)
                             .child(title),
                     )
+                    .when(self.section == Section::Communities, |this| {
+                        this.child(
+                            icon_button("community-panel", "plus", cx)
+                                .tooltip(tip("New community"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.community_panel = !this.community_panel;
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .when(self.section == Section::Channels, |this| {
+                        this.child(
+                            icon_button("channel-panel", "plus", cx)
+                                .tooltip(tip("Find or create a channel"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.channel_panel = !this.channel_panel;
+                                    this.channel_found = None;
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .when(self.section == Section::Status, |this| {
                         this.child(
                             icon_button("new-status", "plus", cx)
@@ -1409,6 +1578,47 @@ impl Shell {
                                     })),
                             )
                         }),
+                )
+            })
+            .when(self.section == Section::Channels && self.channel_panel, |this| {
+                this.child(self.channel_finder(cx))
+            })
+            .when(self.section == Section::Communities && self.community_panel, |this| {
+                let t = t.clone();
+                let hover = t.fg(0.09);
+                this.child(
+                    div()
+                        .px(px(12.))
+                        .pb(px(8.))
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(div().flex_1().child(Input::new(&self.community_name)))
+                        .child(
+                            div()
+                                .id("community-create")
+                                .h(px(32.))
+                                .px(px(12.))
+                                .rounded(R_LG)
+                                .flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .bg(t.fg(0.06))
+                                .text_size(px(13.))
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(hover))
+                                .child("New community")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let name = this.community_name.read(cx).value().trim().to_string();
+                                    if name.is_empty() {
+                                        return;
+                                    }
+                                    this.backend.send(Command::CreateCommunity { name });
+                                    this.community_name.update(cx, |input, cx| input.set_value("", window, cx));
+                                    cx.notify();
+                                })),
+                        ),
                 )
             })
             .when(self.picking && !self.group_mode, |this| {
@@ -3094,5 +3304,128 @@ impl Shell {
                 })),
             )
             .into_any_element()
+    }
+}
+
+impl Shell {
+    /// Channels: find one by its link and follow it, or start a new one.
+    fn channel_finder(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = tokens(cx).clone();
+        let button = |id: &'static str, label: &'static str, strong: bool| {
+            let hover = t.fg(0.12);
+            div()
+                .id(id)
+                .h(px(32.))
+                .px(px(12.))
+                .rounded(R_LG)
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .when(strong, |this| this.bg(t.primary).text_color(t.primary_foreground))
+                .when(!strong, |this| this.bg(t.fg(0.06)).hover(move |style| style.bg(hover)))
+                .child(label)
+        };
+        let mut panel = div()
+            .px(px(12.))
+            .pb(px(10.))
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .gap(px(6.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().flex_1().child(Input::new(&self.channel_link)))
+                    .child(button("channel-find", "Find", false).on_click(cx.listener(|this, _, _, cx| {
+                        let link = this.channel_link.read(cx).value().trim().to_string();
+                        if !link.is_empty() {
+                            this.channel_found = None;
+                            this.backend.send(Command::LookupChannel { link });
+                        }
+                        cx.notify();
+                    }))),
+            );
+        if let Some((link, name, description, followers, verified)) = self.channel_found.clone() {
+            panel = panel.child(
+                div()
+                    .rounded(R_LG)
+                    .border_1()
+                    .border_color(t.border)
+                    .bg(t.fg(0.04))
+                    .p(px(10.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(SharedString::from(name)),
+                            )
+                            .when(verified, |this| {
+                                this.child(icon("circle-check").size(px(14.)).text_color(t.primary))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(t.muted_foreground)
+                            .child(format!("{} followers", super::message::short_count(followers as usize))),
+                    )
+                    .when(!description.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .max_h(px(54.))
+                                .overflow_hidden()
+                                .text_size(px(12.))
+                                .text_color(t.fg(0.8))
+                                .child(SharedString::from(description)),
+                        )
+                    })
+                    .child(
+                        div().flex().justify_end().child(button("channel-follow", "Follow", true).on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.backend.send(Command::FollowChannel { link: link.clone() });
+                                this.channel_found = None;
+                                this.channel_panel = false;
+                                this.channel_link.update(cx, |input, cx| input.set_value("", window, cx));
+                                cx.notify();
+                            }),
+                        )),
+                    ),
+            );
+        }
+        panel = panel.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(div().flex_1().child(Input::new(&self.channel_name)))
+                .child(button("channel-create", "Create", false).on_click(cx.listener(|this, _, window, cx| {
+                    let name = this.channel_name.read(cx).value().trim().to_string();
+                    if name.is_empty() {
+                        return;
+                    }
+                    this.backend.send(Command::CreateChannel {
+                        name,
+                        description: String::new(),
+                    });
+                    this.channel_name.update(cx, |input, cx| input.set_value("", window, cx));
+                    this.channel_panel = false;
+                    cx.notify();
+                }))),
+        );
+        panel.into_any_element()
     }
 }

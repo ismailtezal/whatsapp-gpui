@@ -86,6 +86,17 @@ pub fn init(backend: Backend) {
 /// The picture of a JID if it is on disk. The first lookup of a JID without one asks the
 /// connection to fetch it; the interface is told when it arrives.
 pub fn get(jid: &str) -> Option<PathBuf> {
+    if ChatKind::of_jid(jid) == ChatKind::Newsletter {
+        // Channel pictures come from the channel sync; here only the disk is checked,
+        // once, and the answer remembered.
+        let mut cache = cache().lock().ok()?;
+        if let Some(known) = cache.known.get(jid) {
+            return known.clone();
+        }
+        let found = get_any(jid);
+        cache.known.insert(jid.to_string(), found.clone());
+        return found;
+    }
     if !matches!(ChatKind::of_jid(jid), ChatKind::User | ChatKind::Group) || jid.ends_with("@lid") {
         return None;
     }
@@ -108,6 +119,13 @@ pub fn get(jid: &str) -> Option<PathBuf> {
 }
 
 /// Re-checks the disk for a JID after a fetch finished.
+/// The picture kept for any address, whatever its kind, without asking the connection
+/// for it (channel pictures are fetched from the web by the channel sync).
+pub fn get_any(jid: &str) -> Option<PathBuf> {
+    let path = picture_path(jid);
+    path.exists().then_some(path)
+}
+
 /// Saves a picture as the one for `jid` (used for our own photo after changing it).
 pub fn store(jid: &str, bytes: &[u8]) -> Result<()> {
     std::fs::write(picture_path(jid), bytes)?;

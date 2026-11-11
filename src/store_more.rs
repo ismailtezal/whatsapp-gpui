@@ -132,6 +132,44 @@ impl Store {
         })
     }
 
+    /// Remembers the server's number for a channel post.
+    pub fn put_channel_id(&self, chat: &str, id: &str, server_id: u64) -> Result<()> {
+        self.read(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO channel_ids (chat, id, server_id) VALUES (?1, ?2, ?3)",
+                params![chat, id, server_id as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The server's number for a channel post, if known.
+    pub fn channel_server_id(&self, chat: &str, id: &str) -> Result<Option<u64>> {
+        self.read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT server_id FROM channel_ids WHERE chat = ?1 AND id = ?2",
+                    params![chat, id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .ok()
+                .map(|value| value as u64))
+        })
+    }
+
+    /// The lowest server number held for a channel: the cursor for the page before it.
+    pub fn oldest_channel_server_id(&self, chat: &str) -> Result<Option<u64>> {
+        self.read(|conn| {
+            Ok(conn
+                .query_row("SELECT MIN(server_id) FROM channel_ids WHERE chat = ?1", [chat], |row| {
+                    row.get::<_, Option<i64>>(0)
+                })
+                .ok()
+                .flatten()
+                .map(|value| value as u64))
+        })
+    }
+
     /// The disappearing-message timer of a chat, in seconds (0 when off).
     pub fn chat_timer(&self, chat: &str) -> Result<i64> {
         self.read(|conn| {

@@ -136,6 +136,8 @@ pub struct ChatView {
     edit_field: Option<GroupField>,
     edit_input: Entity<gpui_component::input::InputState>,
     info_open: bool,
+    /// For a channel: its role, followers and mute, as last read from the server.
+    channel: Option<crate::events::ChannelInfo>,
     /// A group's switches as last read from the server (kept in the store).
     group_settings: Option<crate::events::GroupSettings>,
     /// The disappearing-message timer of this chat, in seconds.
@@ -259,6 +261,7 @@ impl ChatView {
             edit_field: None,
             edit_input,
             info_open: false,
+            channel: None,
             group_settings: None,
             timer: 0,
             join_requests: Vec::new(),
@@ -268,6 +271,12 @@ impl ChatView {
             search,
             search_hits: Vec::new(),
         };
+if view.chat.kind == ChatKind::Newsletter {
+            view.backend.send(Command::LoadChannel {
+                chat: view.chat.jid.clone(),
+                older: false,
+            });
+        }
         view.reload(cx);
         if view.chat.kind != ChatKind::User {
             // Members are needed for @-mentions; ask the server for the current list.
@@ -345,6 +354,14 @@ impl ChatView {
         let _perf = crate::perf::scope("chat.reload");
         self.pins = self.store.pinned(&self.chat.jid).unwrap_or_default();
         // Read once per reload, not per frame.
+        if self.chat.kind == ChatKind::Newsletter {
+            self.channel = self
+                .store
+                .kv(&crate::events::ChannelInfo::key(&self.chat.jid))
+                .ok()
+                .flatten()
+                .and_then(|text| crate::events::ChannelInfo::decode(&text));
+        }
         self.timer = self.store.chat_timer(&self.chat.jid).unwrap_or(0);
         self.group_settings = self
             .store
@@ -369,6 +386,13 @@ impl ChatView {
         let mut reactions: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for (id, sender, emoji) in self.store.reactions(&self.chat.jid, &ids).unwrap_or_default() {
             reactions.entry(id).or_default().push((sender, emoji));
+        }
+        // Channels report totals per emoji instead of who reacted.
+        let mut reaction_totals: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+        if self.chat.kind == ChatKind::Newsletter {
+            for (id, emoji, count) in self.store.reaction_counts(&self.chat.jid, &ids).unwrap_or_default() {
+                reaction_totals.entry(id).or_default().push((emoji, count));
+            }
         }
         let by_id: HashMap<String, MsgRow> = rows.iter().map(|r| (r.id.clone(), r.clone())).collect();
 
@@ -513,6 +537,19 @@ impl ChatView {
                             emoji: emoji.clone(),
                             count: 1,
                             mine: sender == "me",
+                        }),
+                    }
+                }
+            }
+            if let Some(totals) = reaction_totals.get(&row.id) {
+                for (emoji, total) in totals {
+                    match chips.iter_mut().find(|chip| chip.emoji == *emoji) {
+                        // The total already counts my own reaction.
+                        Some(chip) => chip.count = (*total).max(1) as usize,
+                        None => chips.push(ReactionChip {
+                            emoji: emoji.clone(),
+                            count: (*total).max(1) as usize,
+                            mine: false,
                         }),
                     }
                 }
@@ -668,6 +705,14 @@ impl ChatView {
         self.loaded += PAGE;
         if self.has_older {
             self.reload(cx);
+        } else if self.chat.kind == ChatKind::Newsletter {
+            // A channel's earlier posts come from the server, a page at a time.
+            self.backend.send(Command::LoadChannel {
+                chat: self.chat.jid.clone(),
+                older: true,
+            });
+            self.notice = Some("Getting earlier posts…".to_string());
+            cx.notify();
         } else {
             self.backend.send(Command::LoadOlder {
                 chat: self.chat.jid.clone(),
@@ -1548,7 +1593,13 @@ impl ChatView {
                 }
             }
             (None, Some(presence)) => presence.clone(),
-            (None, None) => String::new(),
+            (None, None) => match &self.channel {
+                Some(channel) => format!(
+                    "Channel · {} followers",
+                    super::message::short_count(channel.followers as usize)
+                ),
+                None => String::new(),
+            },
         };
         let typing = self.activity.is_some();
         div()
@@ -1652,6 +1703,14 @@ impl ChatView {
             })
         };
         let liquid = t.liquid();
+        // A channel is read-only unless it is ours: the message box gives way to a bar.
+        if self.chat.kind == ChatKind::Newsletter && !self.channel.as_ref().is_some_and(|c| c.can_post()) {
+            return div()
+                .px(px(if liquid { 10. } else { 16. }))
+                .pb(px(if liquid { 10. } else { 20. }))
+                .flex_shrink_0()
+                .child(self.channel_bar(cx));
+        }
         div()
             .px(px(if liquid { 10. } else { 16. }))
             .pb(px(if liquid { 10. } else { 20. }))
@@ -4559,5 +4618,84 @@ impl ChatView {
             player.set_rate(next);
         }
         cx.notify();
+    }
+}
+
+impl ChatView {
+    /// Under a channel we only follow: who may post, and mute and unfollow.
+    fn channel_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = tokens(cx).clone();
+        let muted = self.channel.as_ref().is_some_and(|channel| channel.muted);
+        let followed = self.channel.is_some();
+        let button = |id: &'static str, glyph: &'static str, label: &'static str| {
+            let hover = t.fg(0.12);
+            div()
+                .id(id)
+                .h(px(32.))
+                .px(px(12.))
+                .rounded(R_LG)
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(8.))
+                .bg(t.fg(0.06))
+                .text_size(px(13.))
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .child(icon(glyph).size(px(14.)))
+                .child(label)
+        };
+        div()
+            .h(px(52.))
+            .px(px(14.))
+            .rounded(if t.liquid() { px(22.) } else { R_XL })
+            .border_1()
+            .border_color(if t.liquid() { gpui::transparent_black() } else { t.fg(0.08) })
+            .bg(t.surface(Surface::Bar, t.card))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(13.))
+                    .text_color(t.muted_foreground)
+                    .child("Only the channel's admins can post here."),
+            )
+            .when(followed, |this| {
+                this.child(
+                    button(
+                        "channel-mute",
+                        if muted { "bell" } else { "bell-off" },
+                        if muted { "Unmute" } else { "Mute" },
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.backend.send(Command::MuteChannel {
+                            chat: this.chat.jid.clone(),
+                            muted: !muted,
+                        });
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    button(
+                        "channel-unfollow",
+                        "log-out",
+                        if self.confirm_leave { "Click again to unfollow" } else { "Unfollow" },
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.confirm_leave {
+                            this.backend.send(Command::UnfollowChannel {
+                                chat: this.chat.jid.clone(),
+                            });
+                            this.confirm_leave = false;
+                        } else {
+                            this.confirm_leave = true;
+                        }
+                        cx.notify();
+                    })),
+                )
+            })
+            .into_any_element()
     }
 }
