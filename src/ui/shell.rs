@@ -263,6 +263,10 @@ impl Shell {
                 if !push_name.is_empty() {
                     self.me_name = push_name;
                 }
+                if let Some(view) = &self.chat {
+                    let (name, jid) = (self.me_name.clone(), self.me_jid.clone());
+                    view.update(cx, |view, cx| view.set_me(name, jid, cx));
+                }
             }
             UiEvent::ChatsChanged => self.reload(),
             UiEvent::HistoryProgress { .. } => {

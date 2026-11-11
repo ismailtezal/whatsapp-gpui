@@ -103,6 +103,8 @@ pub struct ChatView {
     viewer: Option<PathBuf>,
     notice: Option<String>,
     audio: Option<crate::audio::AudioPlayer>,
+    forwarding: Option<String>,
+    forward_targets: Vec<ChatRow>,
     info_open: bool,
     /// Group members as (JID, name, rank).
     members: Vec<(String, String, i32)>,
@@ -174,6 +176,8 @@ impl ChatView {
             viewer: None,
             notice: None,
             audio: None,
+            forwarding: None,
+            forward_targets: Vec::new(),
             info_open: false,
             members: Vec::new(),
             gallery: Vec::new(),
@@ -648,6 +652,12 @@ impl ChatView {
                 let _ = entity.update(cx, |this, cx| this.open_media(&media_id, cx));
             })),
             audio: self.audio.as_ref().and_then(|player| player.playback()),
+            quote: view.row.quoted_id.clone().map(|quoted| {
+                let entity = cx.entity().downgrade();
+                Rc::new(move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                    let _ = entity.update(cx, |this, cx| this.jump_to(&quoted, cx));
+                }) as super::message::ClickFn
+            }),
         };
         let row = message_row(view, &hooks, cx);
         if matches!(view.row.kind, MsgKind::System | MsgKind::Revoked) {
@@ -910,6 +920,11 @@ impl ChatView {
                 ));
             }
         }
+
+        let forward_id = row.id.clone();
+        panel = panel.child(item(8, "forward", "Forward", false).on_click(cx.listener(
+            move |this, _, _, cx| this.start_forward(&forward_id, cx),
+        )));
 
         if row.from_me && row.kind == MsgKind::Text && now - row.ts < EDIT_WINDOW_SECS {
             let id = row.id.clone();
@@ -1300,6 +1315,7 @@ impl Render for ChatView {
                     .children(self.info_panel(cx)),
             )
             .children(viewer)
+            .children(self.forward_overlay(window, cx))
             .children(menu)
             .children(emoji)
     }
@@ -1765,5 +1781,123 @@ impl ChatView {
             }
         }
         Some(panel.into_any_element())
+    }
+}
+
+impl ChatView {
+    /// The account name and number arrived (or changed) after this view was opened.
+    pub fn set_me(&mut self, name: String, jid: Option<String>, cx: &mut Context<Self>) {
+        self.me_name = name;
+        self.me_jid = jid;
+        self.reload(cx);
+    }
+
+    fn start_forward(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.forwarding = Some(id.to_string());
+        self.forward_targets = self.store.chats(false).unwrap_or_default();
+        self.menu = None;
+        cx.notify();
+    }
+
+    /// The chat picker for forwarding a message.
+    fn forward_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let id = self.forwarding.clone()?;
+        let t = tokens(cx).clone();
+        let size = window.viewport_size();
+        let mut rows = div()
+            .id("forward-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .p(px(6.));
+        for (slot, chat) in self.forward_targets.iter().enumerate() {
+            let hover = t.accent;
+            let to = chat.jid.clone();
+            let message = id.clone();
+            rows = rows.child(
+                div()
+                    .id(("forward-to", slot))
+                    .h(px(44.))
+                    .px(px(8.))
+                    .rounded(R_MD)
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap(px(10.))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .child(avatar(
+                        &chat.jid,
+                        &chat.title,
+                        28.,
+                        crate::avatars::get(&chat.jid),
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(14.))
+                            .child(SharedString::from(chat.title.clone())),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.backend.send(Command::Forward {
+                            from_chat: this.chat.jid.clone(),
+                            id: message.clone(),
+                            to_chats: vec![to.clone()],
+                        });
+                        this.forwarding = None;
+                        this.notice = Some("Forwarded".to_string());
+                        cx.notify();
+                    })),
+            );
+        }
+        let panel = div()
+            .w(px(420.))
+            .h(px(520.))
+            .rounded(super::theme::R_2XL)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .shadow(t.shadow_dialog())
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .px(px(16.))
+                    .py(px(12.))
+                    .border_b_1()
+                    .border_color(t.border)
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Forward to"),
+            )
+            .child(rows);
+        let close = cx.listener(|this, _: &MouseDownEvent, _, cx| {
+            this.forwarding = None;
+            cx.notify();
+        });
+        Some(
+            deferred(
+                anchored().position(point(px(0.), px(0.))).child(
+                    div()
+                        .w(size.width)
+                        .h(size.height)
+                        .occlude()
+                        .bg(gpui::hsla(0., 0., 0., 0.55))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(MouseButton::Left, close)
+                        .child(panel),
+                ),
+            )
+            .with_priority(10)
+            .into_any_element(),
+        )
     }
 }

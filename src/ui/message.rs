@@ -77,6 +77,8 @@ pub struct RowHooks {
     pub media: Option<ClickFn>,
     /// The clip the audio player has loaded, if any.
     pub audio: Option<crate::audio::Playback>,
+    /// Jump to the message this one replies to.
+    pub quote: Option<ClickFn>,
 }
 
 /// Extracts what a row needs from the stored record.
@@ -680,24 +682,23 @@ pub fn message_row(view: &MsgView, hooks: &RowHooks, cx: &App) -> AnyElement {
 
     if let Some(quote) = &view.quote {
         let (_, name_color) = tint_of(&quote.author_seed, t.dark);
-        outer = outer.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .mb(px(2.))
-                .text_size(px(12.))
-                .text_color(t.muted_foreground)
-                .child(icon("corner-up-left").size(px(12.)))
-                .child(
-                    div()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(name_color)
-                        .flex_shrink_0()
-                        .child(quote.author.clone()),
-                )
-                .child(div().truncate().child(quote.text.clone())),
-        );
+        let line = div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .mb(px(2.))
+            .text_size(px(12.))
+            .text_color(t.muted_foreground)
+            .child(icon("corner-up-left").size(px(12.)))
+            .child(
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(name_color)
+                    .flex_shrink_0()
+                    .child(quote.author.clone()),
+            )
+            .child(div().truncate().child(quote.text.clone()));
+        outer = outer.child(clickable(line, ("quote", view.row.rowid as usize), &hooks.quote));
     }
 
     if view.head {

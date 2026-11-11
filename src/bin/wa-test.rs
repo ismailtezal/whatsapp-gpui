@@ -258,6 +258,25 @@ fn main() -> Result<()> {
             std::thread::sleep(Duration::from_secs(1));
             println!("messages before={before} after={}", store.message_count(Some(&chat))?);
         }
+        "reply" => {
+            // Reply to the newest message of a group, quoting it.
+            let chat = group(&store, &args[1])?;
+            let target = newest(&store, &chat, false)?;
+            backend.send(Command::SendText {
+                chat: chat.clone(),
+                text: args[2..].join(" "),
+                reply_to: Some(target.id.clone()),
+                mentions: Vec::new(),
+            });
+            std::thread::sleep(Duration::from_millis(800));
+            let sent = newest(&store, &chat, true)?;
+            println!(
+                "reply id={} quotes_target={} ack={:?}",
+                sent.id,
+                sent.quoted_id.as_deref() == Some(target.id.as_str()),
+                wait_ack(&store, &chat, &sent.id, Duration::from_secs(20))?
+            );
+        }
         "listen" => {
             let seconds: u64 = args.get(1).and_then(|n| n.parse().ok()).unwrap_or(15);
             let mut counts = std::collections::BTreeMap::new();
