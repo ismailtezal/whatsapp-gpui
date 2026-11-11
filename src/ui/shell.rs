@@ -119,6 +119,11 @@ impl Shell {
         .detach();
         cx.observe_window_activation(window, |this, window, _cx| {
             this.window_active = window.is_window_active();
+            if this.window_active
+                && let Some(chat) = this.selected.clone()
+            {
+                this.backend.send(Command::MarkRead { chat });
+            }
         })
         .detach();
 
@@ -313,6 +318,10 @@ impl Shell {
                 ..
             } => {
                 let open_and_focused = self.window_active && self.selected.as_deref() == Some(chat.as_str());
+                if open_and_focused {
+                    // The chat is in front of the user: what arrives is read as it arrives.
+                    self.backend.send(Command::MarkRead { chat: chat.clone() });
+                }
                 let row = self.chats.iter().find(|c| c.jid == chat);
                 let muted = row.is_some_and(|c| c.mute_until != 0);
                 if !open_and_focused && !muted && chat != "status@broadcast" {
@@ -353,6 +362,22 @@ impl Shell {
                 {
                     view.update(cx, |view, cx| view.set_presence(online, last_seen, cx));
                 }
+            }
+            UiEvent::IncomingCall { from, video, .. } => {
+                let name = self
+                    .store
+                    .display_name(&from)
+                    .unwrap_or_else(|_| display_number(&from));
+                cx.show_system_notification(SystemNotification {
+                    tag: SharedString::from(format!("call-{from}")),
+                    title: name.into(),
+                    body: format!(
+                        "Incoming {} call. Answer on your phone: calls are not available in this app yet.",
+                        if video { "video" } else { "voice" }
+                    )
+                    .into(),
+                    actions: Vec::new(),
+                });
             }
             UiEvent::AvatarReady { jid } => crate::avatars::refresh(&jid),
             UiEvent::MediaReady {

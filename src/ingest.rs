@@ -321,6 +321,23 @@ fn apply_inner(store: &Store, event: &Event, out: &mut Vec<UiEvent>) -> DbResult
             store.put_call(&history.record)?;
         }
 
+        Event::IncomingCall(call) => {
+            if let whatsapp_rust::wacore::types::call::CallAction::Offer {
+                call_id,
+                is_video,
+                caller_pn,
+                ..
+            } = &call.action
+            {
+                let from = caller_pn.as_ref().unwrap_or(&call.from).to_non_ad_string();
+                out.push(UiEvent::IncomingCall {
+                    from: store.canonical(&from)?,
+                    call_id: call_id.clone(),
+                    video: *is_video,
+                });
+            }
+        }
+
         Event::SelfPushNameUpdated(_) => {}
 
         _ => {}

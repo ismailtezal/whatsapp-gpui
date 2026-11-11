@@ -67,6 +67,8 @@ pub struct MsgView {
     pub avatar: Option<std::path::PathBuf>,
     pub poll: Option<crate::polls::PollView>,
     pub extras: Extras,
+    /// Further photos shown in the same grid as this one: (message ID, file on disk).
+    pub album: Vec<(String, Option<String>)>,
 }
 
 /// What a click on a part of a row does.
@@ -85,6 +87,8 @@ pub struct RowHooks {
     pub poll_vote: Option<Rc<dyn Fn(usize, &mut Window, &mut App)>>,
     /// Open the chat with this JID.
     pub open_chat: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
+    /// Open the photo of the message with this ID (for album tiles).
+    pub media_id: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
 }
 
 /// Extracts what a row needs from the stored record.
@@ -426,7 +430,11 @@ fn content(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> Div {
             }
         }
         Image => {
-            column = column.child(clickable(picture(view, t, None), ("media", key), &hooks.media));
+            column = column.child(if view.album.is_empty() {
+                clickable(picture(view, t, None), ("media", key), &hooks.media)
+            } else {
+                album_grid(view, hooks, t)
+            });
             if let Some(text) = text {
                 column = column.child(body_text(view, text, t));
             }
@@ -1110,4 +1118,40 @@ mod tests {
         assert_eq!(vcard_number(vcard).as_deref(), Some("15550001111"));
         assert_eq!(vcard_number("BEGIN:VCARD\nFN:No number\nEND:VCARD"), None);
     }
+}
+
+/// Several photos sent together, as a two-column grid of square tiles.
+fn album_grid(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> AnyElement {
+    let first = (view.row.id.clone(), view.row.media_path.clone());
+    let tile = 236.;
+    let mut grid = div().w(px(tile * 2. + 4.)).flex().flex_wrap().gap(px(4.));
+    for (slot, (id, path)) in std::iter::once(&first).chain(view.album.iter()).enumerate() {
+        let mut frame = div()
+            .size(px(tile))
+            .rounded(R_LG)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.muted)
+            .overflow_hidden();
+        if let Some(path) = path {
+            frame = frame.child(
+                gpui::img(std::path::PathBuf::from(path))
+                    .size(px(tile))
+                    .object_fit(gpui::ObjectFit::Cover),
+            );
+        }
+        grid = grid.child(match &hooks.media_id {
+            Some(hook) => {
+                let hook = hook.clone();
+                let id = id.clone();
+                frame
+                    .id(("album", view.row.rowid as usize * 16 + slot))
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| hook(id.clone(), window, cx))
+                    .into_any_element()
+            }
+            None => frame.into_any_element(),
+        });
+    }
+    grid.into_any_element()
 }

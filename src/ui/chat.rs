@@ -307,7 +307,11 @@ impl ChatView {
         let mut items = Vec::with_capacity(rows.len() + 8);
         let mut previous: Option<&MsgRow> = None;
         let mut previous_day = i64::MIN;
+        let mut skip_to = 0usize;
         for (index, row) in rows.iter().enumerate() {
+            if index < skip_to {
+                continue;
+            }
             let day = local_day(row.ts);
             let new_day = day != previous_day;
             if new_day {
@@ -427,6 +431,36 @@ impl ChatView {
                 crate::avatars::get(&author_seed)
             };
 
+            // Photos sent together (same author, within a minute and a half, no captions)
+            // are shown as one grid; the ones after the first are folded into it.
+            let mut album = Vec::new();
+            if row.kind == MsgKind::Image
+                && !view_once
+                && row.text.as_deref().is_none_or(str::is_empty)
+                && quote.is_none()
+            {
+                for next in rows.iter().skip(index + 1) {
+                    let joins = next.kind == MsgKind::Image
+                        && next.from_me == row.from_me
+                        && next.sender == row.sender
+                        && next.quoted_id.is_none()
+                        && next.text.as_deref().is_none_or(str::is_empty)
+                        && (next.ts - row.ts).abs() <= 90
+                        && local_day(next.ts) == day;
+                    if !joins || album.len() >= 9 {
+                        break;
+                    }
+                    if next.media_path.is_none() && self.requested.insert(next.id.clone()) {
+                        self.backend.send(Command::DownloadMedia {
+                            chat: self.chat.jid.clone(),
+                            id: next.id.clone(),
+                        });
+                    }
+                    album.push((next.id.clone(), next.media_path.clone()));
+                }
+                skip_to = index + 1 + album.len();
+            }
+
             items.push(Item::Msg(Box::new(MsgView {
                 row: row.clone(),
                 author,
@@ -437,6 +471,7 @@ impl ChatView {
                 media,
                 notice,
                 view_once,
+                album,
                 extras: super::message::extras_of(&record),
                 poll: if row.kind == MsgKind::Poll {
                     self.store.poll(&self.chat.jid, &row.id, &row.proto)
@@ -521,6 +556,13 @@ impl ChatView {
         match self.row(id).map(|r| r.kind) {
             Some(MsgKind::Image) => self.viewer = Some(path),
             Some(MsgKind::Voice | MsgKind::Audio) => self.play_audio(id, &path, cx),
+            None if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("jpg" | "jpeg" | "png" | "webp")
+            ) =>
+            {
+                self.viewer = Some(path)
+            }
             _ => cx.open_with_system(&path),
         }
         cx.notify();
@@ -709,6 +751,12 @@ impl ChatView {
                 let _ = entity.update(cx, |this, cx| this.open_media(&media_id, cx));
             })),
             audio: self.audio.as_ref().and_then(|player| player.playback()),
+            media_id: Some({
+                let entity = cx.entity().downgrade();
+                Rc::new(move |picture: String, _: &mut Window, cx: &mut App| {
+                    let _ = entity.update(cx, |this, cx| this.open_picture(&picture, cx));
+                })
+            }),
             open_chat: Some({
                 let entity = cx.entity().downgrade();
                 Rc::new(move |jid: String, _: &mut Window, cx: &mut App| {
@@ -1389,6 +1437,29 @@ impl Render for ChatView {
             .flex()
             .flex_col()
             .bg(t.background)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    // Escape closes whatever is open on top, one layer at a time.
+                    if this.viewer.take().is_some()
+                        || this.menu.take().is_some()
+                        || this.emoji.take().is_some()
+                        || this.stickers_at.take().is_some()
+                        || this.forwarding.take().is_some()
+                        || this.info_for.take().is_some()
+                        || this.member_menu.take().is_some()
+                        || this.edit_field.take().is_some()
+                    {
+                        cx.notify();
+                    } else if this.adding_members || this.search_open {
+                        this.adding_members = false;
+                        this.search_open = false;
+                        this.search_hits.clear();
+                        cx.notify();
+                    } else if this.reply_to.take().is_some() {
+                        cx.notify();
+                    }
+                }
+            }))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.send_files(paths.paths().to_vec(), cx);
             }))
@@ -2810,5 +2881,31 @@ impl ChatView {
             .with_priority(10)
             .into_any_element(),
         )
+    }
+}
+
+impl ChatView {
+    /// Opens a photo by message ID, including photos folded into an album grid.
+    fn open_picture(&mut self, id: &str, cx: &mut Context<Self>) {
+        let on_disk = self
+            .store
+            .message(&self.chat.jid, id)
+            .ok()
+            .flatten()
+            .and_then(|message| message.media_path)
+            .map(PathBuf::from)
+            .filter(|path| path.exists());
+        match on_disk {
+            Some(path) => self.viewer = Some(path),
+            None => {
+                self.open_when_ready = Some(id.to_string());
+                self.notice = Some("Downloading…".to_string());
+                self.backend.send(Command::DownloadMedia {
+                    chat: self.chat.jid.clone(),
+                    id: id.to_string(),
+                });
+            }
+        }
+        cx.notify();
     }
 }

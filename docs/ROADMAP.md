@@ -43,7 +43,7 @@ member) and in an empty test group created for the purpose, never with another p
 | Delivery ticks | Partial | Sent, delivered, read are stored and drawn; history shows all three, live only "sent" was observed. |
 | Typing indicator: send, show | Built | Sending is disabled in test runs. |
 | Presence (online, last seen) | Built | |
-| Mentions | Partial | Shown as name pills. Cannot be inserted from the composer. |
+| Mentions | Built | Shown as name pills. In a group, typing `@` lists the members; picking one sends a real mention. The send has not been exercised (the test groups have no other member to mention). |
 | Formatting (bold, italic, strike, code), links | Verified | Unit tests. |
 | Link previews | Partial | Shown for received and stored messages. Not generated when sending a link. |
 | Polls | Verified | Create (`/poll Question \| A \| B` in the composer), show, vote. Gaps: no dialog for creating one, and other people's votes that arrive live are not decoded yet (votes in history are). |
@@ -69,12 +69,13 @@ member) and in an empty test group created for the purpose, never with another p
 | Voice messages and audio: play in app | Verified (player) / Built (control) | The player was checked on this PC with a real voice message. The play button and progress bar in the conversation were not clicked. |
 | Voice messages: record | Not done | Needs an Opus encoder. |
 | Media that expired on the server | Verified | Re-requested from the phone, then downloaded. |
-| Stickers: show | Built | First frame only for animated ones. |
-| Stickers: send, picker | Not done | |
+| Stickers: show | Verified | First frame only for animated ones. |
+| Stickers: send | Verified | |
+| Sticker picker | Built | Lists stickers already downloaded to this PC. No favourites, no sticker packs. |
 | Video: play in app | Not done | Downloads, then opens in the default player. |
 | GIFs: play in app | Not done | Shown as a still. |
 | Documents: open | Built | Downloads and opens with the default app. |
-| Albums | Partial | Photos are shown one under another, not as a grid. |
+| Albums | Built | Photos sent together are shown as a two-column grid. Videos in an album are still listed separately. |
 | Paste an image, camera | Not done | |
 
 ## Chats, contacts, groups
@@ -104,7 +105,7 @@ member) and in an empty test group created for the purpose, never with another p
 | --- | --- | --- |
 | Calls list | Verified | 197 calls from history, with direction, duration and missed state. |
 | Voice and video calls | Not done | The library handles the call protocol. Microphone, camera, playback and video coding are the app's job and are not started. The call buttons say so. |
-| Incoming call notice | Not done | |
+| Incoming call notice | Built | A Windows notification says who is calling and to answer on the phone. No ringing screen, no decline button. |
 | Status: view | Built | Text and photo statuses of the last 24 hours; other media open in the default player. Viewing does not send a "seen" receipt. |
 | Status: post, reply | Not done | |
 | Settings: profile, dark / light, data folder, log out | Built | |
@@ -131,7 +132,7 @@ rows, roomy menus. Known differences:
 
 Left behind by the checks, all clearly labelled:
 
-- In "Dosyalar": one edited test message, one test reply, one test poll, and four
-  "This message was deleted" markers.
+- In "Dosyalar": one edited test message, one test reply, one test poll, one sticker,
+  and four "This message was deleted" markers.
 - A group named "wagpui test group renamed", which the account has left. It can be
   deleted from the chat list.
