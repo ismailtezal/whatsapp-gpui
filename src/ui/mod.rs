@@ -170,8 +170,24 @@ pub fn run() {
             }
         })
         .detach();
-        if !offscreen {
+if !offscreen {
             cx.activate(true);
+        }
+        // Development aid: WA_EXIT_AFTER=<seconds> quits the app by itself, the same way
+        // closing it does, so a start-up check never needs to kill it.
+        if let Some(seconds) = std::env::var("WA_EXIT_AFTER").ok().and_then(|value| value.parse::<u64>().ok()) {
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(seconds))
+                    .await;
+                let _ = cx.update(|cx| {
+                    if let Some(tray) = crate::tray::current() {
+                        tray.remove();
+                    }
+                    cx.quit();
+                });
+            })
+            .detach();
         }
     });
 }

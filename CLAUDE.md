@@ -97,6 +97,10 @@ connection. Windows only. Private now, open source later.
   as `Style`; `WA_STYLE`, `WA_BACKDROP`, `WA_PALETTE` and `WA_THEME` override the stored
   choice for a dev run. `WA_FAKE_CALL=ringing|calling|connected` shows the call card; `WA_PLAY_VIDEO=1` opens
   the newest downloaded video of the opened chat in the viewer.
+- To check the real start-up path (tray, database check, backup, connection) without
+  killing anything: `WA_READONLY=1 WA_OFFSCREEN=1 WA_MUTE=1 WA_EXIT_AFTER=35
+  target/release/whatsapp-gpui.exe`. It quits by itself; exit code 0 and a fresh file in
+  `backups` mean it worked. Only while the owner's copy is not running.
 - `whatsapp-rust` is built with its `voip` feature, which compiles the native Opus
   library with CMake. On this PC CMake came from winget and `.cargo/config.toml` (not
   committed) points Cargo at it.
