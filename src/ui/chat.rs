@@ -308,6 +308,7 @@ impl ChatView {
         let mut previous: Option<&MsgRow> = None;
         let mut previous_day = i64::MIN;
         let mut skip_to = 0usize;
+        let mut missing_previews: Vec<std::path::PathBuf> = Vec::new();
         for (index, row) in rows.iter().enumerate() {
             if index < skip_to {
                 continue;
@@ -324,7 +325,17 @@ impl ChatView {
             }
 
             let record = record_of(row);
-            let (media, view_once) = media_of(&record);
+            let (mut media, view_once) = media_of(&record);
+            if matches!(row.kind, MsgKind::Video | MsgKind::Gif | MsgKind::VideoNote)
+                && let Some(file) = &row.media_path
+            {
+                let preview = crate::thumbs::thumb_path(std::path::Path::new(file));
+                if preview.exists() {
+                    media.thumb_file = Some(preview);
+                } else if self.requested.insert(format!("thumb:{}", row.id)) {
+                    missing_previews.push(std::path::PathBuf::from(file));
+                }
+            }
             let (author_seed, author) = self.author_of(row);
             let notice = if row.kind == MsgKind::System {
                 let store = self.store.clone();
@@ -414,7 +425,10 @@ impl ChatView {
 
             // Photos and stickers load by themselves, like the official client; larger
             // media waits for a click.
-            if matches!(row.kind, MsgKind::Image | MsgKind::Sticker)
+            // Photos, stickers, GIFs and smaller videos load by themselves.
+            let auto = matches!(row.kind, MsgKind::Image | MsgKind::Sticker | MsgKind::Gif)
+                || (row.kind == MsgKind::Video && media.file_size <= 16 * 1024 * 1024);
+            if auto
                 && row.media_path.is_none()
                 && !view_once
                 && self.requested.insert(row.id.clone())
@@ -482,6 +496,21 @@ impl ChatView {
                 avatar,
             })));
             previous = Some(row);
+        }
+
+        // Videos downloaded before previews existed get theirs made in the background.
+        if !missing_previews.is_empty() {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .spawn(async move {
+                        for video in missing_previews {
+                            let _ = crate::thumbs::make_video_thumb(&video);
+                        }
+                    })
+                    .await;
+                let _ = this.update(cx, |this, cx| this.reload(cx));
+            })
+            .detach();
         }
 
         let old_count = self.list.item_count();

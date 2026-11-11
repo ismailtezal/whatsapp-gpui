@@ -72,8 +72,9 @@ member) and in an empty test group created for the purpose, never with another p
 | Stickers: show | Verified | First frame only for animated ones. |
 | Stickers: send | Verified | |
 | Sticker picker | Built | Lists stickers already downloaded to this PC. No favourites, no sticker packs. |
-| Video: play in app | Not done | Downloads, then opens in the default player. |
-| GIFs: play in app | Not done | Shown as a still. |
+| Video and GIF previews | Verified | GIFs and videos up to 16 MB download on view; Windows makes the preview picture. |
+| Video: play in app | Not done | A click opens it in the default player. |
+| GIFs: play in app | Not done | Shown as a still preview; a click opens the default player. |
 | Documents: open | Built | Downloads and opens with the default app. |
 | Albums | Built | Photos sent together are shown as a two-column grid. Videos in an album are still listed separately. |
 | Paste an image, camera | Not done | |

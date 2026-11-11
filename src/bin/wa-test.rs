@@ -439,6 +439,38 @@ fn main() -> Result<()> {
                 wait_ack(&store, &chat, &sent.id, Duration::from_secs(30))?
             );
         }
+        "fetch" => {
+            // Download-only: fetch the newest message of a kind (gif, video, sticker, …)
+            // from any chat and print where it was saved.
+            let wanted = args.get(1).map(String::as_str).unwrap_or("gif").to_lowercase();
+            let mut found = None;
+            'chats: for chat in store.chats(false)? {
+                for msg in store.messages(&chat.jid, None, 400)?.into_iter().rev() {
+                    if format!("{:?}", msg.kind).to_lowercase() == wanted {
+                        found = Some((chat.jid.clone(), msg));
+                        break 'chats;
+                    }
+                }
+            }
+            let (chat, msg) = found.ok_or_else(|| anyhow!("no {wanted} message in history"))?;
+            backend.send(Command::DownloadMedia {
+                chat,
+                id: msg.id.clone(),
+            });
+            let mut result = None;
+            let _ = wait_for(&backend, "download", Duration::from_secs(60), |event| {
+                if let UiEvent::MediaReady { path, error, .. } = event {
+                    result = Some((path.clone(), error.clone()));
+                    return true;
+                }
+                false
+            });
+            match result {
+                Some((Some(path), _)) => println!("FETCHED_PATH={path}"),
+                Some((None, error)) => println!("download failed: {error:?}"),
+                None => println!("download timed out"),
+            }
+        }
         "listen" => {
             let seconds: u64 = args.get(1).and_then(|n| n.parse().ok()).unwrap_or(15);
             let mut counts = std::collections::BTreeMap::new();

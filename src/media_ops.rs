@@ -301,6 +301,15 @@ async fn download_media(
                 None => crate::paths::media_dir().join(format!("{}.{extension}", safe_name(id))),
             };
             std::fs::write(&path, &bytes)?;
+            // Videos get a preview picture, made by Windows, so they do not show as blanks.
+            if matches!(extension.as_str(), "mp4" | "mov" | "3gp" | "m4v") {
+                let video = path.clone();
+                match tokio::task::spawn_blocking(move || crate::thumbs::make_video_thumb(&video)).await {
+                    Ok(Err(error)) => eprintln!("video preview failed: {error:#}"),
+                    Err(error) => eprintln!("video preview task failed: {error}"),
+                    Ok(Ok(_)) => {}
+                }
+            }
             let path = path.to_string_lossy().to_string();
             store.batch(|tx| tx.set_media_path(chat, id, &path))?;
             (Some(path), None)

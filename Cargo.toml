@@ -14,7 +14,7 @@ gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12" }
 gpui-kit-assets = "0.9.1"
 anyhow = "1.0.104"
 rust-embed = "8"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 ureq = "3.5"
-windows = { version = "0.62", features = ["Media_Playback", "Media_Core", "Foundation"] }
+windows = { version = "0.62", features = ["Media_Playback", "Media_Core", "Foundation", "Storage", "Storage_FileProperties", "Storage_Streams"] }
 sha2 = "0.10"

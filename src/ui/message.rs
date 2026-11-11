@@ -46,6 +46,8 @@ pub struct Media {
     pub file_size: u64,
     pub mime: Option<String>,
     pub page_count: Option<u32>,
+    /// A preview picture on disk (made for downloaded videos).
+    pub thumb_file: Option<std::path::PathBuf>,
 }
 
 /// A stored message with everything the row needs resolved.
@@ -260,6 +262,7 @@ fn picture(view: &MsgView, t: &Tokens, overlay: Option<&'static str>) -> Div {
         .as_ref()
         .filter(|_| view.row.kind == MsgKind::Image)
         .map(|path| gpui::img(std::path::PathBuf::from(path)))
+        .or_else(|| view.media.thumb_file.clone().map(gpui::img))
         .or_else(|| view.media.thumb.clone().map(gpui::img));
     if let Some(image) = source {
         frame = frame.child(
