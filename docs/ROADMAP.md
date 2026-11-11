@@ -119,9 +119,13 @@ member) and in an empty test group created for the purpose, never with another p
 
 ## Design
 
-The interface follows `docs/design-spec.md` (diskurt's modern design): frameless window
-with a 32px title bar, rail, floating main panel, Figtree, translucent fills, flat message
-rows, roomy menus. Known differences:
+The interface takes its design tokens from `docs/design-spec.md` (diskurt's modern
+design): colours, Figtree, radii, spacing, translucent fills, the frameless window with a
+32px title bar, the rail, the floating main panel and roomy menus. The conversation
+itself keeps WhatsApp's shape, at the owner's request: bubbles, own messages on the
+right in the accent tint, others on the left, time and ticks inside the bubble, names
+and pictures on other people's bubbles in groups, centred date and notice pills.
+Known differences from the spec:
 
 - The chat column is 320px, not 248px, to fit two-line rows with previews.
 - Chat rows show a preview and a time; diskurt's rows have neither, so this follows the

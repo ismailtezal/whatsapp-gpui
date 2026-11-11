@@ -11,7 +11,7 @@ use gpui::{
 };
 use whatsapp_rust::buffa::Message as _;
 
-use super::theme::{GUTTER, R_LG, R_MD, Tokens, tokens};
+use super::theme::{R_LG, R_MD, R_XL, Tokens, tokens};
 use super::widgets::{avatar, clock, duration, file_size, header_time, icon, tint_of};
 use crate::content::{self, preview_label};
 use crate::model::{Ack, MsgKind, MsgRow};
@@ -68,6 +68,8 @@ pub struct MsgView {
     pub rich: Option<Rich>,
     pub avatar: Option<std::path::PathBuf>,
     pub poll: Option<crate::polls::PollView>,
+    /// Whether the chat is a group (other people's bubbles then show a name and picture).
+    pub group: bool,
     pub extras: Extras,
     /// Further photos shown in the same grid as this one: (message ID, file on disk).
     pub album: Vec<(String, Option<String>)>,
@@ -765,254 +767,305 @@ fn content(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> Div {
         column = column.child(link_card(link, key, t));
     }
 
-    if !view.reactions.is_empty() {
-        let mut chips = div().flex().flex_wrap().gap(px(4.)).mt(px(2.));
-        for chip in &view.reactions {
-            let (border, fill, color) = if chip.mine {
-                (t.tint(0.45), t.tint(0.12), t.primary)
-            } else {
-                (gpui::transparent_black(), t.fg(0.06), t.muted_foreground)
-            };
-            chips = chips.child(
-                div()
-                    .h(px(28.))
-                    .px(px(8.))
-                    .rounded_full()
-                    .border_1()
-                    .border_color(border)
-                    .bg(fill)
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(div().text_size(px(14.)).child(chip.emoji.clone()))
-                    .when(chip.count > 1, |this| {
-                        this.child(
-                            div()
-                                .text_size(px(12.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(color)
-                                .child(chip.count.to_string()),
-                        )
-                    }),
-            );
-        }
-        column = column.child(chips);
-    }
     column
 }
 
-/// A centred-gutter notice line ("X added Y", "Missed voice call").
-fn notice_row(view: &MsgView, text: &str, t: &Tokens) -> AnyElement {
+/// The reaction chips that hang off the bottom of a bubble.
+fn reaction_chips(view: &MsgView, t: &Tokens) -> Option<Div> {
+    if view.reactions.is_empty() {
+        return None;
+    }
+    let mut chips = div().flex().flex_wrap().gap(px(4.)).mt(px(-6.)).px(px(6.));
+    for chip in &view.reactions {
+        let (border, color) = if chip.mine {
+            (t.tint(0.45), t.primary)
+        } else {
+            (t.fg(0.10), t.muted_foreground)
+        };
+        chips = chips.child(
+            div()
+                .h(px(24.))
+                .px(px(7.))
+                .rounded_full()
+                .border_1()
+                .border_color(border)
+                // Opaque, so the chip reads as sitting on top of the bubble's edge.
+                .bg(t.popover)
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .child(div().text_size(px(13.)).child(chip.emoji.clone()))
+                .when(chip.count > 1, |this| {
+                    this.child(
+                        div()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color)
+                            .child(chip.count.to_string()),
+                    )
+                }),
+        );
+    }
+    Some(chips)
+}
+
+/// A centred notice ("X added Y", "Missed voice call"), as WhatsApp shows them.
+fn notice_row(text: &str, t: &Tokens) -> AnyElement {
     let (name, color) = if text.contains("Missed") {
         ("phone-missed", t.destructive)
     } else if text.contains("end-to-end") {
         ("lock", t.muted_foreground)
     } else if text.contains("removed") || text.contains("left") {
-        ("user-minus", t.destructive)
+        ("user-minus", t.muted_foreground)
     } else if text.contains("added") || text.contains("joined") {
-        ("user-plus", t.online)
+        ("user-plus", t.muted_foreground)
     } else {
         ("info", t.muted_foreground)
     };
     div()
         .w_full()
-        .relative()
-        .pl(GUTTER)
-        .pr(px(48.))
+        .px(px(48.))
         .py(px(4.))
-        .mt(px(8.))
+        .flex()
+        .justify_center()
         .child(
             div()
-                .absolute()
-                .left_0()
-                .top(px(6.))
-                .w(GUTTER)
+                .max_w(px(520.))
+                .px(px(10.))
+                .py(px(4.))
+                .rounded(R_LG)
+                .bg(t.fg(0.05))
                 .flex()
-                .justify_center()
-                .text_color(color)
-                .child(icon(name).size(px(14.))),
-        )
-        .child(
-            div()
-                .text_size(px(13.))
-                .line_height(px(18.))
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(12.))
+                .line_height(px(17.))
                 .text_color(t.muted_foreground)
-                .child(SharedString::from(format!(
-                    "{text}  ·  {}",
-                    header_time(view.row.ts)
-                ))),
+                .child(icon(name).size(px(12.)).text_color(color))
+                .child(div().min_w_0().child(SharedString::from(text.to_string()))),
         )
         .into_any_element()
 }
 
-/// Draws one message row.
+/// The time, ticks and small marks at the bottom right of a bubble.
+fn footer(view: &MsgView, t: &Tokens) -> Div {
+    let row = &view.row;
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .gap(px(4.))
+        .text_size(px(11.))
+        .line_height(px(14.))
+        .text_color(Tokens::with_alpha(t.muted_foreground, 0.9))
+        .when(row.starred, |this| {
+            this.child(icon("star").size(px(10.)).text_color(t.idle))
+        })
+        .when(row.edited, |this| this.child("Edited"))
+        .child(clock(row.ts))
+        .when(row.from_me, |this| this.child(ticks(row.ack, t)))
+}
+
+/// Draws one message as a WhatsApp bubble: ours on the right, theirs on the left, with
+/// the time and ticks inside. Colours, radii and type come from the design tokens.
 pub fn message_row(view: &MsgView, hooks: &RowHooks, cx: &App) -> AnyElement {
     let t = tokens(cx);
     let row = &view.row;
 
     if row.kind == MsgKind::System {
         return match view.notice.as_deref() {
-            Some(text) => notice_row(view, text, t),
+            Some(text) => notice_row(text, t),
             None => div().into_any_element(),
         };
     }
 
-    let hover = t.fg(0.03);
-    let mut outer = div()
-        .w_full()
-        .relative()
-        .pl(GUTTER)
-        .pr(px(48.))
-        .hover(move |style| style.bg(hover));
-    outer = if view.head {
-        outer.mt(px(12.)).pt(px(2.)).pb(px(1.))
-    } else {
-        outer.py(px(1.))
-    };
+    let mine = row.from_me;
+    // Stickers stand alone, without a bubble behind them.
+    let bare = row.kind == MsgKind::Sticker && !view.view_once;
+    let fill = if mine { t.tint(0.16) } else { t.fg(0.06) };
+    let name_color = tint_of(&view.author_seed, t.dark).1;
+
+    let mut bubble = div()
+        .max_w(px(560.))
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(3.))
+        .rounded(R_XL);
+    if !bare {
+        bubble = bubble.bg(fill).px(px(9.)).pt(px(6.)).pb(px(5.));
+        // The first bubble of a run gets a tighter corner on its own side, like a tail.
+        if view.head {
+            bubble = if mine {
+                bubble.rounded_tr(px(4.))
+            } else {
+                bubble.rounded_tl(px(4.))
+            };
+        }
+    }
+
+    // In a group, the first bubble of someone else's run carries their name.
+    if view.group && !mine && view.head && !bare {
+        bubble = bubble.child(
+            div()
+                .text_size(px(13.))
+                .line_height(px(17.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(name_color)
+                .child(view.author.clone()),
+        );
+    }
+
+    if row.forwarded {
+        bubble = bubble.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .text_size(px(11.))
+                .italic()
+                .text_color(t.muted_foreground)
+                .child(icon("forward").size(px(11.)))
+                .child("Forwarded"),
+        );
+    }
 
     if let Some(quote) = &view.quote {
-        let (_, name_color) = tint_of(&quote.author_seed, t.dark);
-        let line = div()
+        let quoted_color = if quote.author_seed.is_empty() {
+            t.muted_foreground
+        } else {
+            tint_of(&quote.author_seed, t.dark).1
+        };
+        let block = div()
+            .rounded(R_MD)
+            .bg(t.fg(0.07))
+            .overflow_hidden()
             .flex()
-            .items_center()
-            .gap(px(6.))
-            .mb(px(2.))
-            .text_size(px(12.))
-            .text_color(t.muted_foreground)
-            .child(icon("corner-up-left").size(px(12.)))
+            .child(div().w(px(3.)).flex_shrink_0().bg(quoted_color))
             .child(
                 div()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(name_color)
-                    .flex_shrink_0()
-                    .child(quote.author.clone()),
-            )
-            .child(div().truncate().child(quote.text.clone()));
-        outer = outer.child(clickable(line, ("quote", view.row.rowid as usize), &hooks.quote));
-    }
-
-    if view.head {
-        let (_, name_color) = tint_of(&view.author_seed, t.dark);
-        outer = outer
-            .child(
-                div()
-                    .absolute()
-                    .left(px(16.))
-                    .top(px(if view.quote.is_some() { 22. } else { 2. }))
-                    .child(avatar(&view.author_seed, &view.author, 32., view.avatar.clone(), cx)),
-            )
-            .child(
-                div()
+                    .min_w_0()
+                    .px(px(8.))
+                    .py(px(4.))
                     .flex()
-                    .items_baseline()
-                    .gap(px(8.))
-                    .h(px(20.))
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(if row.from_me { t.foreground } else { name_color })
-                            .child(view.author.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(t.muted_foreground)
-                            .child(header_time(row.ts)),
-                    )
-                    .when(row.from_me, |this| this.child(ticks(row.ack, t)))
-                    .when(row.starred, |this| {
-                        this.child(icon("star").size(px(11.)).text_color(t.idle))
-                    })
-                    .when(row.forwarded, |this| {
+                    .flex_col()
+                    .when(!quote.author.is_empty(), |this| {
                         this.child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap(px(4.))
-                                .text_size(px(11.))
-                                .italic()
-                                .text_color(t.muted_foreground)
-                                .child(icon("forward").size(px(11.)))
-                                .child("Forwarded"),
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(quoted_color)
+                                .child(quote.author.clone()),
                         )
-                    }),
+                    })
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(t.muted_foreground)
+                            .child(quote.text.clone()),
+                    ),
             );
-    } else {
-        // Continued message: the short time sits in the gutter.
-        outer = outer.child(
-            div()
-                .absolute()
-                .left_0()
-                .top(px(4.))
-                .w(GUTTER)
-                .flex()
-                .justify_center()
-                .items_center()
-                .gap(px(3.))
-                .text_size(px(10.))
-                .text_color(Tokens::with_alpha(t.muted_foreground, 0.7))
-                .child(clock(row.ts))
-                .when(row.from_me, |this| this.child(ticks(row.ack, t))),
-        );
+        bubble = bubble.child(clickable(block, ("quote", row.rowid as usize), &hooks.quote));
     }
 
-    let mut body = content(view, hooks, t);
-    if row.edited {
-        body = body.child(
+    // A short line of plain text shares its line with the time, as WhatsApp does.
+    let short_text = row.kind == MsgKind::Text
+        && view.extras.link.is_none()
+        && row
+            .text
+            .as_deref()
+            .is_some_and(|text| !text.contains('\n') && text.chars().count() <= 42);
+    let body = content(view, hooks, t);
+    bubble = if short_text {
+        bubble.child(
             div()
-                .text_size(px(10.))
-                .text_color(t.muted_foreground)
-                .child("(edited)"),
-        );
+                .flex()
+                .items_end()
+                .justify_between()
+                .gap(px(10.))
+                .child(body)
+                .child(footer(view, t)),
+        )
+    } else {
+        bubble
+            .child(body)
+            .child(div().flex().justify_end().child(footer(view, t)))
+    };
+
+    let mut stack = div()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .when(mine, |this| this.items_end())
+        .when(!mine, |this| this.items_start())
+        .child(bubble);
+    if let Some(chips) = reaction_chips(view, t) {
+        stack = stack.child(chips);
     }
-    outer.child(body).into_any_element()
+
+    let mut line = div()
+        .w_full()
+        .px(px(16.))
+        .flex()
+        .gap(px(8.))
+        .when(mine, |this| this.justify_end())
+        .mt(px(if view.head { 8. } else { 2. }));
+    // Other people's bubbles in a group sit beside their picture.
+    if view.group && !mine {
+        line = line.child(if view.head {
+            avatar(&view.author_seed, &view.author, 28., view.avatar.clone(), cx)
+        } else {
+            div().w(px(28.)).flex_shrink_0()
+        });
+    }
+    line.child(stack).into_any_element()
 }
 
-/// A date separator: a rule each side of a centred label.
+/// A date separator: a centred pill, as WhatsApp shows it.
 pub fn day_separator(label: String, cx: &App) -> AnyElement {
     let t = tokens(cx);
     div()
         .w_full()
-        .px(px(16.))
-        .py(px(12.))
+        .py(px(10.))
         .flex()
-        .items_center()
-        .gap(px(8.))
-        .child(div().flex_1().h(px(1.)).bg(t.border))
+        .justify_center()
         .child(
             div()
+                .h(px(24.))
+                .px(px(10.))
+                .rounded(R_LG)
+                .bg(t.fg(0.06))
+                .flex()
+                .items_center()
                 .text_size(px(11.))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(t.muted_foreground)
                 .child(label),
         )
-        .child(div().flex_1().h(px(1.)).bg(t.border))
         .into_any_element()
 }
 
-/// The "New" line marking where unread messages start.
+/// The marker where unread messages start.
 pub fn unread_separator(cx: &App) -> AnyElement {
     let t = tokens(cx);
     div()
         .w_full()
-        .px(px(16.))
-        .py(px(4.))
+        .py(px(8.))
         .flex()
-        .items_center()
-        .gap(px(8.))
+        .justify_center()
         .child(
             div()
-                .flex_1()
-                .h(px(1.))
-                .bg(Tokens::with_alpha(t.destructive, 0.6)),
-        )
-        .child(
-            div()
-                .text_size(px(10.))
+                .h(px(24.))
+                .px(px(12.))
+                .rounded_full()
+                .bg(t.tint(0.12))
+                .flex()
+                .items_center()
+                .text_size(px(11.))
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(t.destructive)
-                .child("New"),
+                .text_color(t.primary)
+                .child("Unread messages"),
         )
         .into_any_element()
 }

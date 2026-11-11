@@ -512,6 +512,7 @@ impl ChatView {
                 media,
                 notice,
                 view_once,
+                group: self.chat.kind != ChatKind::User,
                 album,
                 extras: super::message::extras_of(&record),
                 poll: if row.kind == MsgKind::Poll {
@@ -856,8 +857,9 @@ impl ChatView {
         let hover = if t.dark { t.accent } else { t.muted };
         let mut toolbar = div()
             .absolute()
-            .top(px(-14.))
-            .right(px(16.))
+            .top(px(-10.))
+            .when(view.row.from_me, |this| this.left(px(16.)))
+            .when(!view.row.from_me, |this| this.right(px(16.)))
             .invisible()
             .group_hover("row", |style| style.visible())
             .flex()

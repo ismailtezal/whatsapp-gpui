@@ -66,9 +66,9 @@ Deleting the folder unlinks nothing by itself; use Settings, Log out, to unlink 
 
 ## Design
 
-The look follows the "modern" design of diskurt: a frameless window with a slim title
-bar, a rail, a floating main panel, the Figtree typeface, translucent fills and flat
-message rows.
+The look uses the design tokens of diskurt's "modern" design: a frameless window with a
+slim title bar, a rail, a floating main panel, the Figtree typeface and translucent
+fills. The conversation keeps WhatsApp's shape: bubbles, with your messages on the right.
 
 ## Credits
 

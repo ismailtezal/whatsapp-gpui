@@ -16,8 +16,11 @@ connection. Windows only. Private now, open source later.
   mark the owner's real chats as read from test runs: set `WA_READONLY=1`, which disables
   read receipts, typing and presence. Never add, remove or promote real people in groups.
 - **Do not play audio during unattended tests** (it comes out of the owner's speakers).
-- **Design:** copy the "modern" design of the owner's other project, diskurt
-  (`C:\Projects\diskurt`, read-only). The extracted spec is `docs/design-spec.md`.
+- **Design:** take the design tokens (colours, type, radii, spacing, surfaces, menus) of
+  the "modern" design of the owner's other project, diskurt (`C:\Projects\diskurt`,
+  read-only; extracted spec in `docs/design-spec.md`). **Tokens only:** the chat
+  experience must stay WhatsApp's (bubbles, own messages on the right, time and ticks
+  inside the bubble). The owner rejected diskurt's flat Slack-like message rows.
 
 ## Layout
 
