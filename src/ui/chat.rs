@@ -107,6 +107,8 @@ pub struct ChatView {
     forward_targets: Vec<ChatRow>,
     /// ID of the own message whose receipts are being shown.
     info_for: Option<String>,
+    /// When the typing indicator was last sent, to avoid sending it on every keystroke.
+    typing_sent: Option<std::time::Instant>,
     /// People picked from the mention list: (name shown, JID).
     mention_map: Vec<(String, String)>,
     /// Where the sticker picker is anchored while it is open.
@@ -149,7 +151,7 @@ impl ChatView {
         cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
             InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
             InputEvent::Change => {
-                this.typing_changed(cx);
+                this.typing_tick(cx);
                 cx.notify();
             }
             _ => {}
@@ -195,6 +197,7 @@ impl ChatView {
             forwarding: None,
             forward_targets: Vec::new(),
             info_for: None,
+            typing_sent: None,
             mention_map: Vec::new(),
             stickers_at: None,
             sticker_choices: Vec::new(),
@@ -661,6 +664,7 @@ impl ChatView {
         }
     }
 
+    #[allow(dead_code)]
     fn typing_changed(&mut self, cx: &mut Context<Self>) {
         let has_text = !self.input.read(cx).value().trim().is_empty();
         self.backend.send(Command::Typing {
@@ -706,6 +710,7 @@ impl ChatView {
         }
         self.input.update(cx, |input, cx| input.set_value("", window, cx));
         self.unread_at_open = 0;
+        self.typing_sent = None;
         cx.notify();
     }
 
@@ -2936,5 +2941,31 @@ impl ChatView {
             }
         }
         cx.notify();
+    }
+}
+
+impl ChatView {
+    /// Tells the other side we are typing, at most once every few seconds, and that we
+    /// stopped when the box is emptied.
+    fn typing_tick(&mut self, cx: &mut Context<Self>) {
+        const REPEAT: std::time::Duration = std::time::Duration::from_secs(8);
+        let has_text = !self.input.read(cx).value().trim().is_empty();
+        let now = std::time::Instant::now();
+        let activity = match (has_text, self.typing_sent) {
+            (true, Some(at)) if now.duration_since(at) < REPEAT => return,
+            (true, _) => {
+                self.typing_sent = Some(now);
+                Activity::Typing
+            }
+            (false, Some(_)) => {
+                self.typing_sent = None;
+                Activity::Idle
+            }
+            (false, None) => return,
+        };
+        self.backend.send(Command::Typing {
+            chat: self.chat.jid.clone(),
+            activity,
+        });
     }
 }

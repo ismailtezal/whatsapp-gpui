@@ -121,6 +121,10 @@ impl Shell {
         .detach();
         cx.observe_window_activation(window, |this, window, _cx| {
             this.window_active = window.is_window_active();
+            // Show as online only while the window is in front, like the official client.
+            this.backend.send(Command::SetPresence {
+                online: this.window_active,
+            });
             if this.window_active
                 && let Some(chat) = this.selected.clone()
             {

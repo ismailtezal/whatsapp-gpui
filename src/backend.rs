@@ -129,6 +129,9 @@ async fn run(
                 for update in ingest::apply(&store, &event) {
                     let _ = events.send(update).await;
                 }
+                for chat in decode_poll_votes(&client, &store, &event).await {
+                    let _ = events.send(UiEvent::ChatChanged { chat }).await;
+                }
             }
         })
         .build()
@@ -861,4 +864,83 @@ async fn execute(
     }
     let _ = bare_jid;
     Ok(())
+}
+
+/// Decodes poll votes that arrive live (they are encrypted to the poll's creator and
+/// voters) and stores them. Returns the chats whose polls changed.
+async fn decode_poll_votes(client: &Arc<Client>, store: &Arc<Store>, event: &Event) -> Vec<String> {
+    use whatsapp_rust::wacore::poll::PollVoteCiphertext;
+    let Event::Messages(batch) = event else {
+        return Vec::new();
+    };
+    let mut touched = Vec::new();
+    for inbound in batch.iter() {
+        let (base, _, _) = crate::content::unwrap(&inbound.message);
+        let Some(update) = base.poll_update_message.as_option() else {
+            continue;
+        };
+        let (Some(key), Some(vote)) = (
+            update.poll_creation_message_key.as_option(),
+            update.vote.as_option(),
+        ) else {
+            continue;
+        };
+        let Some(poll_id) = key.id.as_deref() else {
+            continue;
+        };
+        let Ok(chat) = store.canonical(&inbound.info.source.chat.to_non_ad_string()) else {
+            continue;
+        };
+        let Ok(Some(record)) = store.record(&chat, poll_id) else {
+            continue;
+        };
+        let Some(secret) = crate::polls::secret(&record) else {
+            continue;
+        };
+        let Ok(secret_bytes) = <[u8; 32]>::try_from(secret.as_slice()) else {
+            continue;
+        };
+        let Ok((chat_jid, sender, from_me)) = target_parts(&record, &chat) else {
+            continue;
+        };
+        let creator = if from_me {
+            match client.pn() {
+                Some(pn) => pn,
+                None => continue,
+            }
+        } else {
+            sender.clone().unwrap_or_else(|| chat_jid.clone())
+        };
+        let Ok(message_id) = MessageId::new(poll_id) else {
+            continue;
+        };
+        let Ok(target) = MessageRef::new(&chat_jid, message_id, sender.as_ref(), from_me) else {
+            continue;
+        };
+        let secret = whatsapp_rust::MessageSecret::from_bytes(secret_bytes);
+        let Ok(poll) = whatsapp_rust::PollRef::new(target, &creator, &secret) else {
+            continue;
+        };
+        let voter_jid = inbound.info.source.sender.to_non_ad();
+        let ciphertext = PollVoteCiphertext {
+            enc_payload: vote.enc_payload.as_ref().map(|bytes| &bytes[..]).unwrap_or(&[]),
+            enc_iv: vote.enc_iv.as_ref().map(|bytes| &bytes[..]).unwrap_or(&[]),
+        };
+        if let Ok(picked) = client.polls().decrypt_vote(ciphertext, &poll, &voter_jid).await {
+            let voter = if inbound.info.source.is_from_me {
+                "me".to_string()
+            } else {
+                voter_jid.to_string()
+            };
+            let hashes: Vec<String> = picked.iter().map(|hash| crate::polls::hex(hash)).collect();
+            let at = inbound.info.timestamp.timestamp();
+            if store
+                .batch(|tx| tx.put_poll_vote(&chat, poll_id, &voter, &hashes, at))
+                .is_ok()
+            {
+                touched.push(chat);
+            }
+        }
+    }
+    touched
 }

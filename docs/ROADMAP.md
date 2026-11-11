@@ -41,12 +41,12 @@ member) and in an empty test group created for the purpose, never with another p
 | Message info (who received and read) | Built | From stored receipts. |
 | Read receipts (blue ticks) | Built | Test runs set `WA_READONLY=1`, so none has been sent for real. |
 | Delivery ticks | Partial | Sent, delivered, read are stored and drawn; history shows all three, live only "sent" was observed. |
-| Typing indicator: send, show | Built | Sending is disabled in test runs. |
-| Presence (online, last seen) | Built | |
+| Typing indicator: send, show | Built | Sent at most once every 8 seconds while typing. Sending is disabled in test runs. |
+| Presence (online, last seen) | Built | The account shows as online only while the window is in front. |
 | Mentions | Built | Shown as name pills. In a group, typing `@` lists the members; picking one sends a real mention. The send has not been exercised (the test groups have no other member to mention). |
 | Formatting (bold, italic, strike, code), links | Verified | Unit tests. |
 | Link previews | Partial | Shown for received and stored messages. Not generated when sending a link. |
-| Polls | Verified | Create (`/poll Question \| A \| B` in the composer), show, vote. Gaps: no dialog for creating one, and other people's votes that arrive live are not decoded yet (votes in history are). |
+| Polls | Verified | Create (`/poll Question \| A \| B` in the composer), show, vote. Gaps: no dialog for creating one. Decoding of other people's votes as they arrive is built but unproven, since nobody else could vote in the test group (votes in history are read). |
 | Events | Not done | Shown as a card with the name only. |
 | Location | Partial | Card that opens the place in the browser's maps. No sending, no live location. |
 | Contact cards | Partial | Card with a "message" action. No sending. |
