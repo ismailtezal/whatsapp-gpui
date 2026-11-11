@@ -29,6 +29,8 @@ use windows::core::{PCWSTR, w};
 const WM_TRAY: u32 = WM_APP + 1;
 /// Sent by the main thread: the unread count changed (count in `wParam`).
 const WM_UNREAD: u32 = WM_APP + 2;
+/// Sent by a second copy of the app that was started while this one runs: show the window.
+const WM_SHOW: u32 = WM_APP + 3;
 const MENU_OPEN: usize = 1;
 const MENU_QUIT: usize = 2;
 
@@ -229,6 +231,10 @@ unsafe extern "system" fn window_proc(window: HWND, message: u32, wparam: WPARAM
                 let count = wparam.0 as u32;
                 let _ = Shell_NotifyIconW(NIM_MODIFY, &icon_data(window, app_icon(), count));
                 set_taskbar_badge(count);
+                LRESULT(0)
+            }
+            WM_SHOW => {
+                show_main_window();
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -437,5 +443,32 @@ mod tests {
         assert_ne!(&two[far_left..far_left + 4], &[255, 255, 255, 255]);
         // More than 99 is shown as 99, not something wider.
         assert_eq!(badge_pixels(250), badge_pixels(99));
+    }
+}
+
+/// Makes sure only one copy of the app runs. Two copies would share one linked-device
+/// connection and knock each other off it, so nothing would send.
+///
+/// Returns true for the first copy. A later copy asks the first to show its window
+/// (it may be hidden behind the tray icon) and gets false: it must exit at once.
+pub fn claim_single_instance() -> bool {
+    use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowExW;
+    // SAFETY: plain Win32 calls. The mutex handle is kept for the life of the process on
+    // purpose: Windows releases it when the process ends.
+    unsafe {
+        let mutex = CreateMutexW(None, true, w!("Local\\whatsapp-gpui-single-instance"));
+        let already = GetLastError() == ERROR_ALREADY_EXISTS;
+        // The handle is deliberately never closed.
+        let _ = mutex;
+        if !already {
+            return true;
+        }
+        // The first copy's tray window is a message-only window, found under HWND_MESSAGE.
+        if let Ok(window) = FindWindowExW(Some(HWND_MESSAGE), None, w!("whatsapp-gpui-tray"), None) {
+            let _ = PostMessageW(Some(window), WM_SHOW, WPARAM(0), LPARAM(0));
+        }
+        false
     }
 }

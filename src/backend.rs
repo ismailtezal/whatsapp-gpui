@@ -84,7 +84,12 @@ impl Backend {
     }
 
     pub fn send(&self, command: Command) {
-        let _ = self.commands.send(command);
+        if self.commands.send(command).is_err() {
+            // The connection thread has ended; say so instead of dropping the request.
+            let _ = self.announce.try_send(UiEvent::Error(
+                "Not connected: that could not be done. Close WhatsApp completely (Quit in the tray icon's menu) and start it again.".to_string(),
+            ));
+        }
     }
 
     pub fn events(&self) -> async_channel::Receiver<UiEvent> {

@@ -42,6 +42,11 @@ impl AssetSource for Assets {
 
 /// Opens the main window and runs until it is closed.
 pub fn run() {
+    // Only one copy may run: a second one shows the first and leaves. Test copies, which
+    // never connect, are exempt.
+    if std::env::var("WA_OFFLINE").is_err() && !crate::tray::claim_single_instance() {
+        return;
+    }
     // Opens the chat database, repairing it first if it is damaged.
     let (store, repair_notice) = match crate::guard::open() {
         Ok(opened) => (Arc::new(opened.store), opened.notice),
