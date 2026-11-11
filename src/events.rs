@@ -65,6 +65,8 @@ pub enum UiEvent {
         lid: Option<String>,
         push_name: String,
     },
+    /// Something happened to a call.
+    Call(CallUpdate),
     /// A channel found by its link: who it is, before deciding to follow.
     ChannelFound {
         link: String,
@@ -96,6 +98,22 @@ pub enum Attach {
     Voice,
     Document,
     Sticker,
+}
+
+/// What happened to a call, for the interface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallUpdate {
+    /// Someone is calling.
+    Ringing { call_id: String, from: String, video: bool },
+    /// We are calling someone and it is ringing there.
+    Calling { peer: String },
+    /// We answered; sound is being set up.
+    Answered,
+    /// Sound is flowing.
+    Connected,
+    Muted(bool),
+    /// The call is over (or never happened), with a few words on why.
+    Ended { reason: String },
 }
 
 /// A community and its groups, as last read from the server.
@@ -296,6 +314,14 @@ pub enum Command {
         id: String,
         text: String,
     },
+    /// Call someone (voice).
+    StartCall { chat: String },
+    /// Answer or decline a call that is ringing.
+    AnswerCall { call_id: String },
+    DeclineCall { call_id: String },
+    /// End the call in progress.
+    EndCall,
+    MuteCall { muted: bool },
     /// Read the communities this account is in, with their groups.
     SyncCommunities,
     CreateCommunity { name: String },

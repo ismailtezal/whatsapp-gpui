@@ -9,6 +9,7 @@ pub mod audio;
 pub mod avatars;
 pub mod backend;
 pub mod buffa_decode;
+pub mod calls;
 pub mod content;
 pub mod events;
 pub mod guard;

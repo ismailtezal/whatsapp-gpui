@@ -144,6 +144,7 @@ async fn run(
                 for update in ingest::apply(&store, &event) {
                     let _ = events.send(update).await;
                 }
+                crate::calls::on_event(&store, &events, &event).await;
                 for chat in decode_poll_votes(&client, &store, &event).await {
                     let _ = events.send(UiEvent::ChatChanged { chat }).await;
                 }
@@ -1011,6 +1012,12 @@ async fn execute(
             // Read the result back from the server rather than guessing it.
             Box::pin(execute(client, store, events, Command::RefreshGroup { chat })).await?;
         }
+
+        Command::StartCall { chat } => crate::calls::start(client, events, &chat).await?,
+        Command::AnswerCall { call_id } => crate::calls::answer(client, events, &call_id).await?,
+        Command::DeclineCall { call_id } => crate::calls::decline(client, events, &call_id).await?,
+        Command::EndCall => crate::calls::end(events).await?,
+        Command::MuteCall { muted } => crate::calls::mute(events, muted).await?,
 
         Command::SyncCommunities => {
             let parents = client

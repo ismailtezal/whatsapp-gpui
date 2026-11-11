@@ -1673,7 +1673,7 @@ if view.chat.kind == ChatKind::Newsletter {
                     .child(
                         icon_button("call-voice", "phone", cx)
                             .tooltip(tip("Voice call"))
-                            .on_click(cx.listener(|this, _, _, cx| this.calls_unavailable(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.start_call(cx))),
                     )
                     .child(
                         icon_button("chat-search", "search", cx)
@@ -2136,8 +2136,21 @@ impl ChatView {
             .into_any_element()
     }
 
+    /// The video button: video calls are not built yet.
     fn calls_unavailable(&mut self, cx: &mut Context<Self>) {
-        self.notice = Some("Calls are not available in this build yet".to_string());
+        self.notice = Some("Video calls are not available yet. Use the phone button for a voice call.".to_string());
+        cx.notify();
+    }
+
+    /// The phone button: calls the person of this chat.
+    fn start_call(&mut self, cx: &mut Context<Self>) {
+        if self.chat.kind == ChatKind::User {
+            self.backend.send(Command::StartCall {
+                chat: self.chat.jid.clone(),
+            });
+        } else {
+            self.notice = Some("Group calls are not available yet.".to_string());
+        }
         cx.notify();
     }
 

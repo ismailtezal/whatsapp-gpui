@@ -76,6 +76,28 @@ impl Section {
     }
 }
 
+/// The call on screen: ringing, being placed, in progress, or just ended.
+struct CallView {
+    /// Set while an incoming call rings, to answer or decline it.
+    call_id: Option<String>,
+    peer: String,
+    name: String,
+    video: bool,
+    phase: CallPhase,
+    muted: bool,
+    /// When sound started flowing, for the timer.
+    connected_at: Option<std::time::Instant>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CallPhase {
+    Ringing,
+    Calling,
+    Connecting,
+    Connected,
+    Ended(String),
+}
+
 /// A status update being written.
 struct StatusDraft {
     /// Index into [`STATUS_COLORS`] for a text status.
@@ -136,6 +158,9 @@ pub struct Shell {
     profile_name_stale: bool,
     /// Whether the app is set to start with Windows (read once at start).
     autostart: bool,
+    fake_call_shown: bool,
+    /// The call card, while there is a call to show.
+    call: Option<CallView>,
     /// Communities as last read from the server, and the create panel.
     communities: Vec<crate::events::Community>,
     community_panel: bool,
@@ -291,6 +316,8 @@ impl Shell {
             backdrop: None,
             stale_chats: false,
             stale_open_chat: false,
+            fake_call_shown: false,
+            call: None,
             communities: Vec::new(),
             community_panel: false,
             community_name,
@@ -588,6 +615,7 @@ impl Shell {
                     view.update(cx, |view, cx| view.join_requests_arrived(people, cx));
                 }
             }
+            UiEvent::Call(update) => self.on_call_update(update, cx),
             UiEvent::IncomingCall { from, video, .. } => {
                 let name = self
                     .store
@@ -597,7 +625,7 @@ impl Shell {
                     tag: SharedString::from(format!("call-{from}")),
                     title: name.into(),
                     body: format!(
-                        "Incoming {} call. Answer on your phone: calls are not available in this app yet.",
+                        "Incoming {} call. Open WhatsApp to answer.",
                         if video { "video" } else { "voice" }
                     )
                     .into(),
@@ -2271,6 +2299,31 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::perf::frame();
         let _perf = crate::perf::scope("shell.render");
+        // Development aid: WA_FAKE_CALL=ringing, calling or connected shows the call card
+        // without any call, for screenshots.
+        if !self.fake_call_shown
+            && let Ok(kind) = std::env::var("WA_FAKE_CALL")
+        {
+            use crate::events::CallUpdate;
+            self.fake_call_shown = true;
+            let peer = self.chats.first().map(|chat| chat.jid.clone()).unwrap_or_default();
+            match kind.as_str() {
+                "ringing" => self.on_call_update(
+                    CallUpdate::Ringing {
+                        call_id: "fake".to_string(),
+                        from: peer,
+                        video: false,
+                    },
+                    cx,
+                ),
+                other => {
+                    self.on_call_update(CallUpdate::Calling { peer }, cx);
+                    if other == "connected" {
+                        self.on_call_update(CallUpdate::Connected, cx);
+                    }
+                }
+            }
+        }
         if std::mem::take(&mut self.profile_name_stale) {
             let name = self.me_name.clone();
             self.profile_name.update(cx, |input, cx| input.set_value(name, window, cx));
@@ -2351,6 +2404,7 @@ impl Render for Shell {
                     ),
             )
             .children(chat_menu)
+            .children(self.call_card(cx))
     }
 }
 
@@ -3427,5 +3481,226 @@ impl Shell {
                 }))),
         );
         panel.into_any_element()
+    }
+}
+
+impl Shell {
+    fn on_call_update(&mut self, update: crate::events::CallUpdate, cx: &mut Context<Self>) {
+        use crate::events::CallUpdate;
+        match update {
+            CallUpdate::Ringing { call_id, from, video } => {
+                let name = self.title_of(&from);
+                self.call = Some(CallView {
+                    call_id: Some(call_id),
+                    peer: from,
+                    name,
+                    video,
+                    phase: CallPhase::Ringing,
+                    muted: false,
+                    connected_at: None,
+                });
+                // A ringing call brings the window back from the tray.
+                crate::tray::show_main_window();
+            }
+            CallUpdate::Calling { peer } => {
+                let name = self.title_of(&peer);
+                self.call = Some(CallView {
+                    call_id: None,
+                    peer,
+                    name,
+                    video: false,
+                    phase: CallPhase::Calling,
+                    muted: false,
+                    connected_at: None,
+                });
+            }
+            CallUpdate::Answered => {
+                if let Some(call) = self.call.as_mut() {
+                    call.phase = CallPhase::Connecting;
+                    call.call_id = None;
+                }
+            }
+            CallUpdate::Connected => {
+                if let Some(call) = self.call.as_mut() {
+                    call.phase = CallPhase::Connected;
+                    call.connected_at.get_or_insert_with(std::time::Instant::now);
+                }
+                // The timer on the card moves once a second.
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                        let running = this
+                            .update(cx, |this, cx| {
+                                cx.notify();
+                                this.call.as_ref().is_some_and(|call| call.phase == CallPhase::Connected)
+                            })
+                            .unwrap_or(false);
+                        if !running {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            CallUpdate::Muted(muted) => {
+                if let Some(call) = self.call.as_mut() {
+                    call.muted = muted;
+                }
+            }
+            CallUpdate::Ended { reason } => {
+                if let Some(call) = self.call.as_mut() {
+                    // The first reason stands; a second "ended" for the same call adds nothing.
+                    if !matches!(call.phase, CallPhase::Ended(_)) {
+                        call.phase = CallPhase::Ended(reason);
+                        call.call_id = None;
+                        // The card stays a moment, then goes.
+                        cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(2500)).await;
+                            let _ = this.update(cx, |this, cx| {
+                                if this.call.as_ref().is_some_and(|call| matches!(call.phase, CallPhase::Ended(_))) {
+                                    this.call = None;
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
+                    }
+                }
+                // The calls list has a new entry.
+                self.stale_chats = true;
+            }
+        }
+        cx.notify();
+    }
+
+    /// The call card: who, what is happening, and the buttons that fit the moment.
+    fn call_card(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let call = self.call.as_ref()?;
+        let t = tokens(cx).clone();
+        let status = match &call.phase {
+            CallPhase::Ringing if call.video => "Incoming video call (answers with voice only)".to_string(),
+            CallPhase::Ringing => "Incoming voice call".to_string(),
+            CallPhase::Calling => "Calling…".to_string(),
+            CallPhase::Connecting => "Connecting…".to_string(),
+            CallPhase::Connected => {
+                let seconds = call.connected_at.map(|since| since.elapsed().as_secs()).unwrap_or(0);
+                format!("{}:{:02}", seconds / 60, seconds % 60)
+            }
+            CallPhase::Ended(reason) => reason.clone(),
+        };
+        let round = |id: &'static str, glyph: &'static str, fill: gpui::Hsla, text: gpui::Hsla| {
+            div()
+                .id(id)
+                .size(px(44.))
+                .rounded_full()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .bg(fill)
+                .text_color(text)
+                .cursor_pointer()
+                .hover(|style| style.opacity(0.85))
+                .child(icon(glyph).size(px(20.)))
+        };
+        let red: gpui::Hsla = gpui::rgb(0xe5484d).into();
+        let green: gpui::Hsla = gpui::rgb(0x30a46c).into();
+        let mut buttons = div().flex().items_center().gap(px(14.));
+        match &call.phase {
+            CallPhase::Ringing => {
+                let (yes, no) = (call.call_id.clone().unwrap_or_default(), call.call_id.clone().unwrap_or_default());
+                buttons = buttons
+                    .child(
+                        round("call-decline", "phone-off", red, gpui::white())
+                            .tooltip(tip("Decline"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.backend.send(Command::DeclineCall { call_id: no.clone() });
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        round("call-accept", "phone", green, gpui::white())
+                            .tooltip(tip("Answer"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.backend.send(Command::AnswerCall { call_id: yes.clone() });
+                                cx.notify();
+                            })),
+                    );
+            }
+            CallPhase::Calling | CallPhase::Connecting | CallPhase::Connected => {
+                let muted = call.muted;
+                buttons = buttons
+                    .child(
+                        round(
+                            "call-mute",
+                            if muted { "mic-off" } else { "mic" },
+                            if muted { t.foreground } else { t.fg(0.12) },
+                            if muted { t.background } else { t.foreground },
+                        )
+                        .tooltip(tip(if muted { "Unmute" } else { "Mute" }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.backend.send(Command::MuteCall { muted: !muted });
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        round("call-end", "phone-off", red, gpui::white())
+                            .tooltip(tip("End call"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.backend.send(Command::EndCall);
+                                cx.notify();
+                            })),
+                    );
+            }
+            CallPhase::Ended(_) => {}
+        }
+        Some(
+            // A full-width row that only centres the card; it takes no clicks itself.
+            div()
+                .absolute()
+                .top(px(44.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("call-card")
+                        .occlude()
+                        .w(px(340.))
+                        .p(px(16.))
+                        .rounded(px(20.))
+                        .border_1()
+                        .border_color(t.border)
+                        .bg(t.popover_fill())
+                        .shadow(t.shadow_dialog())
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(12.))
+                        .child(avatar(&call.peer, &call.name, 64., crate::avatars::get(&call.peer), cx))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .text_size(px(16.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(SharedString::from(call.name.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .text_color(t.muted_foreground)
+                                        .child(status),
+                                ),
+                        )
+                        .child(buttons),
+                )
+                .into_any_element(),
+        )
     }
 }
