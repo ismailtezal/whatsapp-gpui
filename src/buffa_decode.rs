@@ -84,3 +84,35 @@ pub fn describe(proto: &[u8]) -> String {
     }
     parts.join(" | ")
 }
+
+/// The names of the top-level fields a message has set (names only, never values), for
+/// finding out what an "unsupported" message actually is.
+pub fn set_fields(proto: &[u8]) -> Vec<String> {
+    let Ok(record) = wa::WebMessageInfo::decode_from_slice(proto) else {
+        return Vec::new();
+    };
+    let Some(message) = record.message.as_option() else {
+        return Vec::new();
+    };
+    let (base, _, _) = content::unwrap(message);
+    match whatsapp_rust::serde_json::to_value(base) {
+        Ok(whatsapp_rust::serde_json::Value::Object(map)) => map
+            .into_iter()
+            .filter(|(_, value)| !value.is_null())
+            .map(|(key, value)| match value {
+                // One level down for wrappers we do not unwrap yet.
+                whatsapp_rust::serde_json::Value::Object(inner) => {
+                    let inner: Vec<String> = inner
+                        .into_iter()
+                        .filter(|(_, v)| !v.is_null())
+                        .map(|(k, _)| k)
+                        .take(8)
+                        .collect();
+                    format!("{key}{{{}}}", inner.join(","))
+                }
+                _ => key,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}

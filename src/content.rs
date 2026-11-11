@@ -327,6 +327,14 @@ fn classify(base: &wa::Message) -> Option<Digest> {
         return Some(Digest::new(Payment, None));
     }
 
+    // Sent to linked devices in place of content only the phone may show.
+    if base.placeholder_message.is_set() {
+        return Some(Digest::new(
+            Unsupported,
+            Some("This message can only be viewed on your phone.".to_string()),
+        ));
+    }
+
     // Actions and transport plumbing: handled elsewhere, never shown as a bubble.
     if base.protocol_message.is_set()
         || base.reaction_message.is_set()
@@ -393,7 +401,7 @@ pub fn preview_label(kind: MsgKind, text: Option<&str>) -> String {
         Product => "Product".into(),
         Order => with("Order"),
         Payment => "Payment".into(),
-        Unsupported => "Unsupported message".into(),
+        Unsupported => text.unwrap_or("Unsupported message").to_string(),
     }
 }
 

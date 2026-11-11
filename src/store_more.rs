@@ -243,3 +243,12 @@ impl Store {
         })
     }
 }
+
+impl Tx<'_> {
+    /// Forgets the stored member list of a group, before writing a fresh one.
+    pub fn clear_group_members(&self, group: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM group_members WHERE group_jid = ?1", [bare_jid(group)])?;
+        Ok(())
+    }
+}

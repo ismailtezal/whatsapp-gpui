@@ -277,6 +277,16 @@ fn main() -> Result<()> {
                 wait_ack(&store, &chat, &sent.id, Duration::from_secs(20))?
             );
         }
+        "group" => {
+            // Read-only: refresh a group's details from the server and count its members.
+            let chat = group(&store, &args[1])?;
+            let before = store.group_members(&chat)?.len();
+            backend.send(Command::RefreshGroup { chat: chat.clone() });
+            std::thread::sleep(Duration::from_secs(4));
+            let members = store.group_members(&chat)?;
+            let admins = members.iter().filter(|(_, rank)| *rank > 0).count();
+            println!("members before={before} after={} admins={admins}", members.len());
+        }
         "listen" => {
             let seconds: u64 = args.get(1).and_then(|n| n.parse().ok()).unwrap_or(15);
             let mut counts = std::collections::BTreeMap::new();

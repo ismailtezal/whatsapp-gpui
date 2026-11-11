@@ -561,7 +561,9 @@ fn content(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> Div {
                     .text_size(px(13.))
                     .italic()
                     .text_color(t.muted_foreground)
-                    .child("This message type is not shown yet. Open it on your phone."),
+                    .child(SharedString::from(
+                        text.unwrap_or("This message type is not shown yet. Open it on your phone.").to_string(),
+                    )),
             );
         }
         other => {

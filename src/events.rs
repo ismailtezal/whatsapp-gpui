@@ -134,6 +134,9 @@ pub enum Command {
     /// Ask the phone for older messages of a chat.
     LoadOlder { chat: String },
     SetPresence { online: bool },
+    /// Read a group's current subject, description and members from the server.
+    RefreshGroup { chat: String },
+    LeaveGroup { chat: String },
     Logout,
     Shutdown,
 }

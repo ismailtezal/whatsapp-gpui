@@ -600,6 +600,66 @@ async fn execute(
             crate::media_ops::execute(client, store, events, command).await?;
         }
 
+        Command::RefreshGroup { chat } => {
+            let meta = client
+                .groups()
+                .fetch_metadata(&jid(&chat)?)
+                .await
+                .map_err(|error| anyhow!("could not read the group details: {error}"))?;
+            store.batch(|tx| {
+                tx.patch_chat(
+                    &chat,
+                    &ChatPatch {
+                        name: meta.subject.clone(),
+                        description: meta.description.clone(),
+                        created_at: meta.creation_time.map(|t| t as i64),
+                        ..Default::default()
+                    },
+                )?;
+                tx.clear_group_members(&chat)?;
+                for member in &meta.participants {
+                    let address = member.jid.to_non_ad_string();
+                    // Prefer the phone-number identity, and remember that the two are one person.
+                    let person = match &member.phone_number {
+                        Some(pn) => {
+                            let pn = pn.to_non_ad_string();
+                            if address.ends_with("@lid") {
+                                tx.learn_lid(&address, &pn)?;
+                            }
+                            pn
+                        }
+                        None => address,
+                    };
+                    let rank = if member.is_super_admin() {
+                        2
+                    } else if member.is_admin() {
+                        1
+                    } else {
+                        0
+                    };
+                    tx.put_group_member(&chat, &person, rank)?;
+                }
+                Ok(())
+            })?;
+            notify(events, &chat).await;
+        }
+
+        Command::LeaveGroup { chat } => {
+            client
+                .groups()
+                .leave(jid(&chat)?)
+                .await
+                .map_err(|error| anyhow!("could not leave the group: {error}"))?;
+            store.patch_chat(
+                &chat,
+                &ChatPatch {
+                    read_only: Some(true),
+                    ..Default::default()
+                },
+            )?;
+            notify(events, &chat).await;
+        }
+
         Command::LoadOlder { chat } => {
             // The phone answers with a history-sync blob, which arrives as an event and is
             // imported like any other.

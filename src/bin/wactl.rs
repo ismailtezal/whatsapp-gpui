@@ -105,6 +105,21 @@ fn main() -> Result<()> {
             let max = calls.iter().map(|c| c.duration).max().unwrap_or(0);
             println!("calls={} with_duration={} max_duration={}", calls.len(), with_duration, max);
         }
+        Some("unsupported") => {
+            // Which fields do messages we cannot show yet carry? Names only.
+            let mut seen = std::collections::BTreeMap::new();
+            for chat in store.chats(false)?.into_iter().chain(store.chats(true)?) {
+                for msg in store.messages(&chat.jid, None, 100_000)? {
+                    if msg.kind == whatsapp_gpui::model::MsgKind::Unsupported {
+                        let fields = whatsapp_gpui::buffa_decode::set_fields(&msg.proto).join(" + ");
+                        *seen.entry(fields).or_insert(0usize) += 1;
+                    }
+                }
+            }
+            for (fields, count) in seen {
+                println!("{count}x {fields}");
+            }
+        }
         Some("kinds") => {
             let jid = args.get(1).cloned();
             let mut kinds = std::collections::BTreeMap::new();

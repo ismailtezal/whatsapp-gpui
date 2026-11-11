@@ -237,6 +237,9 @@ impl ChatView {
 
     /// Re-reads the loaded window of messages from the store and rebuilds the rows.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        if self.info_open {
+            self.refresh_members();
+        }
         let rows = self
             .store
             .messages(&self.chat.jid, None, self.loaded)
@@ -1422,6 +1425,12 @@ impl ChatView {
 
     fn toggle_info(&mut self, cx: &mut Context<Self>) {
         self.info_open = !self.info_open;
+        if self.info_open && self.chat.kind != ChatKind::User {
+            // Ask the server for the current members; the panel refreshes when they arrive.
+            self.backend.send(Command::RefreshGroup {
+                chat: self.chat.jid.clone(),
+            });
+        }
         if self.info_open {
             let mut members = Vec::new();
             if self.chat.kind != ChatKind::User {
@@ -1899,5 +1908,23 @@ impl ChatView {
             .with_priority(10)
             .into_any_element(),
         )
+    }
+}
+
+impl ChatView {
+    /// Re-reads the member list shown in the info panel.
+    fn refresh_members(&mut self) {
+        let mut members = Vec::new();
+        if self.chat.kind != ChatKind::User {
+            for (jid, rank) in self.store.group_members(&self.chat.jid).unwrap_or_default() {
+                let name = if self.me_jid.as_deref() == Some(jid.as_str()) {
+                    "You".to_string()
+                } else {
+                    self.name_of(&jid)
+                };
+                members.push((jid, name, rank));
+            }
+        }
+        self.members = members;
     }
 }
