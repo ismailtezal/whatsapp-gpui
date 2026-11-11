@@ -27,6 +27,11 @@ connection. Windows only. Private now, open source later.
 
 - `src/main.rs`, `src/ui/`: the GPUI application (shell, chat, message rows, theme).
 - `src/backend.rs`, `src/media_ops.rs`: the connection thread; `Command`s in, `UiEvent`s out.
+- `src/calls.rs`: voice calls (microphone and speaker for the library's call engine).
+  `src/voice.rs`: voice message recording and the Opus encoder (child process).
+  `src/tray.rs`: tray icon, taskbar badge, start with Windows.
+- `src/guard.rs`, `src/salvage.rs`: opening, checking, backing up and rebuilding the
+  chat database.
 - `src/ingest.rs`: applies events to the store (has the receive-path tests).
 - `src/store.rs`, `src/store_more.rs`, `src/polls.rs`: the SQLite store.
 - `src/bin/wa-link.rs`: QR linking tool. `src/bin/wactl.rs`: inspect the store (masked).
@@ -88,5 +93,16 @@ connection. Windows only. Private now, open source later.
   Setup installer (`installer/whatsapp-gpui.iss`) and a portable zip, and publishes
   them. `ci.yml` tests and builds every push to `main`. Inno Setup is not installed on
   this PC, so the installer is only built in CI.
-- Interface styles (Modern, Glass, Futuristic) live in `src/ui/theme.rs` as `Style`;
-  `WA_STYLE`, `WA_PALETTE` and `WA_THEME` override the stored choice for a dev run.
+- Interface styles (Modern, Glass, Liquid Glass, Futuristic) live in `src/ui/theme.rs`
+  as `Style`; `WA_STYLE`, `WA_BACKDROP`, `WA_PALETTE` and `WA_THEME` override the stored
+  choice for a dev run. `WA_FAKE_CALL=ringing|calling|connected` shows the call card.
+- `whatsapp-rust` is built with its `voip` feature, which compiles the native Opus
+  library with CMake. On this PC CMake came from winget and `.cargo/config.toml` (not
+  committed) points Cargo at it.
+- **Never call, message, add or follow anyone in a test.** Calls and status replies
+  cannot be verified without another person; say so instead of trying. A status may be
+  test-posted only with `only_me` (the owner's own devices). WhatsApp rate-limits
+  group creation: after a few test groups in a day, stop creating more.
+- Patches to source files are applied with small Node scripts written with the Write
+  tool to `.reference/p_*.js` (exact-text replace, reporting what is missing). Bash
+  heredocs containing Rust break, and reusing one script name has re-run an old patch.

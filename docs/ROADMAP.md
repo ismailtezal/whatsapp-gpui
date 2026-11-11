@@ -8,9 +8,13 @@ This file is the honest checklist. Each line is one of:
 - **Partial**: some of it works; the gap is stated.
 - **Not done**: nothing useful exists yet.
 
-Real-account checks were run only in the owner's "Dosyalar" group (which has no other
-member) and in an empty test group created for the purpose, never with another person.
-`wa-test` refuses to send anywhere but a group.
+Real-account checks were run only where nobody else is affected: the owner's "Dosyalar"
+group (no other member), groups and a community created for the purpose with nobody
+else in them, a status posted to the owner's own devices only, and read-only requests.
+`wa-test` refuses to send anywhere but a group. Nothing was ever sent to another person,
+which is also why several features below are "Built" and not "Verified": calling,
+replying to someone's status, adding people to a group and following a channel cannot be
+tried without touching someone else or changing the account.
 
 ## Foundation
 
@@ -18,8 +22,9 @@ member) and in an empty test group created for the purpose, never with another p
 | --- | --- | --- |
 | Link by QR code | Verified | Linked with `wa-link`. The app draws the QR itself when not linked (Built: this path has not been run, since the device is already linked). |
 | Session persistence, reconnect | Verified | Reconnected across dozens of runs. |
-| History sync import | Verified | About 73,700 messages in 130 chats arrived from the phone and are stored. |
+| History sync import | Verified | 73,754 messages in 131 chats are stored. |
 | Local chat database | Verified | SQLite; the full protocol record of every message; full-text index. |
+| Data safety | Verified (tested) | The app checks its chat database when it starts. If SQLite cannot read it, the file is set aside and rebuilt from its data pages plus the saved history, and the app starts with a notice; this was run against a really damaged file. A full integrity check and a daily backup (three kept) run in the background. See "The database incident" below. |
 | Account state replay | Verified | Saved contact names, pins, mutes, archive flags and stars arrive on first run. |
 | LID / phone-number identity merge | Verified | Unit test; mappings also learned from history and group details. |
 | Get earlier messages from the phone | Built | Request is sent; the phone did not answer during the night test, so the result is unconfirmed. |
@@ -28,29 +33,31 @@ member) and in an empty test group created for the purpose, never with another p
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Receive messages | Partial | The handling is covered by tests (text, own-device messages, groups, reactions, deletes, edits). One real incoming message has since arrived while the app was running: it appeared in the chat list with its preview and unread badge. That chat was not opened, so the message was not seen inside a conversation. |
+| Receive messages | Partial | The handling is covered by tests (text, own-device messages, groups, reactions, deletes, edits). One real incoming message arrived while the app was running: it appeared in the chat list with its preview and unread badge. It was not watched arriving inside an open conversation. |
 | Send text | Verified | |
 | Reply (quote), jump to the quoted message | Verified (send) / Built (jump) | |
-| Reactions: send, show | Verified | Quick reactions and a picker of about 190 emoji. |
+| Reactions: send, show | Verified | Quick reactions and the full emoji picker. |
+| Reaction bar on hover | Verified | Sits right next to the bubble, level with its top. Seen on a real mouse hover and with the bar forced visible (`WA_HOVER=1`). |
+| Emoji picker | Verified (shown) | Every emoji the system font draws (Unicode 15 and earlier), in nine groups plus recents, with search by name. Seen on screen. No skin-tone choice. |
 | Edit own message | Verified | 15-minute window. |
 | Delete for everyone | Verified | Text, photo and document. |
 | Delete for me | Built | |
 | Star / unstar, starred list | Built | |
-| Forward, with a chat picker | Built | |
+| Forward, with a chat picker | Verified (send) / Built (picker) | A message was forwarded within "Dosyalar" and arrived marked as forwarded. The picker was not clicked through. |
 | Copy text | Built | |
 | Message info (who received and read) | Built | From stored receipts. |
 | Read receipts (blue ticks) | Built | Test runs set `WA_READONLY=1`, so none has been sent for real. |
 | Delivery ticks | Partial | Sent, delivered, read are stored and drawn; history shows all three, live only "sent" was observed. |
 | Typing indicator: send, show | Built | Sent at most once every 8 seconds while typing. Sending is disabled in test runs. |
 | Presence (online, last seen) | Built | The account shows as online only while the window is in front. |
-| Mentions | Built | Shown as name pills. In a group, typing `@` lists the members; picking one sends a real mention. The send has not been exercised (the test groups have no other member to mention). |
+| Mentions | Verified (send) / Built (picker) | A message mentioning this account itself was sent to "Dosyalar" and carried the mention. Typing `@` in a group lists the members; that list was not clicked through. |
 | Formatting (bold, italic, strike, code), links | Verified | Unit tests. |
 | Link previews | Partial | Shown for received and stored messages. Not generated when sending a link. |
-| Polls | Verified | Create (`/poll Question \| A \| B` in the composer), show, vote. Gaps: no dialog for creating one. Decoding of other people's votes as they arrive is built but unproven, since nobody else could vote in the test group (votes in history are read). |
+| Polls | Verified | Create (`/poll Question \| A \| B` in the composer), show, vote. Gaps: no dialog for creating one. Decoding of other people's votes as they arrive is built but unproven. |
 | Events | Partial | Shown with name, time, place and description. No responding, no creating. |
 | Location | Partial | Card that opens the place in the browser's maps. No sending, no live location. |
 | Contact cards | Partial | Card with a "message" action. No sending. |
-| Disappearing messages | Partial | The timer is tracked per chat; it cannot be changed, and expired messages are not removed locally. |
+| Disappearing messages | Partial | The timer can be set from the info panel: verified on a test group (7 days, then off); for a chat with one person it is built but not exercised. Expired messages are not removed locally. |
 | View-once | Partial | Placeholder, as on any linked device. |
 | Phone-only messages | Verified | Shown with the same notice the official client uses. |
 | Pin a message | Verified | Pin (for a week) and unpin from the message menu; the newest pin shows under the header. Pins made before this device was linked are not known. |
@@ -62,20 +69,20 @@ member) and in an empty test group created for the purpose, never with another p
 
 | Feature | Status | Notes |
 | --- | --- | --- |
-| Photos: download, show, viewer | Verified | Download on view; in-app viewer. |
+| Photos: download, show, viewer | Verified | Download on view; in-app viewer. In a conversation a photo is shown from a small copy made in the background, so scrolling past large photos does not stall. |
 | Send photo | Verified | With thumbnail and dimensions. |
 | Send document | Verified | |
 | Send video, audio | Built | Same path as photos and documents. Videos are sent without a preview image. |
 | File picker, drag and drop, paste | Built | Files are staged above the message box with a preview and sent on Enter; what is typed becomes the caption. Pasting a copied image or copied files stages them too. |
-| Voice messages and audio: play in app | Verified (player) / Built (control) | The player was checked on this PC with a real voice message. The play button and progress bar in the conversation were not clicked. |
-| Voice messages: record | Verified (parts) / Built (whole) | The mic button records: a level meter, a timer, discard and send. Checked separately: the microphone opens and delivers audio on this PC; the encoder produces Opus in OGG that decodes back to the exact length (round-trip test); a synthetic two-second voice note was sent to "Dosyalar" and accepted by the server. Not done as one piece: recording by clicking the button in the app and sending that. No pause, no slide-to-lock, no playback before sending. |
+| Voice messages and audio: play in app | Verified (player, waveform) / Built (controls) | The player was checked on this PC with a real voice message. A voice message shows its sender's waveform (seen on screen); clicking a bar jumps there and a chip steps the speed through 1, 1.5 and 2 times. Jumping and the speed chip were not clicked. |
+| Voice messages: record | Verified (parts) / Built (whole) | The mic button records: a level meter, a timer, discard and send. Checked separately: clicking the mic button in the test copy started a recording and showed the row; the microphone opens and delivers audio on this PC; the encoder (run in a child process) produces Opus in OGG that decodes back to the exact length; a synthetic two-second voice note was sent to "Dosyalar" and accepted by the server. Not done as one piece: speaking a message and sending it from the app. A layout fix to the recording row was not captured again. No pause, no slide-to-lock, no playback before sending. |
 | Media that expired on the server | Verified | Re-requested from the phone, then downloaded. |
-| Stickers: show | Verified | Animated stickers play on their own. Checked on screen: two captures a second apart showed different frames of the animated sticker in "Dosyalar". |
+| Stickers: show | Verified | Animated stickers play on their own, seen on screen. |
 | Stickers: send | Verified | |
 | Sticker picker | Built | Lists stickers already downloaded to this PC. No favourites, no sticker packs. |
 | Video and GIF previews | Verified | GIFs and videos up to 16 MB download on view; Windows makes the preview picture. |
-| GIFs: play in app | Verified | A click opens the viewer, where the GIF loops. Seen playing on screen. In the conversation itself a GIF is a still preview; it does not autoplay inline. |
-| Video: play in app | Built | Same viewer, with the sound track played alongside. Not run, because unattended tests must stay silent, so picture-sound sync is unproven. No pause, seek or volume controls yet; a click closes it. |
+| GIFs: play in app | Verified | A click opens the viewer, where the GIF loops. In the conversation itself a GIF is a still preview; it does not autoplay inline. |
+| Video: play in app | Built | The viewer has play and pause, a bar to jump with, the time and mute, with the sound track kept in step with the picture. None of it has been run: no video was played after the controls were written. |
 | Documents: open | Built | Downloads and opens with the default app. |
 | Albums | Built | Photos sent together are shown as a two-column grid. Videos in an album are still listed separately. |
 | Camera capture | Not done | |
@@ -90,41 +97,67 @@ member) and in an empty test group created for the purpose, never with another p
 | Right-click a chat: read/unread, pin, mute, archive, delete | Built | |
 | New chat from saved contacts | Built | |
 | Profile pictures | Verified | Fetched one at a time, cached on disk. |
-| Chat info panel: about, photos, members | Built | |
+| Chat info panel: about, photos, members | Verified (shown) | The first ten members are listed, with "View all" for the rest. |
 | Group details from the server (members, admins, description) | Verified | |
 | Create a group | Verified | Tested with nobody else in it. |
 | Rename a group, change its description | Verified | |
 | Leave a group | Verified | |
 | Add, remove, promote, demote members | Built | Deliberately not exercised: it would affect real people. |
-| Group settings (who can send, approval, invite links) | Not done | The library supports them. |
-| Communities, channels | Not done | Shown as plain chats; the Channels section only filters. |
+| Group settings | Verified (calls) / Built (screen) | On a test group, through the same commands the screen sends: only admins edit info, only admins send, admins approve new members (on and off each), the message timer, reading the requests to join, the invite link and resetting it. Built but not exercised: "members can add people", changing the group photo, answering a request to join. The switches in the info panel were not seen on screen, because the off-screen test copy has no account identity and so does not show admin controls. |
+| Join a group from an invite link | Built | New chat panel. Not exercised: it would join a real group. |
+| Communities | Verified (create, close) / Built (rest) | A Communities section lists each community with its groups. Verified live: reading the list (the account is in none), creating a community with nobody else in it, closing it. Adding a group to it was refused by WhatsApp's rate limit after the day's test groups, so it is unverified. Joining a community's group, and putting an existing group into a community (the command exists; there is no button for it yet), are built only. The section was not seen with real data. |
+| Channels | Verified (read) / Built (rest) | Verified live, read-only: the list of followed channels (the account follows none), looking a public channel up by its link (name, followers, verified mark), and reading its posts with their reaction totals without following. Built but not exercised, because each would change the account: follow, unfollow, mute, react, create a channel, post as an admin. The channel screens were not seen with real data. No channel directory to browse, no live update of reaction totals. |
 | Block, report | Built / Not done | Block from a person's info panel and unblock from Settings are built but not exercised. No report. |
 | Labels (business) | Not done | |
 
-## Other surfaces
+## Calls
 
 | Feature | Status | Notes |
 | --- | --- | --- |
 | Calls list | Verified | 197 calls from history, with direction, duration and missed state. |
-| Voice and video calls | Not done | The library handles the call protocol. Microphone, camera, playback and video coding are the app's job and are not started. The call buttons say so. |
-| Incoming call notice | Built | A Windows notification says who is calling and to answer on the phone. No ringing screen, no decline button. |
-| Status: view | Built | Text and photo statuses of the last 24 hours; other media open in the default player. Viewing does not send a "seen" receipt. |
-| Status: post, reply | Not done | |
-| Settings: profile, dark / light, data folder, log out | Verified (shown) / Built (log out) | Dark and light were both checked on screen. Log out was not pressed. |
-| Settings: privacy and blocked contacts | Partial | Read from the account and shown. Privacy cannot be changed here; unblock is built but not exercised. |
-| Settings: notifications, edit name / about / photo | Not done | |
+| Voice calls with one person | Built | Place a call (phone button in a chat), answer or decline one that rings, mute, hang up. The connection library carries the call; the app supplies the microphone and speaker. Checked: the sound devices open the way a call uses them and deliver sound in the right form; the call card in its ringing and connected states, in two styles. **Never used in a real call**: that needs another person. Whether sound flows both ways with a real phone is unknown. |
+| Incoming call | Built | A card with the caller, Answer and Decline, plus a Windows notification; the window comes back from the tray. A video call can only be answered with voice. |
+| Video calls | Not done | The library carries video but needs the app to capture the camera and to encode and decode H.264; none of that is written. The video button says so. |
+| Group calls, call links | Not done | The library supports them. |
+
+## Status
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| View | Verified (shown) | Statuses of the last 24 hours. A text status is shown on the colour its author chose. Photos show in the app; videos open in the default player. |
+| Tell the poster it was seen | Built | Sent once per status when it is opened; never in test runs. |
+| Post | Verified (text) / Built (photo, video) | A composer with eight background colours, or a photo or video with a caption. A text status was posted live to this account's own devices only and accepted by the server. Posting to contacts (the real audience, following the privacy setting synced from the phone) was not exercised, nor was a photo or video. |
+| Delete my status | Verified | The test status was taken down again. |
+| Reply, like | Built | A reply box and a heart under someone's status. Not exercised: it would message a real person. |
+| Who saw my status | Built | From stored receipts. |
+
+## Settings and system
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| Profile: name, About, photo | Verified (name) / Built (About, photo) | The name call was exercised live by re-applying the current name. About and photo are built, not exercised: they would change the account. |
+| Privacy | Verified (call) / Built (screen) | Each setting is a row of choices. The change call was exercised live by re-applying a current value. A custom "my contacts except…" list made on the phone is shown but cannot be edited here. Default message timer for new chats: built. |
+| Blocked contacts | Partial | Listed; unblock is built but not exercised. |
+| Dark / light, data folder | Verified (shown) | |
+| Log out | Built | Not pressed. |
+| Notification settings | Not done | Chats can be muted one by one; there is no global notification setting. |
 | Notifications | Built | Windows notification for a new message when its chat is not in front; clicking opens the chat. No real incoming message has triggered one yet. |
-| Taskbar badge, tray icon | Not done | |
+| Tray icon | Verified (icon) / Built (behaviour) | The icon was added, updated and removed on this PC. Built and not watched: a click brings the window back; its menu has Open and Quit; closing the window keeps the app running behind it (a setting, on by default). |
+| Taskbar unread badge | Built | The badge picture is covered by a test; it was not seen on the taskbar. |
+| Start with Windows | Built | A setting that adds or removes the app from the sign-in programs. The switch was not flipped in a test. |
 | App icon | Verified (build) | `assets/app.ico`, drawn by `scripts/make-icon.ps1` and embedded by `build.rs`. A placeholder mark: an accent square with a speech bubble. |
-| Installer, start with Windows | Built | `installer/whatsapp-gpui.iss` (Inno Setup): installs for the current user without administrator rights, Start menu entry, optional desktop shortcut and "Start with Windows", uninstaller. Built by the release workflow; see "Releases" below for whether it has been run. Not signed, so Windows SmartScreen will warn. |
-| Build and release workflows | Built | `.github/workflows/ci.yml` tests and builds every push to `main`. `release.yml` runs on a `v*` tag and publishes the installer and a portable zip as a GitHub release. |
+| Installer | Verified (built) | `installer/whatsapp-gpui.iss` (Inno Setup): installs for the current user without administrator rights, Start menu entry, optional desktop shortcut and "Start with Windows", uninstaller. The release workflow built and published it for v0.1.0. It was not installed and run from that file. Not signed, so Windows SmartScreen will warn. |
+| Build and release workflows | Verified | `.github/workflows/ci.yml` tests and builds every push to `main`. `release.yml` runs on a `v*` tag and publishes the installer and a portable zip as a GitHub release. |
+
+## Look and speed
+
+| Feature | Status | Notes |
+| --- | --- | --- |
 | Interface styles | Verified (shown) | Modern, Glass, Liquid Glass and Futuristic, chosen in Settings and remembered. Glass is a translucent window over the Windows blur. Futuristic adds accent glows and sharper borders. Not every style was checked with every palette. |
-| Liquid Glass style | Verified (shown) | Real glass drawn by the renderer (a patch to the vendored GPUI, see `vendor/README.md`): the rail, chat list, conversation panel, chat header, message box and menus show a blurred copy of what is beneath them, bent at the rim with a slight colour split and a lit edge. The header and message box float over the messages, which pass beneath them. Checked on screen in dark and light, zoomed in on the edges; holds 165 frames a second while scrolling. Differences from Apple's Liquid Glass: the lighting is fixed (it does not react to window movement or content brightness), and menus were not opened in this style during the checks. |
-| Speed | Verified (measured) | Measured with `WA_PERF` on a 165 Hz screen: scrolling a conversation and the chat list holds 165 frames a second (about 2.5 ms of work per frame, down from 10 to 18 ms). Lists build only the rows on screen; wheel scrolling glides; a reload updates only the rows that changed, so the list keeps its place. Not measured: typing, opening the emoji picker, playing video, the first seconds of a large history sync. |
+| Liquid Glass style | Verified (shown) | Real glass drawn by the renderer (a patch to the vendored GPUI, see `vendor/README.md`): the rail, chat list, conversation panel, chat header, message box and menus show a blurred copy of what is beneath them, bent at the rim with a slight colour split and a lit edge. The header and message box float over the messages, which pass beneath them. Checked on screen in dark and light, zoomed in on the edges. Differences from Apple's Liquid Glass: the lighting is fixed (it does not react to window movement or content brightness). |
 | Liquid Glass background | Verified (shown) | Settings has Clear (the default: the desktop shows through the window), Frosted (blurred by Windows; over a dark window it looks almost solid) and Solid (the app's own soft colours). Clear and Frosted were captured on the real screen. The glass bends what is inside the app; the desktop behind the window is shown as Windows composes it, not bent. |
-| Data safety | Verified (tested) | The app checks its chat database when it starts. If SQLite cannot read it, the file is set aside and rebuilt from its data pages plus the saved history, and the app starts with a notice; this was run against a really damaged file. A full integrity check and a daily backup (three kept) run in the background. |
-| Reaction bar on hover | Verified (position) / Built (hover) | Sits right next to the bubble, level with its top (left of own messages, right of others), not at the edge of the window. The position was checked on screen with the bar forced visible (`WA_HOVER=1`). Showing it on a real mouse hover was not captured. |
-| Colour palettes of the design | Partial | Neutral, Turquoise, Midnight, Mono and Amber, in dark and light, chosen in Settings and remembered. Turquoise dark was checked on screen. The other five palettes of diskurt (ocean, violet, rose, pomegranate, forest) are not included. |
+| Colour palettes | Verified (values) | All ten of the design: neutral, turquoise, midnight, mono, amber, ocean, violet, rose, pomegranate, forest, in dark and light. The last five are worked out the way the design's own script does it and are tested against the design's table. Only neutral and turquoise were looked at on screen as a whole interface. |
+| Speed | Verified (measured) | Measured with `WA_PERF` on a 165 Hz screen: scrolling a conversation and the chat list holds 165 frames a second (about 2.5 ms of work per frame, down from 10 to 18 ms), in the Modern and Liquid Glass styles, and still does after everything added since. Lists build only the rows on screen; wheel scrolling glides; a reload updates only the rows that changed, so the list keeps its place. Not measured: typing, playing video, the first seconds of a large history sync. |
 
 ## Design
 
@@ -144,11 +177,35 @@ Known differences from the spec:
 - The spec was extracted from diskurt's source; there was no screenshot of the modern
   design to compare against, so small visual differences are likely.
 
+## The database incident (2026-11-11)
+
+During development the chat database was found damaged: SQLite could not read its
+schema, and the newest pages of the file were blank. Recent writes had been recorded in
+SQLite's write-ahead log and never reached the main file. It was rebuilt from its intact
+data pages and the saved history files: 73,754 messages and 131 chats, with messages up
+to the minute before the damage and no gap seen in the hours before it. It cannot be
+ruled out that a few messages of that morning are missing. The damaged file is kept in
+`%LOCALAPPDATA%\whatsapp-gpui\backup-20261111-111714`.
+
+The cause was not proven. Development test processes were sharing the file with each
+other at the time. Two stress tests on scratch copies (several writers with 33 random
+force-kills; 120 rounds of the voice codec next to a warm database cache) both left the
+database intact. Every plausible cause was therefore removed: interface tests use a
+throwaway snapshot, the voice encoder runs in a child process, and the app repairs,
+checks and backs up its database by itself (see "Data safety").
+
 ## Test leftovers on the account
 
 Left behind by the checks, all clearly labelled:
 
-- In "Dosyalar": one edited test message, one test reply, one test poll, one sticker,
-  and four "This message was deleted" markers.
-- A group named "wagpui test group renamed", which the account has left. It can be
-  deleted from the chat list.
+- In "Dosyalar": one edited test message, one test reply, one test poll, a sticker,
+  a two-second test voice note (a tone), a "mention check" message, a forwarded copy of
+  it, and several "This message was deleted" markers.
+- Groups the account has left, which can be deleted from the chat list: "wagpui test
+  group renamed" and "wagpui settings test".
+- A community named "wagpui community" followed by a number was created and closed
+  again. Its announcement and general groups may still be listed.
+- A status posted to this account only, removed again after a few seconds.
+
+On this PC: CMake was installed with winget (the native Opus library used for calls is
+built with it).

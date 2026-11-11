@@ -95,10 +95,12 @@ fn main() -> Result<()> {
     let backend = Backend::start(store.clone());
 
     let mut own_name: Option<String> = None;
+    let mut own_jid: Option<String> = None;
     wait_for(&backend, "connection", Duration::from_secs(40), |event| {
         if let UiEvent::Identity { pn, lid, push_name } = event {
             println!("identity: pn={} lid={}", pn.is_some(), lid.is_some());
             own_name = Some(push_name.clone());
+            own_jid = pn.clone();
         }
         matches!(event, UiEvent::Connection(ConnState::Online))
     })?;
@@ -280,6 +282,73 @@ fn main() -> Result<()> {
                 "reply id={} quotes_target={} ack={:?}",
                 sent.id,
                 sent.quoted_id.as_deref() == Some(target.id.as_str()),
+                wait_ack(&store, &chat, &sent.id, Duration::from_secs(20))?
+            );
+        }
+        "forward" => {
+            // Forward the newest own message of a group back into the same group.
+            let chat = group(&store, &args[1])?;
+            let target = newest(&store, &chat, true)?;
+            let before = target.id.clone();
+            backend.send(Command::Forward {
+                from_chat: chat.clone(),
+                id: target.id.clone(),
+                to_chats: vec![chat.clone()],
+            });
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let sent = loop {
+                let newest = newest(&store, &chat, true)?;
+                if newest.id != before {
+                    break newest;
+                }
+                if Instant::now() > deadline {
+                    bail!("the forward did not appear in time");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            println!(
+                "forwarded id={} marked_forwarded={} same_kind={} ack={:?}",
+                sent.id,
+                sent.forwarded,
+                sent.kind == target.kind,
+                wait_ack(&store, &chat, &sent.id, Duration::from_secs(20))?
+            );
+        }
+        "mention" => {
+            // Send a message to a group that mentions this account itself.
+            let chat = group(&store, &args[1])?;
+            let me = own_jid.clone().ok_or_else(|| anyhow!("own number not known"))?;
+            let number = me.split('@').next().unwrap_or_default().to_string();
+            let before = newest(&store, &chat, true).map(|m| m.id).unwrap_or_default();
+            backend.send(Command::SendText {
+                chat: chat.clone(),
+                text: format!("whatsapp-gpui mention check @{number}"),
+                reply_to: None,
+                mentions: vec![me.clone()],
+            });
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let sent = loop {
+                let newest = newest(&store, &chat, true)?;
+                if newest.id != before {
+                    break newest;
+                }
+                if Instant::now() > deadline {
+                    bail!("the message did not appear in time");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            // The mention must be in the stored message, as the recipients get it.
+            let record = store.record(&chat, &sent.id)?.ok_or_else(|| anyhow!("message not stored"))?;
+            let mentioned = record
+                .message
+                .as_option()
+                .and_then(|message| message.extended_text_message.as_option())
+                .and_then(|text| text.context_info.as_option())
+                .map(|context| context.mentioned_jid.len())
+                .unwrap_or(0);
+            println!(
+                "mention sent id={} people_mentioned={mentioned} ack={:?}",
+                sent.id,
                 wait_ack(&store, &chat, &sent.id, Duration::from_secs(20))?
             );
         }

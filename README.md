@@ -46,7 +46,8 @@ each other.
 ## Build
 
 Requirements: Rust 1.95 or newer with the `x86_64-pc-windows-msvc` toolchain, Visual
-Studio with the C++ tools, and the Windows 11 SDK.
+Studio with the C++ tools, the Windows 11 SDK, and CMake on the PATH (the Opus library
+used for calls is built with it; `winget install Kitware.CMake`).
 
 ```bash
 cargo build --release --bin whatsapp-gpui
