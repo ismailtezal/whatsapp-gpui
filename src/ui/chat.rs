@@ -102,6 +102,7 @@ pub struct ChatView {
     emoji: Option<EmojiState>,
     viewer: Option<PathBuf>,
     notice: Option<String>,
+    audio: Option<crate::audio::AudioPlayer>,
     info_open: bool,
     /// Group members as (JID, name, rank).
     members: Vec<(String, String, i32)>,
@@ -172,6 +173,7 @@ impl ChatView {
             emoji: None,
             viewer: None,
             notice: None,
+            audio: None,
             info_open: false,
             members: Vec::new(),
             gallery: Vec::new(),
@@ -408,10 +410,17 @@ impl ChatView {
         cx.notify();
     }
 
+    /// Shows an older page: from the local store while it has more, else by asking the phone.
     fn load_older(&mut self, cx: &mut Context<Self>) {
+        self.loaded += PAGE;
         if self.has_older {
-            self.loaded += PAGE;
             self.reload(cx);
+        } else {
+            self.backend.send(Command::LoadOlder {
+                chat: self.chat.jid.clone(),
+            });
+            self.notice = Some("Asked your phone for earlier messages…".to_string());
+            cx.notify();
         }
     }
 
@@ -460,13 +469,58 @@ impl ChatView {
     }
 
     fn show_file(&mut self, id: &str, path: PathBuf, cx: &mut Context<Self>) {
-        let is_picture = self.row(id).is_some_and(|r| r.kind == MsgKind::Image);
-        if is_picture {
-            self.viewer = Some(path);
-        } else {
-            cx.open_with_system(&path);
+        match self.row(id).map(|r| r.kind) {
+            Some(MsgKind::Image) => self.viewer = Some(path),
+            Some(MsgKind::Voice | MsgKind::Audio) => self.play_audio(id, &path, cx),
+            _ => cx.open_with_system(&path),
         }
         cx.notify();
+    }
+
+    /// Plays a voice message or audio file in the app; a second click pauses it.
+    fn play_audio(&mut self, id: &str, path: &std::path::Path, cx: &mut Context<Self>) {
+        if self.audio.is_none() {
+            match crate::audio::AudioPlayer::new() {
+                Ok(player) => self.audio = Some(player),
+                Err(error) => {
+                    self.notice = Some(format!("Audio is not available: {error}"));
+                    cx.open_with_system(path);
+                    return;
+                }
+            }
+        }
+        let Some(player) = self.audio.as_mut() else {
+            return;
+        };
+        let same = player.current() == Some(id);
+        let outcome = if same && !player.finished() {
+            player.toggle().map(|_| ())
+        } else {
+            player.play(id, path)
+        };
+        if let Err(error) = outcome {
+            self.notice = Some(format!("Could not play this: {error}"));
+            return;
+        }
+        self.notice = None;
+        // Keep the progress bar moving while something plays.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        cx.notify();
+                        this.audio.as_ref().is_some_and(|player| player.is_playing())
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn open_media(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -593,6 +647,7 @@ impl ChatView {
             media: Some(Rc::new(move |_, _window, cx| {
                 let _ = entity.update(cx, |this, cx| this.open_media(&media_id, cx));
             })),
+            audio: self.audio.as_ref().and_then(|player| player.playback()),
         };
         let row = message_row(view, &hooks, cx);
         if matches!(view.row.kind, MsgKind::System | MsgKind::Revoked) {
@@ -1308,7 +1363,7 @@ impl ChatView {
             .min_h_0()
             .flex()
             .flex_col()
-            .when(older, |this| {
+            .when(true, |this| {
                         this.child(
                             div().flex().justify_center().py(px(6.)).child(
                                 div()
@@ -1324,7 +1379,11 @@ impl ChatView {
                                     .text_color(t.muted_foreground)
                                     .cursor_pointer()
                                     .hover(|style| style.bg(t.fg(0.06)))
-                                    .child("Load earlier messages")
+                                    .child(if older {
+                                "Load earlier messages"
+                            } else {
+                                "Get earlier messages from your phone"
+                            })
                                     .on_click(cx.listener(|this, _, _, cx| this.load_older(cx))),
                             ),
                         )

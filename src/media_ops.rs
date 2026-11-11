@@ -119,7 +119,128 @@ fn safe_file_name(name: &str) -> String {
         .collect()
 }
 
-/// Downloads and decrypts the media of a stored message into the media folder.
+/// The outcome of fetching one message's media: the bytes (or why not), the file
+/// extension, and the original file name for documents.
+type Fetched = (std::result::Result<Vec<u8>, String>, String, Option<String>);
+
+/// Downloads whichever media the message carries. `None` when it carries none.
+async fn fetch(client: &Arc<Client>, base: &crate::wa::Message) -> Option<Fetched> {
+    use whatsapp_rust::download::DownloadLimits;
+    let limits = DownloadLimits::default();
+    fn text<E: std::fmt::Display>(outcome: std::result::Result<Vec<u8>, E>) -> std::result::Result<Vec<u8>, String> {
+        outcome.map_err(|error| error.to_string())
+    }
+    if let Some(m) = base.image_message.as_option() {
+        return Some((
+            text(client.download(m, limits).await),
+            extension_for(m.mimetype.as_deref(), "jpg"),
+            None,
+        ));
+    }
+    if let Some(m) = base.sticker_message.as_option() {
+        return Some((
+            text(client.download(m, limits).await),
+            extension_for(m.mimetype.as_deref(), "webp"),
+            None,
+        ));
+    }
+    if let Some(m) = base.video_message.as_option().or(base.ptv_message.as_option()) {
+        return Some((
+            text(client.download(m, limits).await),
+            extension_for(m.mimetype.as_deref(), "mp4"),
+            None,
+        ));
+    }
+    if let Some(m) = base.audio_message.as_option() {
+        return Some((
+            text(client.download(m, limits).await),
+            extension_for(m.mimetype.as_deref(), "ogg"),
+            None,
+        ));
+    }
+    if let Some(m) = base.document_message.as_option() {
+        let name = m.file_name.clone().or_else(|| m.title.clone());
+        let from_name = name
+            .as_deref()
+            .and_then(|n| Path::new(n).extension())
+            .and_then(|e| e.to_str())
+            .map(str::to_lowercase);
+        let extension = from_name.unwrap_or_else(|| extension_for(m.mimetype.as_deref(), "bin"));
+        return Some((text(client.download(m, limits).await), extension, name));
+    }
+    None
+}
+
+/// The 32-byte media key of whichever media the message carries.
+fn media_key(base: &crate::wa::Message) -> Option<[u8; 32]> {
+    let key = base
+        .image_message
+        .as_option()
+        .and_then(|m| m.media_key.clone())
+        .or_else(|| base.video_message.as_option().and_then(|m| m.media_key.clone()))
+        .or_else(|| base.ptv_message.as_option().and_then(|m| m.media_key.clone()))
+        .or_else(|| base.audio_message.as_option().and_then(|m| m.media_key.clone()))
+        .or_else(|| base.document_message.as_option().and_then(|m| m.media_key.clone()))
+        .or_else(|| base.sticker_message.as_option().and_then(|m| m.media_key.clone()))?;
+    key.as_slice().try_into().ok()
+}
+
+/// Points the message's media at a fresh download path.
+fn set_direct_path(base: &mut crate::wa::Message, path: &str) {
+    let path = Some(path.to_string());
+    if let Some(m) = base.image_message.as_option_mut() {
+        m.direct_path = path;
+    } else if let Some(m) = base.video_message.as_option_mut() {
+        m.direct_path = path;
+    } else if let Some(m) = base.ptv_message.as_option_mut() {
+        m.direct_path = path;
+    } else if let Some(m) = base.audio_message.as_option_mut() {
+        m.direct_path = path;
+    } else if let Some(m) = base.document_message.as_option_mut() {
+        m.direct_path = path;
+    } else if let Some(m) = base.sticker_message.as_option_mut() {
+        m.direct_path = path;
+    }
+}
+
+/// Whether a download failure means the server no longer has the file under this path.
+fn expired(error: &str) -> bool {
+    ["Some(403)", "Some(404)", "Some(410)"].iter().any(|code| error.contains(code))
+}
+
+/// Asks the phone to upload the media again and returns the message pointed at the new copy.
+async fn reupload(
+    client: &Arc<Client>,
+    record: &crate::wa::WebMessageInfo,
+    chat: &str,
+    id: &str,
+    base: &crate::wa::Message,
+) -> Result<crate::wa::Message> {
+    use whatsapp_rust::{MediaReuploadRequest, MediaRetryResult, MessageId, MessageRef};
+    let key = media_key(base).ok_or_else(|| anyhow!("the message has no media key"))?;
+    let (chat_jid, sender, from_me) = crate::backend::target_parts(record, chat)?;
+    let target = MessageRef::new(&chat_jid, MessageId::new(id)?, sender.as_ref(), from_me)?;
+    let request = MediaReuploadRequest {
+        target,
+        media_key: &key,
+    };
+    match client
+        .media_reupload()
+        .request(&request)
+        .await
+        .map_err(|error| anyhow!("asking the phone for the file failed: {error}"))?
+    {
+        MediaRetryResult::Success { direct_path } => {
+            let mut fresh = base.clone();
+            set_direct_path(&mut fresh, &direct_path.to_string());
+            Ok(fresh)
+        }
+        other => Err(anyhow!("the phone no longer has this file ({other:?})")),
+    }
+}
+
+/// Downloads and decrypts the media of a stored message into the media folder. When the
+/// server copy has expired, the phone is asked to upload it again first.
 async fn download_media(
     client: &Arc<Client>,
     store: &Arc<Store>,
@@ -127,7 +248,6 @@ async fn download_media(
     chat: &str,
     id: &str,
 ) -> Result<()> {
-    use whatsapp_rust::download::DownloadLimits;
     let record = store
         .record(chat, id)?
         .ok_or_else(|| anyhow!("message not found"))?;
@@ -136,50 +256,32 @@ async fn download_media(
         .as_option()
         .ok_or_else(|| anyhow!("message has no content"))?;
     let (base, _, _) = crate::content::unwrap(message);
-    let limits = DownloadLimits::default();
+    let unwrapped = std::ptr::eq(base, message);
 
     let slot = download_slots().acquire().await?;
-    let (bytes, extension, file_name) = if let Some(m) = base.image_message.as_option() {
-        (
-            client.download(m, limits).await,
-            extension_for(m.mimetype.as_deref(), "jpg"),
-            None,
-        )
-    } else if let Some(m) = base.sticker_message.as_option() {
-        (
-            client.download(m, limits).await,
-            extension_for(m.mimetype.as_deref(), "webp"),
-            None,
-        )
-    } else if let Some(m) = base
-        .video_message
-        .as_option()
-        .or(base.ptv_message.as_option())
+    let mut fetched = fetch(client, base)
+        .await
+        .ok_or_else(|| anyhow!("this message has no downloadable media"))?;
+    if let Err(error) = &fetched.0
+        && expired(error)
     {
-        (
-            client.download(m, limits).await,
-            extension_for(m.mimetype.as_deref(), "mp4"),
-            None,
-        )
-    } else if let Some(m) = base.audio_message.as_option() {
-        (
-            client.download(m, limits).await,
-            extension_for(m.mimetype.as_deref(), "ogg"),
-            None,
-        )
-    } else if let Some(m) = base.document_message.as_option() {
-        let name = m.file_name.clone().or_else(|| m.title.clone());
-        let from_name = name
-            .as_deref()
-            .and_then(|n| Path::new(n).extension())
-            .and_then(|e| e.to_str())
-            .map(str::to_lowercase);
-        let extension = from_name.unwrap_or_else(|| extension_for(m.mimetype.as_deref(), "bin"));
-        (client.download(m, limits).await, extension, name)
-    } else {
-        return Err(anyhow!("this message has no downloadable media"));
-    };
+        match reupload(client, &record, chat, id, base).await {
+            Ok(fresh) => {
+                if let Some(retried) = fetch(client, &fresh).await {
+                    fetched = retried;
+                }
+                // Remember the new path, so the next download does not need the phone.
+                if fetched.0.is_ok() && unwrapped {
+                    let mut updated = record.clone();
+                    updated.message = whatsapp_rust::buffa::MessageField::some(fresh);
+                    store.put_message(&updated)?;
+                }
+            }
+            Err(error) => fetched.0 = Err(format!("{error:#}")),
+        }
+    }
     drop(slot);
+    let (bytes, extension, file_name) = fetched;
 
     let (path, error) = match bytes {
         Ok(bytes) => {
@@ -203,7 +305,7 @@ async fn download_media(
             store.batch(|tx| tx.set_media_path(chat, id, &path))?;
             (Some(path), None)
         }
-        Err(error) => (None, Some(error.to_string())),
+        Err(error) => (None, Some(error)),
     };
     let failed = error.clone();
     let _ = events

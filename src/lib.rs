@@ -5,6 +5,7 @@
 //! - [`import`] loads history-sync data into the store.
 //! - [`paths`] says where everything lives on disk.
 
+pub mod audio;
 pub mod avatars;
 pub mod backend;
 pub mod buffa_decode;

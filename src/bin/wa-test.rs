@@ -214,6 +214,50 @@ fn main() -> Result<()> {
             });
             println!("downloaded {done}/{total}");
         }
+        "voice" => {
+            // Download-only: fetch the newest voice message from any chat and print its path.
+            let mut found = None;
+            for chat in store.chats(false)? {
+                if let Some(msg) = store
+                    .messages(&chat.jid, None, 400)?
+                    .into_iter()
+                    .rev()
+                    .find(|m| m.kind == whatsapp_gpui::model::MsgKind::Voice)
+                {
+                    found = Some((chat.jid.clone(), msg));
+                    break;
+                }
+            }
+            let (chat, msg) = found.ok_or_else(|| anyhow!("no voice message in history"))?;
+            backend.send(Command::DownloadMedia {
+                chat,
+                id: msg.id.clone(),
+            });
+            let mut result = None;
+            let _ = wait_for(&backend, "voice download", Duration::from_secs(40), |event| {
+                if let UiEvent::MediaReady { path, error, .. } = event {
+                    result = Some((path.clone(), error.clone()));
+                    return true;
+                }
+                false
+            });
+            match result {
+                Some((Some(path), _)) => println!("VOICE_PATH={path}"),
+                Some((None, error)) => println!("voice download failed: {error:?}"),
+                None => println!("voice download timed out"),
+            }
+        }
+        "older" => {
+            // Ask the phone for messages older than the oldest stored one of a group.
+            let chat = group(&store, &args[1])?;
+            let before = store.message_count(Some(&chat))?;
+            backend.send(Command::LoadOlder { chat: chat.clone() });
+            let _ = wait_for(&backend, "history from the phone", Duration::from_secs(45), |event| {
+                matches!(event, UiEvent::HistoryProgress { .. })
+            });
+            std::thread::sleep(Duration::from_secs(1));
+            println!("messages before={before} after={}", store.message_count(Some(&chat))?);
+        }
         "listen" => {
             let seconds: u64 = args.get(1).and_then(|n| n.parse().ok()).unwrap_or(15);
             let mut counts = std::collections::BTreeMap::new();

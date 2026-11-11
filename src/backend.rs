@@ -225,7 +225,7 @@ fn replay_account_state_once(client: Arc<Client>, store: Arc<Store>) {
 
 /// The addressing a protocol operation on a stored message needs: its chat, its original
 /// author (for messages by others in groups), and whether it is ours.
-fn target_parts(record: &wa::WebMessageInfo, chat: &str) -> Result<(Jid, Option<Jid>, bool)> {
+pub(crate) fn target_parts(record: &wa::WebMessageInfo, chat: &str) -> Result<(Jid, Option<Jid>, bool)> {
     let key = record
         .key
         .as_option()
@@ -598,6 +598,26 @@ async fn execute(
 
         command @ (Command::DownloadMedia { .. } | Command::SendFile { .. }) => {
             crate::media_ops::execute(client, store, events, command).await?;
+        }
+
+        Command::LoadOlder { chat } => {
+            // The phone answers with a history-sync blob, which arrives as an event and is
+            // imported like any other.
+            let oldest = store
+                .oldest_message(&chat)?
+                .ok_or_else(|| anyhow!("this chat has no message to load from"))?;
+            client
+                .fetch_message_history(&jid(&chat)?, &oldest.id, oldest.from_me, oldest.ts * 1000, 50)
+                .await?;
+        }
+
+        Command::ClearChat { chat } => {
+            client
+                .chat_actions()
+                .clear_chat_with_options(&jid(&chat)?, Default::default(), None)
+                .await?;
+            store.batch(|tx| tx.clear_chat(&chat))?;
+            notify(events, &chat).await;
         }
 
         other => {

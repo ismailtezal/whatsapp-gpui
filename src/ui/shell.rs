@@ -264,7 +264,14 @@ impl Shell {
                     self.me_name = push_name;
                 }
             }
-            UiEvent::ChatsChanged | UiEvent::HistoryProgress { .. } => self.reload(),
+            UiEvent::ChatsChanged => self.reload(),
+            UiEvent::HistoryProgress { .. } => {
+                // History arrived (first sync or an answer to "get earlier messages").
+                self.reload();
+                if let Some(view) = &self.chat {
+                    view.update(cx, |view, cx| view.reload(cx));
+                }
+            }
             UiEvent::ChatChanged { chat } => {
                 if self.selected.as_deref() == Some(chat.as_str())
                     && let Some(view) = &self.chat

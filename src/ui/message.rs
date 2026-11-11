@@ -75,6 +75,8 @@ pub type ClickFn = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 pub struct RowHooks {
     /// Open (or download) the media of this message.
     pub media: Option<ClickFn>,
+    /// The clip the audio player has loaded, if any.
+    pub audio: Option<crate::audio::Playback>,
 }
 
 /// Extracts what a row needs from the stored record.
@@ -450,21 +452,74 @@ fn content(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> Div {
             });
         }
         Voice | Audio => {
-            let title = if row.kind == Voice {
-                "Voice message"
+            // A small player: play / pause, a progress track, elapsed and total time.
+            let state = hooks.audio.as_ref().filter(|p| p.id == row.id);
+            let playing = state.is_some_and(|p| p.playing);
+            let total = state
+                .map(|p| p.duration_secs)
+                .filter(|d| *d > 0.)
+                .unwrap_or(view.media.seconds as f64);
+            let position = state.map(|p| p.position_secs).unwrap_or(0.);
+            let fraction = if total > 0. {
+                (position / total).clamp(0., 1.) as f32
             } else {
-                "Audio"
+                0.
             };
-            column = column.child(clickable(
-                info_card(
-                    if row.kind == Voice { "mic" } else { "music" },
-                    title.to_string(),
-                    duration(view.media.seconds),
-                    t,
-                ),
-                ("media", key),
-                &hooks.media,
-            ));
+            let times = if state.is_some() {
+                format!("{} / {}", duration(position as u32), duration(total as u32))
+            } else {
+                duration(total as u32)
+            };
+            let card = div()
+                .w(px(300.))
+                .rounded(R_LG)
+                .border_1()
+                .border_color(t.border)
+                .bg(t.card)
+                .p(px(10.))
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .size(px(36.))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .bg(t.primary)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(t.primary_foreground)
+                        .child(icon(if playing { "pause" } else { "play" })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .child(
+                            div().h(px(4.)).rounded_full().bg(t.fg(0.12)).child(
+                                div()
+                                    .h_full()
+                                    .w(gpui::relative(fraction))
+                                    .rounded_full()
+                                    .bg(t.primary),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .text_size(px(11.))
+                                .text_color(t.muted_foreground)
+                                .child(icon(if row.kind == Voice { "mic" } else { "music" }).size(px(11.)))
+                                .child(times),
+                        ),
+                );
+            column = column.child(clickable(card, ("media", key), &hooks.media));
         }
         Document => {
             let name = view

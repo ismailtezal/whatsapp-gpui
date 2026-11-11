@@ -230,3 +230,16 @@ impl Store {
         })
     }
 }
+
+impl Store {
+    /// The oldest stored message of a chat: the anchor for asking the phone for more.
+    pub fn oldest_message(&self, chat: &str) -> Result<Option<MsgRow>> {
+        self.read(|conn| {
+            let sql = format!(
+                "SELECT {MSG_COLUMNS} FROM messages WHERE chat = ?1 AND ts > 0
+                 ORDER BY ts ASC, rowid ASC LIMIT 1"
+            );
+            conn.query_row(&sql, [chat], msg_row).optional()
+        })
+    }
+}
