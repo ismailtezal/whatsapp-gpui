@@ -48,6 +48,8 @@ pub struct Media {
     pub page_count: Option<u32>,
     /// A preview picture on disk (made for downloaded videos).
     pub thumb_file: Option<std::path::PathBuf>,
+    /// The display copy of a downloaded photo: small enough to show without a hitch.
+    pub display: Option<std::path::PathBuf>,
 }
 
 /// A stored message with everything the row needs resolved.
@@ -258,14 +260,22 @@ fn picture(view: &MsgView, t: &Tokens, overlay: Option<&'static str>) -> Div {
         .flex()
         .items_center()
         .justify_center();
+    // The display copy when there is one; the small embedded preview while it is being
+    // made; the file itself only when neither exists.
     let source = view
-        .row
-        .media_path
-        .as_ref()
-        .filter(|_| view.row.kind == MsgKind::Image)
-        .map(|path| gpui::img(std::path::PathBuf::from(path)))
+        .media
+        .display
+        .clone()
+        .map(gpui::img)
         .or_else(|| view.media.thumb_file.clone().map(gpui::img))
-        .or_else(|| view.media.thumb.clone().map(gpui::img));
+        .or_else(|| view.media.thumb.clone().map(gpui::img))
+        .or_else(|| {
+            view.row
+                .media_path
+                .as_ref()
+                .filter(|_| view.row.kind == MsgKind::Image)
+                .map(|path| gpui::img(std::path::PathBuf::from(path)))
+        });
     if let Some(image) = source {
         frame = frame.child(
             image
@@ -1229,7 +1239,13 @@ mod tests {
 
 /// Several photos sent together, as a two-column grid of square tiles.
 fn album_grid(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> AnyElement {
-    let first = (view.row.id.clone(), view.row.media_path.clone());
+    let first_path = view
+        .media
+        .display
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .or_else(|| view.row.media_path.clone());
+    let first = (view.row.id.clone(), first_path);
     let tile = 236.;
     let mut grid = div().w(px(tile * 2. + 4.)).flex().flex_wrap().gap(px(4.));
     for (slot, (id, path)) in std::iter::once(&first).chain(view.album.iter()).enumerate() {

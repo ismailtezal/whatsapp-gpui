@@ -225,11 +225,26 @@ pub fn tokens(cx: &App) -> &Tokens {
 
 /// Installs the tokens and makes the component library's own widgets (text fields,
 /// menus, tooltips, scrollbars) use the same colours, font and radii.
+/// Set for test runs: appearance changes then last for the run only and are never
+/// saved, so a test cannot overwrite what the owner chose.
+static VOLATILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Stops this run from saving appearance choices.
+pub fn set_volatile() {
+    VOLATILE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn remember(store: &std::sync::Arc<crate::store::Store>, key: &str, value: &str) {
+    if !VOLATILE.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = store.set_kv(key, value);
+    }
+}
+
 pub fn install(dark: bool, cx: &mut App) {
     let t = Tokens::of(palette(cx), dark).styled(style(cx));
     // Remember the mode for the next start.
     if let Some(store) = cx.try_global::<Appearance>().and_then(|a| a.store.clone()) {
-        let _ = store.set_kv("theme", if dark { "dark" } else { "light" });
+        remember(&store, "theme", if dark { "dark" } else { "light" });
     }
     gpui_component::Theme::change(
         if dark {
@@ -428,7 +443,7 @@ pub fn set_palette(palette: Palette, cx: &mut App) {
     let dark = cx.try_global::<Tokens>().map(|t| t.dark).unwrap_or(true);
     let store = cx.try_global::<Appearance>().and_then(|a| a.store.clone());
     if let Some(store) = &store {
-        let _ = store.set_kv("palette", palette.name());
+        remember(store, "palette", palette.name());
     }
     cx.set_global(Appearance { palette, store });
     install(dark, cx);
@@ -459,17 +474,21 @@ pub enum Style {
     /// Translucent surfaces over a blurred view of what is behind the window, with light
     /// edges that read as the rim of a pane of glass.
     Glass,
+    /// Real glass, drawn by the renderer: floating surfaces show a blurred copy of what
+    /// passes beneath them, bent at the rim like a thick pane, with a lit edge.
+    Liquid,
     /// Deeper blacks, accent-coloured hairlines and a soft glow on what is active.
     Futuristic,
 }
 
 impl Style {
-    pub const ALL: [Style; 3] = [Style::Modern, Style::Glass, Style::Futuristic];
+    pub const ALL: [Style; 4] = [Style::Modern, Style::Glass, Style::Liquid, Style::Futuristic];
 
     pub fn name(self) -> &'static str {
         match self {
             Style::Modern => "Modern",
             Style::Glass => "Glass",
+            Style::Liquid => "Liquid Glass",
             Style::Futuristic => "Futuristic",
         }
     }
@@ -478,6 +497,7 @@ impl Style {
         match self {
             Style::Modern => "Solid, layered surfaces",
             Style::Glass => "Translucent panes over a blurred backdrop",
+            Style::Liquid => "Real glass that blurs and bends what passes beneath",
             Style::Futuristic => "Deep blacks, accent lines and glow",
         }
     }
@@ -485,7 +505,11 @@ impl Style {
     pub fn from_name(name: &str) -> Style {
         Style::ALL
             .into_iter()
-            .find(|style| style.name().eq_ignore_ascii_case(name))
+            .find(|style| {
+                let full = style.name();
+                let first = full.split(' ').next().unwrap_or(full);
+                full.eq_ignore_ascii_case(name) || first.eq_ignore_ascii_case(name)
+            })
             .unwrap_or_default()
     }
 }
@@ -514,6 +538,24 @@ impl Tokens {
                 self.sidebar_border = self.fg(0.12);
                 self.input = self.fg(0.18);
             }
+            Style::Liquid => {
+                // The window keeps one opaque base colour (the rail token); every
+                // other surface is glass or a faint fill, so the ambient colours and
+                // the content beneath show through.
+                self.rail = if self.dark { hex(0x05060b) } else { hex(0xe6ebf3) };
+                self.sidebar = alpha(self.sidebar, 0.);
+                self.background = alpha(self.background, 0.);
+                self.card = self.fg(if self.dark { 0.07 } else { 0.05 });
+                self.popover = alpha(self.popover, 0.90);
+                self.tooltip = alpha(self.tooltip, 0.95);
+                self.sidebar_accent = self.fg(0.10);
+                self.secondary = self.fg(0.08);
+                self.muted = self.fg(0.08);
+                self.accent = self.fg(0.12);
+                self.border = self.fg(0.12);
+                self.sidebar_border = self.fg(0.10);
+                self.input = self.fg(0.18);
+            }
             Style::Futuristic => {
                 if self.dark {
                     self.background = hex(0x04050a);
@@ -539,6 +581,8 @@ impl Tokens {
             (Style::Modern, false) => self.fg(0.06),
             (Style::Glass, true) => self.tint(0.36),
             (Style::Glass, false) => self.fg(0.12),
+            (Style::Liquid, true) => self.tint(0.42),
+            (Style::Liquid, false) => self.fg(0.13),
             (Style::Futuristic, true) => self.tint(0.18),
             (Style::Futuristic, false) => self.fg(0.045),
         }
@@ -550,6 +594,7 @@ impl Tokens {
             (Style::Modern, _) => gpui::transparent_black(),
             // A light rim, like the edge of glass catching light.
             (Style::Glass, _) => self.fg(0.16),
+            (Style::Liquid, _) => self.fg(0.14),
             (Style::Futuristic, true) => self.tint(0.60),
             (Style::Futuristic, false) => self.tint(0.18),
         }
@@ -560,6 +605,8 @@ impl Tokens {
         match self.style {
             Style::Modern => self.fg(0.10),
             Style::Glass => self.fg(0.20),
+            // The glass draws its own lit rim.
+            Style::Liquid => gpui::transparent_black(),
             Style::Futuristic => self.tint(0.38),
         }
     }
@@ -585,6 +632,9 @@ impl Tokens {
                     spread_radius: px(0.),
                     inset: true,
                 });
+            }
+            Style::Liquid => {
+                shadows.clear();
             }
             Style::Futuristic => shadows.push(BoxShadow {
                 color: self.tint(0.22),
@@ -647,9 +697,108 @@ pub fn restore_style(cx: &mut App) {
 /// Switches style, keeping the palette and the dark or light mode.
 pub fn set_style(style: Style, cx: &mut App) {
     if let Some(store) = cx.try_global::<Appearance>().and_then(|a| a.store.clone()) {
-        let _ = store.set_kv("style", style.name());
+        remember(&store, "style", style.name());
     }
     cx.set_global(StyleChoice(style));
     let dark = cx.try_global::<Tokens>().map(|t| t.dark).unwrap_or(true);
     install(dark, cx);
+}
+
+/// Which kind of surface a glass fill is for; each bends and blurs differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Surface {
+    /// A large pane holding content: the chat list, the conversation panel.
+    Panel,
+    /// A bar floating over scrolling content: the chat header, the message box, the rail.
+    Bar,
+    /// A menu, picker or dialog: text over text, so it is the most frosted.
+    Menu,
+    /// A small floating control: a pill or a round button.
+    Chip,
+}
+
+impl Tokens {
+    /// Whether surfaces are drawn as real glass (blurred and refracted by the renderer).
+    pub fn liquid(&self) -> bool {
+        self.style == Style::Liquid
+    }
+
+    /// The fill of a surface. In the Liquid Glass style this is real glass: the surface
+    /// shows a blurred copy of what lies beneath, bent at its rim. In the other styles
+    /// it is the plain colour given as `solid`.
+    pub fn surface(&self, kind: Surface, solid: Hsla) -> gpui::Background {
+        if !self.liquid() {
+            return solid.into();
+        }
+        // Dark glass is smoked, light glass is milky.
+        let base = if self.dark {
+            hsla(225. / 360., 0.30, 0.07, 1.)
+        } else {
+            hsla(220. / 360., 0.35, 0.98, 1.)
+        };
+        let tint = |a: f32| Hsla { a, ..base };
+        let rim = hsla(0., 0., 1., if self.dark { 0.55 } else { 0.95 });
+        let spec = match kind {
+            Surface::Panel => gpui::Glass {
+                tint: tint(if self.dark { 0.52 } else { 0.50 }),
+                blur: 36.,
+                refraction: 26.,
+                bevel: 20.,
+                highlight: Hsla { a: rim.a * 0.75, ..rim },
+                dispersion: 0.10,
+                saturation: 1.5,
+            },
+            Surface::Bar => gpui::Glass {
+                tint: tint(if self.dark { 0.34 } else { 0.38 }),
+                blur: 9.,
+                refraction: 30.,
+                bevel: 18.,
+                highlight: rim,
+                dispersion: 0.16,
+                saturation: 1.6,
+            },
+            Surface::Menu => gpui::Glass {
+                tint: tint(if self.dark { 0.66 } else { 0.70 }),
+                blur: 26.,
+                refraction: 18.,
+                bevel: 12.,
+                highlight: Hsla { a: rim.a * 0.8, ..rim },
+                dispersion: 0.10,
+                saturation: 1.5,
+            },
+            Surface::Chip => gpui::Glass {
+                tint: tint(if self.dark { 0.30 } else { 0.36 }),
+                blur: 7.,
+                refraction: 12.,
+                bevel: 9.,
+                highlight: rim,
+                dispersion: 0.14,
+                saturation: 1.6,
+            },
+        };
+        gpui::glass(spec)
+    }
+
+    /// Fill of menus, pickers and dialogs.
+    pub fn popover_fill(&self) -> gpui::Background {
+        self.surface(Surface::Menu, self.popover)
+    }
+
+    /// The soft colours behind everything in the Liquid Glass style, as (x, y, size,
+    /// colour) with positions as fractions of the window. Glass needs something to bend.
+    pub fn ambient(&self) -> Vec<(f32, f32, f32, Hsla)> {
+        if !self.liquid() {
+            return Vec::new();
+        }
+        let hue = self.primary.h;
+        let turn = |by: f32| (hue + by).rem_euclid(1.);
+        let (light, alpha) = if self.dark { (0.42, 0.42) } else { (0.74, 0.55) };
+        // Neighbouring hues of the accent, so the backdrop reads as one mood.
+        vec![
+            (0.08, 0.10, 520., hsla(turn(0.), 0.80, light, alpha)),
+            (0.92, 0.16, 460., hsla(turn(0.11), 0.75, light, alpha * 0.85)),
+            (0.62, 0.98, 560., hsla(turn(-0.09), 0.80, light, alpha * 0.8)),
+            (0.30, 0.74, 360., hsla(turn(0.20), 0.70, light, alpha * 0.5)),
+        ]
+    }
 }

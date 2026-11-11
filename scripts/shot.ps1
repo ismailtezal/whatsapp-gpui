@@ -15,15 +15,16 @@ public static class Shot {
 }
 "@
 [void][Shot]::SetProcessDPIAware()
-$p = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-if (-not $p) { Write-Output "no window for $ProcessName"; exit 1 }
+. (Join-Path $PSScriptRoot "find-window.ps1")
+$hwnd = Find-AppWindow $ProcessName
+if ($hwnd -eq [IntPtr]::Zero) { Write-Output "no window for $ProcessName"; exit 1 }
 $r = New-Object Shot+RECT
-[void][Shot]::GetWindowRect($p.MainWindowHandle, [ref]$r)
+[void][Shot]::GetWindowRect($hwnd, [ref]$r)
 $w = $r.R - $r.L; $h = $r.B - $r.T
 $bmp = New-Object System.Drawing.Bitmap $w, $h
 $g = [System.Drawing.Graphics]::FromImage($bmp)
 $dc = $g.GetHdc()
-[void][Shot]::PrintWindow($p.MainWindowHandle, $dc, 2)
+[void][Shot]::PrintWindow($hwnd, $dc, 2)
 $g.ReleaseHdc($dc); $g.Dispose()
 $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
 Write-Output "saved $Out ($w x $h)"

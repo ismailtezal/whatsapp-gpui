@@ -8,8 +8,9 @@ connection. Windows only. Private now, open source later.
 - **Goal is full parity with the official WhatsApp client.** Never drop a feature to
   make the work easier. Report honestly what works, what is built but untested, and
   what is not done. `docs/ROADMAP.md` is the feature checklist and status; keep it true.
-- **Stop working when weekly plan usage reaches 50%** (either the all-models or the
-  per-model figure). Check with the usage tool regularly.
+- **Usage limit:** the owner first set a stop at 50% weekly plan usage, then lifted it on
+  2026-11-11 ("yes keep going and finish everything"). There is no usage stop now; if the
+  owner sets a new one, record it here and follow it.
 - **Testing on the real account:** never send a message to a real person. Send tests go
   only to a group with nobody else affected: the owner's "Dosyalar" group (one member),
   or a test group created for the purpose. `wa-test` enforces group-only sends. Do not

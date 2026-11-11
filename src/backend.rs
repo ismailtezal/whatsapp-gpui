@@ -101,6 +101,12 @@ async fn run(
     events: async_channel::Sender<UiEvent>,
 ) -> Result<()> {
     let _ = events.send(UiEvent::Connection(ConnState::Starting)).await;
+    if std::env::var("WA_OFFLINE").is_ok_and(|value| !value.is_empty()) {
+        // Interface test mode: show what is in the local store and never connect, so a
+        // test window can run beside the real app without taking over its session.
+        while commands.recv().await.is_some() {}
+        return Ok(());
+    }
     let session = SqliteStore::open(&crate::paths::session_db().to_string_lossy())
         .await
         .context("opening the session store")?;

@@ -2369,8 +2369,6 @@ dependencies = [
 [[package]]
 name = "gpui-pre"
 version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29db89613527079737f53752eab27fb65c9a7dd94979256c65a0e590c9fd34d8"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -2801,8 +2799,6 @@ dependencies = [
 [[package]]
 name = "gpui-pre-windows"
 version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7201762420222d5b5ce5bdf0056996199212a3349bfb2457a3a0238c688681f3"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -7858,6 +7854,7 @@ dependencies = [
  "gpui-pre-platform",
  "image",
  "qrcode",
+ "raw-window-handle",
  "rusqlite",
  "rust-embed",
  "sha2 0.10.9",

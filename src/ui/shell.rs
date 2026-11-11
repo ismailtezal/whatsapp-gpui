@@ -12,7 +12,7 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 
 use super::chat::{ChatEvent, ChatView};
-use super::theme::{COLUMN_W, HEADER_H, R_LG, R_MD, R_XL, RAIL_W, TITLE_BAR_H, Tokens, tokens};
+use super::theme::{COLUMN_W, HEADER_H, R_LG, R_MD, R_XL, RAIL_W, Surface, TITLE_BAR_H, Tokens, tokens};
 use super::widgets::{avatar, count_badge, duration, icon, icon_button, list_time, tip};
 use crate::backend::Backend;
 use crate::content::preview_label;
@@ -20,6 +20,18 @@ use crate::events::{Command, ConnState, UiEvent};
 use crate::model::{Ack, ChatKind, ChatRow, ContactRow, MsgKind, MsgRow, display_number};
 use crate::store::Store;
 use crate::store_more::CallRow;
+
+/// One row of the column, by position in the list it comes from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowKey {
+    Label(&'static str),
+    Chat(usize),
+    Call(usize),
+    Starred(usize),
+    Hit(usize),
+    Contact(usize),
+    Status(usize),
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Section {
@@ -91,6 +103,11 @@ pub struct Shell {
     confirm_logout: bool,
     /// The window backdrop last applied, so it is only set when the style changes.
     backdrop: Option<gpui::WindowBackgroundAppearance>,
+    /// Set by events; the lists are re-read once after a batch of events.
+    stale_chats: bool,
+    stale_open_chat: bool,
+    /// Names already looked up for rows (calls, search hits); cleared when chats change.
+    titles: std::cell::RefCell<std::collections::HashMap<String, String>>,
     privacy: Vec<(String, String)>,
     blocked: Vec<String>,
     /// Picking several contacts for a new group instead of one to chat with.
@@ -149,8 +166,25 @@ impl Shell {
 
         let events = backend.events();
         let pump = cx.spawn(async move |this, cx| {
-            while let Ok(event) = events.recv().await {
-                let alive = this.update(cx, |this, cx| this.on_event(event, cx)).is_ok();
+            while let Ok(first) = events.recv().await {
+                // Take everything that is already waiting: a burst of events (history
+                // arriving, a busy group) is applied in one go and the lists are
+                // re-read once, not once per event.
+                let mut batch = vec![first];
+                while batch.len() < 1024 {
+                    match events.try_recv() {
+                        Ok(event) => batch.push(event),
+                        Err(_) => break,
+                    }
+                }
+                let alive = this
+                    .update(cx, |this, cx| {
+                        for event in batch {
+                            this.on_event(event, cx);
+                        }
+                        this.flush_reloads(cx);
+                    })
+                    .is_ok();
                 if !alive {
                     break;
                 }
@@ -181,6 +215,9 @@ impl Shell {
             last_error: None,
             confirm_logout: false,
             backdrop: None,
+            stale_chats: false,
+            stale_open_chat: false,
+            titles: Default::default(),
             privacy: Vec::new(),
             blocked: Vec::new(),
             group_mode: false,
@@ -219,6 +256,8 @@ impl Shell {
 
     /// Re-reads what the current section shows.
     fn reload(&mut self) {
+        let _perf = crate::perf::scope("shell.reload");
+        self.titles.borrow_mut().clear();
         self.chats = self
             .store
             .chats(self.section == Section::Archived)
@@ -289,6 +328,7 @@ impl Shell {
     }
 
     fn on_event(&mut self, event: UiEvent, cx: &mut Context<Self>) {
+        let _perf = crate::perf::scope("shell.event");
         match event {
             UiEvent::Connection(state) => {
                 if state == ConnState::Online {
@@ -321,19 +361,15 @@ impl Shell {
                     view.update(cx, |view, cx| view.set_me(name, jid, cx));
                 }
             }
-            UiEvent::ChatsChanged => self.reload(),
+            UiEvent::ChatsChanged => self.stale_chats = true,
             UiEvent::HistoryProgress { .. } => {
                 // History arrived (first sync or an answer to "get earlier messages").
-                self.reload();
-                if let Some(view) = &self.chat {
-                    view.update(cx, |view, cx| view.reload(cx));
-                }
+                self.stale_chats = true;
+                self.stale_open_chat = true;
             }
             UiEvent::ChatChanged { chat } => {
-                if self.selected.as_deref() == Some(chat.as_str())
-                    && let Some(view) = &self.chat
-                {
-                    view.update(cx, |view, cx| view.reload(cx));
+                if self.selected.as_deref() == Some(chat.as_str()) {
+                    self.stale_open_chat = true;
                 }
                 if chat == "status@broadcast" && self.section == Section::Status {
                     self.reload_statuses();
@@ -433,6 +469,19 @@ impl Shell {
         cx.notify();
     }
 
+    /// Re-reads what events marked as stale. Called once after a batch of events.
+    fn flush_reloads(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.stale_chats) {
+            self.reload();
+        }
+        if std::mem::take(&mut self.stale_open_chat)
+            && let Some(view) = &self.chat
+        {
+            view.update(cx, |view, cx| view.reload(cx));
+        }
+        cx.notify();
+    }
+
     fn open_chat(&mut self, jid: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.picking = false;
         self.status_open = None;
@@ -477,19 +526,21 @@ impl Shell {
         self.open_chat(jid, window, cx);
     }
 
-    fn visible_chats(&self) -> Vec<&ChatRow> {
-        let query = self.query.trim().to_lowercase();
-        self.chats
-            .iter()
-            .filter(|chat| match self.section {
-                Section::Unread => chat.unread > 0 || chat.marked_unread,
-                Section::Groups => matches!(chat.kind, ChatKind::Group | ChatKind::Community),
-                Section::Channels => chat.kind == ChatKind::Newsletter,
-                Section::Chats => chat.kind != ChatKind::Newsletter,
-                _ => true,
-            })
-            .filter(|chat| query.is_empty() || chat.title.to_lowercase().contains(&query))
-            .collect()
+    /// The name shown for a chat or person. Rows are rebuilt on every frame they are on
+    /// screen, so the answer is remembered rather than read from the database each time.
+    fn title_of(&self, jid: &str) -> String {
+        if let Some(title) = self.titles.borrow().get(jid) {
+            return title.clone();
+        }
+        let title = match self.store.chat(jid).ok().flatten() {
+            Some(chat) => chat.title,
+            None => self
+                .store
+                .display_name(jid)
+                .unwrap_or_else(|_| display_number(jid)),
+        };
+        self.titles.borrow_mut().insert(jid.to_string(), title.clone());
+        title
     }
 
     // ---- title bar -----------------------------------------------------------------
@@ -528,7 +579,7 @@ impl Shell {
             .flex_shrink_0()
             .flex()
             .items_center()
-            .bg(t.rail)
+            .when(!t.liquid(), |this| this.bg(t.rail))
             .child(
                 div()
                     .id("title-drag")
@@ -620,10 +671,15 @@ impl Shell {
                 .on_click(cx.listener(move |this, _, _, cx| this.set_section(section, cx)))
         };
         div()
-            .w(RAIL_W)
-            .h_full()
             .flex_shrink_0()
-            .bg(t.rail)
+            .when(!t.liquid(), |this| this.w(RAIL_W).h_full().bg(t.rail))
+            .when(t.liquid(), |this| {
+                this.w(px(56.))
+                    .ml(px(8.))
+                    .mb(px(8.))
+                    .rounded(px(22.))
+                    .bg(t.surface(Surface::Bar, t.rail))
+            })
             .flex()
             .flex_col()
             .items_center()
@@ -839,13 +895,7 @@ impl Shell {
     }
 
     fn message_hit_row(&self, slot: usize, row: &MsgRow, cx: &mut Context<Self>) -> AnyElement {
-        let title = self
-            .store
-            .chat(&row.chat)
-            .ok()
-            .flatten()
-            .map(|c| c.title)
-            .unwrap_or_else(|| display_number(&row.chat));
+        let title = self.title_of(&row.chat);
         let who = if row.from_me { "You: " } else { "" };
         let detail = div()
             .truncate()
@@ -873,13 +923,7 @@ impl Shell {
 
     fn call_row(&self, slot: usize, call: &CallRow, cx: &mut Context<Self>) -> AnyElement {
         let t = tokens(cx).clone();
-        let title = match self.store.chat(&call.peer).ok().flatten() {
-            Some(chat) => chat.title,
-            None => self
-                .store
-                .display_name(&call.peer)
-                .unwrap_or_else(|_| display_number(&call.peer)),
-        };
+        let title = self.title_of(&call.peer);
         let (glyph, color, word) = if call.missed() {
             ("phone-missed", t.destructive, "Missed")
         } else if call.outgoing {
@@ -919,136 +963,161 @@ impl Shell {
         .into_any_element()
     }
 
-    fn rows(&self, cx: &mut Context<Self>) -> (Vec<AnyElement>, &'static str) {
-        let t = tokens(cx).clone();
-        let label = |text: &'static str| {
-            div()
-                .px(px(16.))
-                .pt(px(10.))
-                .pb(px(4.))
-                .flex_shrink_0()
-                .text_size(px(12.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(Tokens::with_alpha(t.sidebar_foreground, 0.6))
-                .child(text)
-                .into_any_element()
-        };
+    /// What the column lists, as cheap keys. Only the rows on screen are built from
+    /// them, so a long list costs nothing per frame.
+    fn row_keys(&self) -> (Vec<RowKey>, &'static str) {
         if self.picking {
             let query = self.query.trim().to_lowercase();
-            let rows = self
+            let keys = self
                 .contacts
                 .iter()
-                .filter(|c| {
+                .enumerate()
+                .filter(|(_, c)| {
                     query.is_empty()
                         || c.name.as_deref().unwrap_or_default().to_lowercase().contains(&query)
                         || c.jid.contains(&query)
                 })
-                .enumerate()
-                .map(|(slot, contact)| {
-                    let name = contact.name.clone().unwrap_or_else(|| display_number(&contact.jid));
-                    let detail = div()
-                        .truncate()
-                        .child(contact.about.clone().unwrap_or_else(|| display_number(&contact.jid)))
-                        .into_any_element();
-                    let jid = contact.jid.clone();
-                    let picked = self.group_picks.contains(&contact.jid);
-                    self.list_row(
-                        SharedString::from(format!("contact-{slot}")),
-                        &contact.jid,
-                        &name,
-                        Some(&contact.jid),
-                        String::new(),
-                        detail,
-                        picked.then(|| icon("check").text_color(t.primary).into_any_element()),
-                        picked,
-                        false,
-                        cx,
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| this.pick_contact(&jid, window, cx)))
-                    .into_any_element()
-                })
+                .map(|(index, _)| RowKey::Contact(index))
                 .collect();
-            return (rows, "No contacts match.");
+            return (keys, "No contacts match.");
         }
         match self.section {
-            Section::Calls => (
-                self.calls
-                    .iter()
-                    .enumerate()
-                    .map(|(slot, call)| self.call_row(slot, call, cx))
-                    .collect(),
-                "No calls yet.",
-            ),
+            Section::Calls => ((0..self.calls.len()).map(RowKey::Call).collect(), "No calls yet."),
             Section::Starred => (
-                self.starred
-                    .iter()
-                    .enumerate()
-                    .map(|(slot, row)| self.message_hit_row(slot, row, cx))
-                    .collect(),
+                (0..self.starred.len()).map(RowKey::Starred).collect(),
                 "No starred messages. Right-click a message and choose Star.",
             ),
-            Section::Status => {
-                let rows = self
-                    .statuses
-                    .iter()
-                    .enumerate()
-                    .map(|(index, group)| {
-                        let count = group.items.len();
-                        let detail = div()
-                            .truncate()
-                            .child(format!("{count} update{}", if count == 1 { "" } else { "s" }))
-                            .into_any_element();
-                        let picture = if group.sender == "me" {
-                            self.me_jid.as_deref()
-                        } else {
-                            Some(group.sender.as_str())
-                        };
-                        self.list_row(
-                            SharedString::from(format!("status-{index}")),
-                            &group.sender,
-                            &group.name,
-                            picture,
-                            group.items.last().map(|r| list_time(r.ts)).unwrap_or_default(),
-                            detail,
-                            None,
-                            self.status_open.is_some_and(|(open, _)| open == index),
-                            false,
-                            cx,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.status_open = Some((index, 0));
-                            this.request_status_media();
-                            cx.notify();
-                        }))
-                        .into_any_element()
-                    })
-                    .collect();
-                (rows, "No status updates in the last 24 hours.")
-            }
+            Section::Status => (
+                (0..self.statuses.len()).map(RowKey::Status).collect(),
+                "No status updates in the last 24 hours.",
+            ),
             Section::Settings => (Vec::new(), ""),
             _ => {
-                let mut rows: Vec<AnyElement> = Vec::new();
-                let chats = self.visible_chats();
-                let searching = !self.query.trim().is_empty();
-                if searching && !chats.is_empty() {
-                    rows.push(label("Chats"));
+                let mut keys = Vec::new();
+                let query = self.query.trim().to_lowercase();
+                let chats: Vec<usize> = self
+                    .chats
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, chat)| match self.section {
+                        Section::Unread => chat.unread > 0 || chat.marked_unread,
+                        Section::Groups => matches!(chat.kind, ChatKind::Group | ChatKind::Community),
+                        Section::Channels => chat.kind == ChatKind::Newsletter,
+                        Section::Chats => chat.kind != ChatKind::Newsletter,
+                        _ => true,
+                    })
+                    .filter(|(_, chat)| query.is_empty() || chat.title.to_lowercase().contains(&query))
+                    .map(|(index, _)| index)
+                    .collect();
+                if !query.is_empty() && !chats.is_empty() {
+                    keys.push(RowKey::Label("Chats"));
                 }
-                rows.extend(chats.into_iter().map(|chat| self.chat_row(chat, cx)));
+                keys.extend(chats.into_iter().map(RowKey::Chat));
                 if !self.hits.is_empty() {
-                    rows.push(label("Messages"));
-                    rows.extend(
-                        self.hits
-                            .iter()
-                            .enumerate()
-                            .map(|(slot, row)| self.message_hit_row(slot, row, cx)),
-                    );
+                    keys.push(RowKey::Label("Messages"));
+                    keys.extend((0..self.hits.len()).map(RowKey::Hit));
                 }
-                (rows, "No chats here.")
+                (keys, "No chats here.")
+            }
+        }
+    }
+
+    /// Builds one row of the column.
+    fn render_row(&self, key: RowKey, cx: &mut Context<Self>) -> AnyElement {
+        let t = tokens(cx).clone();
+        let nothing = || div().into_any_element();
+        match key {
+            RowKey::Label(text) => div()
+                .h_full()
+                .px(px(16.))
+                .pb(px(6.))
+                .flex()
+                .items_end()
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(Tokens::with_alpha(t.sidebar_foreground, 0.6))
+                .child(text)
+                .into_any_element(),
+            RowKey::Chat(index) => match self.chats.get(index) {
+                Some(chat) => self.chat_row(chat, cx),
+                None => nothing(),
+            },
+            RowKey::Call(index) => match self.calls.get(index) {
+                Some(call) => self.call_row(index, call, cx),
+                None => nothing(),
+            },
+            RowKey::Starred(index) => match self.starred.get(index) {
+                Some(row) => self.message_hit_row(index, row, cx),
+                None => nothing(),
+            },
+            RowKey::Hit(index) => match self.hits.get(index) {
+                Some(row) => self.message_hit_row(index, row, cx),
+                None => nothing(),
+            },
+            RowKey::Contact(index) => {
+                let Some(contact) = self.contacts.get(index) else {
+                    return nothing();
+                };
+                let name = contact.name.clone().unwrap_or_else(|| display_number(&contact.jid));
+                let detail = div()
+                    .truncate()
+                    .child(contact.about.clone().unwrap_or_else(|| display_number(&contact.jid)))
+                    .into_any_element();
+                let jid = contact.jid.clone();
+                let picked = self.group_picks.contains(&contact.jid);
+                self.list_row(
+                    SharedString::from(format!("contact-{index}")),
+                    &contact.jid,
+                    &name,
+                    Some(&contact.jid),
+                    String::new(),
+                    detail,
+                    picked.then(|| icon("check").text_color(t.primary).into_any_element()),
+                    picked,
+                    false,
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, window, cx| this.pick_contact(&jid, window, cx)))
+                .into_any_element()
+            }
+            RowKey::Status(index) => {
+                let Some(group) = self.statuses.get(index) else {
+                    return nothing();
+                };
+                let count = group.items.len();
+                let detail = div()
+                    .truncate()
+                    .child(format!("{count} update{}", if count == 1 { "" } else { "s" }))
+                    .into_any_element();
+                let picture = if group.sender == "me" {
+                    self.me_jid.as_deref()
+                } else {
+                    Some(group.sender.as_str())
+                };
+                self.list_row(
+                    SharedString::from(format!("status-{index}")),
+                    &group.sender,
+                    &group.name,
+                    picture,
+                    group.items.last().map(|r| list_time(r.ts)).unwrap_or_default(),
+                    detail,
+                    None,
+                    self.status_open.is_some_and(|(open, _)| open == index),
+                    false,
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.status_open = Some((index, 0));
+                    this.request_status_media();
+                    cx.notify();
+                }))
+                .into_any_element()
             }
         }
     }
 
     fn column(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let _perf = crate::perf::scope("shell.column");
         let t = tokens(cx).clone();
         let filter = |section: Section, label: &'static str, cx: &mut Context<Self>| {
             let active = self.section == section;
@@ -1075,8 +1144,9 @@ impl Shell {
         let show_filters =
             matches!(self.section, Section::Chats | Section::Unread | Section::Groups) && !self.picking;
         let show_search = self.section.lists_chats() || self.picking;
-        let (rows, empty_text) = self.rows(cx);
-        let empty = rows.is_empty();
+        let (keys, empty_text) = self.row_keys();
+        let empty = keys.is_empty();
+        let list_id = self.section as usize + if self.picking { 100 } else { 0 };
         let title = if self.picking {
             "New chat"
         } else {
@@ -1085,8 +1155,15 @@ impl Shell {
 
         div()
             .w(COLUMN_W)
-            .h_full()
             .flex_shrink_0()
+            .when(!t.liquid(), |this| this.h_full())
+            .when(t.liquid(), |this| {
+                this.ml(px(8.))
+                    .mb(px(8.))
+                    .rounded(px(20.))
+                    .overflow_hidden()
+                    .bg(t.surface(Surface::Panel, t.sidebar))
+            })
             .flex()
             .flex_col()
             .child(
@@ -1206,27 +1283,34 @@ impl Shell {
                         .child(filter(Section::Groups, "Groups", cx)),
                 )
             })
-            .child(
-                div()
-                    .id("column-list")
+            .when(empty, |this| {
+                this.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .p(px(24.))
+                        .text_size(px(13.))
+                        .text_color(t.muted_foreground)
+                        .child(empty_text),
+                )
+            })
+            .when(!empty, |this| {
+                // Every row is 60px tall plus a 2px gap, so only those on screen are built.
+                this.child(
+                    gpui::uniform_list(
+                        ("column-list", list_id),
+                        keys.len(),
+                        cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                            range
+                                .filter_map(|index| keys.get(index).copied())
+                                .map(|key| div().h(px(62.)).child(this.render_row(key, cx)))
+                                .collect::<Vec<_>>()
+                        }),
+                    )
                     .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.))
-                    .pb(px(8.))
-                    .children(rows)
-                    .when(empty && !empty_text.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .p(px(24.))
-                                .text_size(px(13.))
-                                .text_color(t.muted_foreground)
-                                .child(empty_text),
-                        )
-                    }),
-            )
+                    .min_h_0(),
+                )
+            })
     }
 
     // ---- chat row menu -----------------------------------------------------------------
@@ -1300,7 +1384,7 @@ impl Shell {
             .rounded(R_XL)
             .border_1()
             .border_color(t.border)
-            .bg(t.popover)
+            .bg(t.popover_fill())
             .shadow(t.shadow_popover())
             .flex()
             .flex_col()
@@ -1759,6 +1843,8 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf::frame();
+        let _perf = crate::perf::scope("shell.render");
         let t = tokens(cx).clone();
         let panel: AnyElement = match (self.section, self.status_open, &self.chat) {
             (Section::Settings, _, _) => self.settings_panel(cx),
@@ -1773,14 +1859,37 @@ impl Render for Shell {
             window.set_background_appearance(backdrop);
             self.backdrop = Some(backdrop);
         }
+        // The liquid style paints soft colours behind everything, for the glass to bend.
+        let mut ambient = div().absolute().inset_0().overflow_hidden();
+        let viewport = window.viewport_size();
+        for (x, y, size, color) in t.ambient() {
+            ambient = ambient.child(
+                div()
+                    .absolute()
+                    .left(viewport.width * x - px(size / 2.))
+                    .top(viewport.height * y - px(size / 2.))
+                    .size(px(size))
+                    .rounded_full()
+                    // Only the shadow is drawn: a wide, soft disc of colour.
+                    .shadow(vec![gpui::BoxShadow {
+                        color,
+                        offset: gpui::point(px(0.), px(0.)),
+                        blur_radius: px(size * 0.7),
+                        spread_radius: px(0.),
+                        inset: false,
+                    }]),
+            );
+        }
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(t.rail)
             .text_color(t.foreground)
             .font_family(super::theme::FONT_UI)
             .text_size(px(14.))
+            .when(t.liquid(), |this| this.child(ambient))
             .child(self.title_bar(window, cx))
             .child(
                 div()
@@ -1796,13 +1905,13 @@ impl Render for Shell {
                             .bg(t.sidebar)
                             .child(self.column(cx))
                             .child(
-                                div().flex_1().min_w_0().p(px(8.)).child(
+                                div().flex_1().min_w_0().p(px(8.)).when(t.liquid(), |this| this.pt(px(0.))).child(
                                     div()
                                         .size_full()
-                                        .rounded(R_XL)
+                                        .rounded(if t.liquid() { px(20.) } else { R_XL })
                                         .border_1()
                                         .border_color(t.panel_border())
-                                        .bg(t.background)
+                                        .bg(t.surface(Surface::Panel, t.background))
                                         .shadow(t.panel_shadow())
                                         .overflow_hidden()
                                         .child(panel),

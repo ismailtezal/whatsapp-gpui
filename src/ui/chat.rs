@@ -18,7 +18,7 @@ use super::message::{
     MsgView, Quote, ReactionChip, RowHooks, day_separator, media_of, message_row, notice_of,
     record_of, unread_separator,
 };
-use super::theme::{HEADER_H, R_LG, R_MD, R_XL, Tokens, tokens};
+use super::theme::{HEADER_H, R_LG, R_MD, R_XL, Surface, Tokens, tokens};
 use super::widgets::{avatar, day_label, icon, icon_button, local_day, tip};
 use crate::backend::Backend;
 use crate::content::{self, preview_label};
@@ -76,6 +76,9 @@ struct EmojiState {
 }
 
 pub struct ChatView {
+    /// Heights of the floating top and bottom bars in the Liquid Glass style, measured
+    /// when they are laid out, so the message list can leave room beneath them.
+    insets: Rc<std::cell::Cell<(f32, f32)>>,
     backend: Backend,
     store: Arc<Store>,
     pub chat: ChatRow,
@@ -108,7 +111,14 @@ pub struct ChatView {
     /// ID of the own message whose receipts are being shown.
     info_for: Option<String>,
     /// IDs of the pinned messages of this chat, newest pin first.
+    /// Whether the info panel lists every member or only the first ten.
+    members_expanded: bool,
+    /// The identity and appearance stamp of each list item, to tell the list exactly
+    /// which rows changed on a reload.
+    item_keys: Vec<(String, u64)>,
     pins: Vec<String>,
+    /// Wording of the first pinned message, read when the chat is loaded.
+    pin_text: Option<String>,
     video: Option<VideoPlay>,
     /// A video to start on the next frame: (message ID, file, whether it loops).
     pending_video: Option<(String, PathBuf, bool)>,
@@ -185,6 +195,7 @@ impl ChatView {
             me_jid,
             items: Vec::new(),
             list: ListState::new(0, ListAlignment::Bottom, px(1200.)),
+            insets: Rc::new(std::cell::Cell::new((64., 84.))),
             input,
             names: HashMap::new(),
             loaded: PAGE,
@@ -204,7 +215,10 @@ impl ChatView {
             forwarding: None,
             forward_targets: Vec::new(),
             info_for: None,
+            members_expanded: false,
+            item_keys: Vec::new(),
             pins: Vec::new(),
+            pin_text: None,
             video: None,
             pending_video: None,
             pending: Vec::new(),
@@ -299,7 +313,13 @@ impl ChatView {
 
     /// Re-reads the loaded window of messages from the store and rebuilds the rows.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        let _perf = crate::perf::scope("chat.reload");
         self.pins = self.store.pinned(&self.chat.jid).unwrap_or_default();
+        self.pin_text = self
+            .pins
+            .first()
+            .and_then(|id| self.store.message(&self.chat.jid, id).ok().flatten())
+            .map(|message| preview_label(message.kind, message.text.as_deref()));
         if self.info_open || self.chat.kind != ChatKind::User {
             self.refresh_members();
         }
@@ -336,6 +356,7 @@ impl ChatView {
         let mut previous_day = i64::MIN;
         let mut skip_to = 0usize;
         let mut missing_previews: Vec<std::path::PathBuf> = Vec::new();
+        let mut missing_views: Vec<std::path::PathBuf> = Vec::new();
         for (index, row) in rows.iter().enumerate() {
             if index < skip_to {
                 continue;
@@ -361,6 +382,16 @@ impl ChatView {
                     media.thumb_file = Some(preview);
                 } else if self.requested.insert(format!("thumb:{}", row.id)) {
                     missing_previews.push(std::path::PathBuf::from(file));
+                }
+            }
+            if row.kind == MsgKind::Image
+                && let Some(file) = &row.media_path
+            {
+                let copy = crate::thumbs::view_path(std::path::Path::new(file));
+                if copy.exists() {
+                    media.display = Some(copy);
+                } else if self.requested.insert(format!("view:{}", row.id)) {
+                    missing_views.push(std::path::PathBuf::from(file));
                 }
             }
             let (author_seed, author) = self.author_of(row);
@@ -497,7 +528,16 @@ impl ChatView {
                             id: next.id.clone(),
                         });
                     }
-                    album.push((next.id.clone(), next.media_path.clone()));
+                    // Tiles show the display copy; the viewer opens the original by ID.
+                    let shown = next.media_path.as_ref().map(|file| {
+                        let file = std::path::Path::new(file);
+                        let copy = crate::thumbs::view_path(file);
+                        if !copy.exists() && self.requested.insert(format!("view:{}", next.id)) {
+                            missing_views.push(file.to_path_buf());
+                        }
+                        crate::thumbs::display_path(file).to_string_lossy().into_owned()
+                    });
+                    album.push((next.id.clone(), shown));
                 }
                 skip_to = index + 1 + album.len();
             }
@@ -527,12 +567,15 @@ impl ChatView {
         }
 
         // Videos downloaded before previews existed get theirs made in the background.
-        if !missing_previews.is_empty() {
+        if !missing_previews.is_empty() || !missing_views.is_empty() {
             cx.spawn(async move |this, cx| {
                 cx.background_executor()
                     .spawn(async move {
                         for video in missing_previews {
                             let _ = crate::thumbs::make_video_thumb(&video);
+                        }
+                        for photo in missing_views {
+                            let _ = crate::thumbs::make_view_copy(&photo);
                         }
                     })
                     .await;
@@ -541,13 +584,45 @@ impl ChatView {
             .detach();
         }
 
-        let old_count = self.list.item_count();
+        // Tell the list only what changed. Replacing everything would throw away every
+        // measured row height and move a scrolled-up view back to the top of the page
+        // each time a tick, a reaction or a finished download touches the chat.
+        let keys: Vec<(String, u64)> = items.iter().map(item_key).collect();
+        let old = std::mem::take(&mut self.item_keys);
         self.items = items;
-        if old_count == 0 {
-            self.list.reset(self.items.len());
+        if old.is_empty() {
+            self.list.reset(keys.len());
         } else {
-            self.list.splice(0..old_count, self.items.len());
+            let same = |a: &(String, u64), b: &(String, u64)| a.0 == b.0;
+            let prefix = old.iter().zip(&keys).take_while(|(a, b)| same(a, b)).count();
+            let room = old.len().min(keys.len()) - prefix;
+            let suffix = old
+                .iter()
+                .rev()
+                .zip(keys.iter().rev())
+                .take(room)
+                .take_while(|(a, b)| same(a, b))
+                .count();
+            // Rows that are still there but look different (a reaction added, a photo
+            // downloaded) are measured again, one by one.
+            for index in 0..prefix {
+                if old[index].1 != keys[index].1 {
+                    self.list.splice(index..index + 1, 1);
+                }
+            }
+            for back in 1..=suffix {
+                let (before, after) = (old.len() - back, keys.len() - back);
+                if old[before].1 != keys[after].1 {
+                    // Positions are still the old ones here: the middle is replaced last.
+                    self.list.splice(before..before + 1, 1);
+                }
+            }
+            let (removed, added) = (old.len() - prefix - suffix, keys.len() - prefix - suffix);
+            if removed > 0 || added > 0 {
+                self.list.splice(prefix..prefix + removed, added);
+            }
         }
+        self.item_keys = keys;
         cx.notify();
     }
 
@@ -806,6 +881,7 @@ impl ChatView {
     // ---- rows ------------------------------------------------------------------------------
 
     fn render_item(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let _perf = crate::perf::scope("chat.item");
         let t = tokens(cx).clone();
         let Some(item) = self.items.get(index) else {
             return div().into_any_element();
@@ -862,7 +938,7 @@ impl ChatView {
             .rounded(R_LG)
             .border_1()
             .border_color(t.border)
-            .bg(t.popover)
+            .bg(t.popover_fill())
             .shadow(t.shadow_raised());
         for (slot, emoji) in QUICK_REACTIONS.iter().take(3).enumerate() {
             let react_id = id.clone();
@@ -1026,7 +1102,7 @@ impl ChatView {
             .rounded(R_XL)
             .border_1()
             .border_color(t.border)
-            .bg(t.popover)
+            .bg(t.popover_fill())
             .shadow(t.shadow_popover())
             .flex()
             .flex_col()
@@ -1214,7 +1290,7 @@ impl ChatView {
             .rounded(R_XL)
             .border_1()
             .border_color(t.border)
-            .bg(t.popover)
+            .bg(t.popover_fill())
             .shadow(t.shadow_popover())
             .overflow_hidden()
             .flex()
@@ -1316,8 +1392,13 @@ impl ChatView {
             .flex()
             .items_center()
             .gap(px(10.))
-            .border_b_1()
-            .border_color(Tokens::with_alpha(t.border, t.border.a * 0.7))
+            .when(!t.liquid(), |this| {
+                this.border_b_1()
+                    .border_color(Tokens::with_alpha(t.border, t.border.a * 0.7))
+            })
+            .when(t.liquid(), |this| {
+                this.rounded(px(20.)).bg(t.surface(Surface::Bar, t.card))
+            })
             .child(avatar(
                 &self.chat.jid,
                 &self.chat.title,
@@ -1404,13 +1485,18 @@ impl ChatView {
                 )
             })
         };
-        div().px(px(16.)).pb(px(20.)).flex_shrink_0().child(
+        let liquid = t.liquid();
+        div()
+            .px(px(if liquid { 10. } else { 16. }))
+            .pb(px(if liquid { 10. } else { 20. }))
+            .flex_shrink_0()
+            .child(
             div()
-                .rounded(R_XL)
+                .rounded(if liquid { px(22.) } else { R_XL })
                 .border_1()
-                .border_color(t.fg(0.08))
-                .bg(t.card)
-                .shadow(t.shadow_raised())
+                .border_color(if liquid { gpui::transparent_black() } else { t.fg(0.08) })
+                .bg(t.surface(Surface::Bar, t.card))
+                .when(!liquid, |this| this.shadow(t.shadow_raised()))
                 .overflow_hidden()
                 .flex()
                 .flex_col()
@@ -1522,6 +1608,21 @@ impl ChatView {
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _perf = crate::perf::scope("chat.render");
+        crate::perf::note(|| {
+            let top = self.list.logical_scroll_top();
+            format!(
+                "scroll item {} of {} offset {:.0}",
+                top.item_ix,
+                self.list.item_count(),
+                top.offset_in_item / px(1.)
+            )
+        });
+        if crate::perf::auto_scroll() {
+            // Measurement aid: keep the list moving so frame times can be read.
+            self.list.scroll_by(px(crate::perf::scroll_step()));
+            window.request_animation_frame();
+        }
         let t = tokens(cx).clone();
         let view = cx.entity();
         let older = self.has_older;
@@ -1563,25 +1664,30 @@ impl Render for ChatView {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.send_files(paths.paths().to_vec(), cx);
             }))
-            .child(self.header(cx))
-            .children(self.search_bar(cx))
-            .children(self.pinned_bar(cx))
+            .when(!t.liquid(), |this| {
+                this.child(self.header(cx))
+                    .children(self.search_bar(cx))
+                    .children(self.pinned_bar(cx))
+            })
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(
+                    .child(if t.liquid() {
+                        self.floating_column(older, view, &t, cx)
+                    } else {
                         div()
                             .flex_1()
                             .min_w_0()
                             .h_full()
                             .flex()
                             .flex_col()
-                            .child(self.messages_area(older, view, &t, cx))
+                            .child(self.messages_area(older, view, &t, None, cx))
                             .children(self.mention_popup(cx))
-                            .child(self.composer(cx)),
-                    )
+                            .child(self.composer(cx))
+                            .into_any_element()
+                    })
                     .children(self.info_panel(cx)),
             )
             .children(viewer)
@@ -1604,9 +1710,12 @@ impl ChatView {
         older: bool,
         view: Entity<Self>,
         t: &Tokens,
+        floating: Option<(f32, f32)>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = t.clone();
+        // Room left for bars floating over the list (Liquid Glass style).
+        let (pad_top, pad_bottom) = floating.unwrap_or((0., 20.));
         if self.search_open && !self.search_hits.is_empty() {
             let mut results = div()
                 .id("chat-search-results")
@@ -1616,7 +1725,8 @@ impl ChatView {
                 .flex()
                 .flex_col()
                 .gap(px(8.))
-                .p(px(12.));
+                .p(px(12.))
+                .when(floating.is_some(), |this| this.pt(px(pad_top)).pb(px(pad_bottom)));
             for (slot, hit) in self.search_hits.iter().enumerate() {
                 let id = hit.id.clone();
                 let hover = t.fg(0.15);
@@ -1655,7 +1765,7 @@ impl ChatView {
             .min_h_0()
             .flex()
             .flex_col()
-            .when(true, |this| {
+            .when(floating.is_none(), |this| {
                         this.child(
                             div().flex().justify_center().py(px(6.)).child(
                                 div()
@@ -1686,8 +1796,105 @@ impl ChatView {
                         })
                         .flex_1()
                         .min_h_0()
-                        .pb(px(20.)),
+                        .pt(px(pad_top))
+                        .pb(px(pad_bottom)),
                     )
+            .into_any_element()
+    }
+
+    /// The conversation column in the Liquid Glass style: the messages fill it, and the
+    /// header, pinned bar and message box float over them as glass, so messages pass
+    /// beneath and are bent by the glass.
+    fn floating_column(
+        &self,
+        older: bool,
+        view: Entity<Self>,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (top, bottom) = self.insets.get();
+        let measure = |cell: Rc<std::cell::Cell<(f32, f32)>>, is_top: bool| {
+            gpui::canvas(
+                move |bounds, window, _cx| {
+                    let height = bounds.size.height / px(1.);
+                    let (top, bottom) = cell.get();
+                    let old = if is_top { top } else { bottom };
+                    if (old - height).abs() > 0.5 {
+                        cell.set(if is_top { (height, bottom) } else { (top, height) });
+                        window.request_animation_frame();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full()
+        };
+        let glass_bar = |bar: AnyElement| {
+            div()
+                .rounded(px(16.))
+                .overflow_hidden()
+                .bg(t.surface(Surface::Bar, t.card))
+                .child(bar)
+        };
+        let older_pill = div().flex().justify_center().child(
+            div()
+                .id("load-older")
+                .px(px(12.))
+                .h(px(26.))
+                .rounded_full()
+                .bg(t.surface(Surface::Chip, t.card))
+                .flex()
+                .items_center()
+                .text_size(px(12.))
+                .text_color(t.fg(0.8))
+                .cursor_pointer()
+                .child(if older {
+                    "Load earlier messages"
+                } else {
+                    "Get earlier messages from your phone"
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.load_older(cx))),
+        );
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .relative()
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_col()
+                    .child(self.messages_area(older, view, t, Some((top + 4., bottom + 6.)), cx)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .p(px(10.))
+                    .pb(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(self.header(cx))
+                    .children(self.search_bar(cx).map(glass_bar))
+                    .children(self.pinned_bar(cx).map(glass_bar))
+                    .child(older_pill)
+                    .child(measure(self.insets.clone(), true)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .children(self.mention_popup(cx))
+                    .child(self.composer(cx))
+                    .child(measure(self.insets.clone(), false)),
+            )
             .into_any_element()
     }
 
@@ -1698,6 +1905,7 @@ impl ChatView {
 
     fn toggle_info(&mut self, cx: &mut Context<Self>) {
         self.info_open = !self.info_open;
+        self.members_expanded = false;
         if self.info_open && self.chat.kind != ChatKind::User {
             // Ask the server for the current members; the panel refreshes when they arrive.
             self.backend.send(Command::RefreshGroup {
@@ -1724,6 +1932,7 @@ impl ChatView {
                 .into_iter()
                 .map(PathBuf::from)
                 .filter(|path| path.exists())
+                .map(|path| crate::thumbs::display_path(&path))
                 .collect();
         }
         cx.notify();
@@ -2016,7 +2225,10 @@ impl ChatView {
 
         if !self.members.is_empty() {
             panel = panel.child(section("Members"));
-            for (slot, (member, name, rank)) in self.members.iter().enumerate() {
+            // Ten members at first, as WhatsApp shows them; a large group's full list is
+            // built only when asked for.
+            let shown = if self.members_expanded { usize::MAX } else { 10 };
+            for (slot, (member, name, rank)) in self.members.iter().enumerate().take(shown) {
                 let hover = t.fg(0.06);
                 panel = panel.child(
                     div()
@@ -2086,6 +2298,29 @@ impl ChatView {
                         }),
                 );
             }
+            let hidden = self.members.len().saturating_sub(shown);
+            if hidden > 0 {
+                let hover = t.fg(0.06);
+                panel = panel.child(
+                    div()
+                        .id("members-all")
+                        .h(px(40.))
+                        .px(px(8.))
+                        .rounded(R_MD)
+                        .flex()
+                        .items_center()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.primary)
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(hover))
+                        .child(format!("View all ({hidden} more)"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.members_expanded = true;
+                            cx.notify();
+                        })),
+                );
+            }
         }
         Some(panel.into_any_element())
     }
@@ -2106,68 +2341,79 @@ impl ChatView {
         cx.notify();
     }
 
+    /// A row of a picker: picture and name, 44px tall.
+    fn pick_row(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        jid: &str,
+        title: &str,
+        cx: &App,
+    ) -> gpui::Stateful<gpui::Div> {
+        let hover = tokens(cx).accent;
+        div()
+            .id(id)
+            .h(px(44.))
+            .px(px(8.))
+            .rounded(R_MD)
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(10.))
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover))
+            .child(avatar(jid, title, 28., crate::avatars::get(jid), cx))
+            .child(
+                div()
+                    .truncate()
+                    .text_size(px(14.))
+                    .child(SharedString::from(title.to_string())),
+            )
+    }
+
     /// The chat picker for forwarding a message.
     fn forward_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let id = self.forwarding.clone()?;
         let t = tokens(cx).clone();
         let size = window.viewport_size();
-        let mut rows = div()
-            .id("forward-list")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap(px(2.))
-            .p(px(6.));
-        for (slot, chat) in self.forward_targets.iter().enumerate() {
-            let hover = t.accent;
-            let to = chat.jid.clone();
-            let message = id.clone();
-            rows = rows.child(
-                div()
-                    .id(("forward-to", slot))
-                    .h(px(44.))
-                    .px(px(8.))
-                    .rounded(R_MD)
-                    .flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .gap(px(10.))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(hover))
-                    .child(avatar(
-                        &chat.jid,
-                        &chat.title,
-                        28.,
-                        crate::avatars::get(&chat.jid),
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(14.))
-                            .child(SharedString::from(chat.title.clone())),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.backend.send(Command::Forward {
-                            from_chat: this.chat.jid.clone(),
-                            id: message.clone(),
-                            to_chats: vec![to.clone()],
-                        });
-                        this.forwarding = None;
-                        this.notice = Some("Forwarded".to_string());
-                        cx.notify();
-                    })),
-            );
-        }
+        // Only the rows on screen are built, however many chats there are.
+        let rows = gpui::uniform_list(
+            "forward-list",
+            self.forward_targets.len(),
+            cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                range
+                    .filter_map(|slot| {
+                        let chat = this.forward_targets.get(slot)?;
+                        let to = chat.jid.clone();
+                        let message = id.clone();
+                        Some(
+                            div().h(px(46.)).px(px(6.)).child(
+                                this.pick_row(("forward-to", slot), &chat.jid, &chat.title, cx)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.backend.send(Command::Forward {
+                                            from_chat: this.chat.jid.clone(),
+                                            id: message.clone(),
+                                            to_chats: vec![to.clone()],
+                                        });
+                                        this.forwarding = None;
+                                        this.notice = Some("Forwarded".to_string());
+                                        cx.notify();
+                                    })),
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .min_h_0()
+        .py(px(6.));
         let panel = div()
             .w(px(420.))
             .h(px(520.))
             .rounded(super::theme::R_2XL)
             .border_1()
             .border_color(t.border)
-            .bg(t.popover)
+            .bg(t.popover_fill())
             .shadow(t.shadow_dialog())
             .overflow_hidden()
             .flex()
@@ -2371,7 +2617,7 @@ impl ChatView {
             .rounded(super::theme::R_2XL)
             .border_1()
             .border_color(t.border)
-            .bg(t.popover)
+            .bg(t.popover_fill())
             .shadow(t.shadow_dialog())
             .overflow_hidden()
             .flex()
@@ -2512,7 +2758,7 @@ impl ChatView {
             .rounded(super::theme::R_2XL)
             .border_1()
             .border_color(t.border)
-            .bg(t.popover)
+            .bg(t.popover_fill())
             .shadow(t.shadow_dialog())
             .overflow_hidden()
             .flex()
@@ -2575,47 +2821,42 @@ impl ChatView {
         if !self.adding_members {
             return None;
         }
-        let t = tokens(cx).clone();
         let already: Vec<&str> = self.members.iter().map(|(jid, _, _)| jid.as_str()).collect();
-        let mut rows = div()
-            .id("add-members-list")
-            .h(px(440.))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap(px(2.))
-            .p(px(6.));
-        for (slot, contact) in self
+        let candidates: Vec<usize> = self
             .add_candidates
             .iter()
-            .filter(|c| !already.contains(&c.jid.as_str()))
             .enumerate()
-        {
-            let name = contact
-                .name
-                .clone()
-                .unwrap_or_else(|| crate::model::display_number(&contact.jid));
-            let hover = t.accent;
-            let member = contact.jid.clone();
-            rows = rows.child(
-                div()
-                    .id(("add-member", slot))
-                    .h(px(44.))
-                    .px(px(8.))
-                    .rounded(R_MD)
-                    .flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .gap(px(10.))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(hover))
-                    .child(avatar(&contact.jid, &name, 28., crate::avatars::get(&contact.jid), cx))
-                    .child(div().truncate().text_size(px(14.)).child(SharedString::from(name)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.change_member(&member, crate::events::MemberChange::Add, cx)
-                    })),
-            );
-        }
+            .filter(|(_, contact)| !already.contains(&contact.jid.as_str()))
+            .map(|(index, _)| index)
+            .collect();
+        // Only the rows on screen are built, however many contacts there are.
+        let rows = gpui::uniform_list(
+            "add-members-list",
+            candidates.len(),
+            cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                range
+                    .filter_map(|slot| {
+                        let contact = this.add_candidates.get(*candidates.get(slot)?)?;
+                        let name = contact
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| crate::model::display_number(&contact.jid));
+                        let member = contact.jid.clone();
+                        Some(
+                            div().h(px(46.)).px(px(6.)).child(
+                                this.pick_row(("add-member", slot), &contact.jid, &name, cx).on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.change_member(&member, crate::events::MemberChange::Add, cx)
+                                    }),
+                                ),
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .h(px(440.))
+        .py(px(6.));
         let panel = self.dialog_panel("Add a member", 420., cx).child(rows);
         let close = cx.listener(|this, _: &MouseDownEvent, _, cx| {
             this.adding_members = false;
@@ -2660,7 +2901,7 @@ impl ChatView {
             .rounded(R_XL)
             .border_1()
             .border_color(t.border)
-            .bg(t.popover)
+            .bg(t.popover_fill())
             .shadow(t.shadow_popover())
             .flex()
             .flex_col()
@@ -2859,7 +3100,7 @@ impl ChatView {
             .rounded(R_XL)
             .border_1()
             .border_color(t.border)
-            .bg(t.popover)
+            .bg(t.popover_fill())
             .shadow(t.shadow_popover())
             .flex()
             .flex_col()
@@ -2941,7 +3182,7 @@ impl ChatView {
             .rounded(R_XL)
             .border_1()
             .border_color(t.border)
-            .bg(t.popover)
+            .bg(t.popover_fill())
             .shadow(t.shadow_popover())
             .overflow_hidden()
             .flex()
@@ -3152,7 +3393,7 @@ impl ChatView {
                             .rounded(R_MD)
                             .border_1()
                             .border_color(t.border)
-                            .bg(t.popover)
+                            .bg(t.popover_fill())
                             .flex()
                             .items_center()
                             .justify_center()
@@ -3342,10 +3583,9 @@ impl ChatView {
     fn pinned_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let id = self.pins.first()?.clone();
         let t = tokens(cx).clone();
-        let text = match self.store.message(&self.chat.jid, &id).ok().flatten() {
-            Some(message) => preview_label(message.kind, message.text.as_deref()),
-            None => "Pinned message".to_string(),
-        };
+        // Looked up among the loaded messages first: no database query per frame.
+        // The wording is read once when the chat is loaded, not on every frame.
+        let text = self.pin_text.clone().unwrap_or_else(|| "Pinned message".to_string());
         let more = self.pins.len().saturating_sub(1);
         let hover = t.fg(0.03);
         Some(
@@ -3423,5 +3663,33 @@ impl ChatView {
                 }))
                 .into_any_element(),
         ]
+    }
+}
+
+/// The identity of a list item and a stamp of everything that affects how tall it is.
+fn item_key(item: &Item) -> (String, u64) {
+    use std::hash::{Hash, Hasher};
+    match item {
+        Item::Day(ts) => (format!("day:{}", local_day(*ts)), 0),
+        Item::Unread => ("unread".to_string(), 0),
+        Item::Msg(view) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            view.row.proto.hash(&mut hasher);
+            std::mem::discriminant(&view.row.kind).hash(&mut hasher);
+            view.row.text.hash(&mut hasher);
+            view.row.media_path.hash(&mut hasher);
+            view.row.edited.hash(&mut hasher);
+            view.head.hash(&mut hasher);
+            view.notice.hash(&mut hasher);
+            view.quote.is_some().hash(&mut hasher);
+            view.media.display.is_some().hash(&mut hasher);
+            view.media.thumb_file.is_some().hash(&mut hasher);
+            view.album.len().hash(&mut hasher);
+            for chip in &view.reactions {
+                chip.emoji.hash(&mut hasher);
+                chip.count.hash(&mut hasher);
+            }
+            (view.row.id.clone(), hasher.finish())
+        }
     }
 }
