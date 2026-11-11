@@ -16,6 +16,7 @@ pub mod media_ops;
 pub mod ingest;
 pub mod model;
 pub mod paths;
+pub mod polls;
 pub mod richtext;
 pub mod store;
 pub mod store_more;

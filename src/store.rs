@@ -119,6 +119,15 @@ CREATE TABLE IF NOT EXISTS calls (
     group_jid TEXT
 );
 
+CREATE TABLE IF NOT EXISTS poll_votes (
+    chat    TEXT NOT NULL,
+    poll_id TEXT NOT NULL,
+    voter   TEXT NOT NULL,
+    options TEXT NOT NULL DEFAULT '',
+    ts      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (chat, poll_id, voter)
+);
+
 CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -910,6 +919,10 @@ impl Tx<'_> {
                 receipt.read_timestamp,
                 receipt.played_timestamp,
             )?;
+        }
+
+        if !wmi.poll_updates.is_empty() {
+            self.put_poll_votes_of(&chat, id, wmi)?;
         }
 
         Ok(Some(rowid))

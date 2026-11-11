@@ -660,6 +660,54 @@ async fn execute(
             notify(events, &chat).await;
         }
 
+        Command::VotePoll { chat, id, options } => {
+            let record = store
+                .record(&chat, &id)?
+                .ok_or_else(|| anyhow!("poll not found"))?;
+            let secret = crate::polls::secret(&record)
+                .ok_or_else(|| anyhow!("this poll's key is not on this device, so it cannot be voted on here"))?;
+            let (chat_jid, sender, from_me) = target_parts(&record, &chat)?;
+            // Votes are encrypted to the poll's creator.
+            let creator = if from_me {
+                client.pn().ok_or_else(|| anyhow!("not logged in"))?
+            } else {
+                sender.unwrap_or_else(|| chat_jid.clone())
+            };
+            client
+                .polls()
+                .vote_raw(chat_jid, &id, &creator, &secret, &options)
+                .await
+                .map_err(|error| anyhow!("vote failed: {error}"))?;
+            let hashes: Vec<String> = options.iter().map(|o| crate::polls::option_hash(o)).collect();
+            store.batch(|tx| tx.put_poll_vote(&chat, &id, "me", &hashes, now_secs()))?;
+            notify(events, &chat).await;
+        }
+
+        Command::CreatePoll {
+            chat,
+            question,
+            options,
+            multiple,
+        } => {
+            let created = client
+                .polls()
+                .create(jid(&chat)?, &question, &options, if multiple { 0 } else { 1 })
+                .await
+                .map_err(|error| anyhow!("could not create the poll: {error}"))?;
+            // Keep our own copy, with the secret that later votes need.
+            let result = created.send_result();
+            let mut message = (*result.message).clone();
+            let mut context = message.message_context_info.as_option().cloned().unwrap_or_default();
+            if context.message_secret.is_none() {
+                context.message_secret = Some(created.secret().as_bytes().to_vec().into());
+            }
+            message.message_context_info = MessageField::some(context);
+            let id = result.message_id.as_str().to_string();
+            store_outgoing(store, &chat, &id, &message)?;
+            store.batch(|tx| tx.set_status(&chat, &id, Ack::Sent))?;
+            notify(events, &chat).await;
+        }
+
         Command::LoadOlder { chat } => {
             // The phone answers with a history-sync blob, which arrives as an event and is
             // imported like any other.

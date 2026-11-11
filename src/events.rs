@@ -137,6 +137,19 @@ pub enum Command {
     /// Read a group's current subject, description and members from the server.
     RefreshGroup { chat: String },
     LeaveGroup { chat: String },
+    VotePoll {
+        chat: String,
+        id: String,
+        /// Names of the options picked; empty retracts the vote.
+        options: Vec<String>,
+    },
+    CreatePoll {
+        chat: String,
+        question: String,
+        options: Vec<String>,
+        /// Whether a person may pick more than one option.
+        multiple: bool,
+    },
     Logout,
     Shutdown,
 }

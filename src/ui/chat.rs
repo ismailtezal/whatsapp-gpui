@@ -401,6 +401,11 @@ impl ChatView {
                 media,
                 notice,
                 view_once,
+                poll: if row.kind == MsgKind::Poll {
+                    self.store.poll(&self.chat.jid, &row.id, &row.proto)
+                } else {
+                    None
+                },
                 rich,
                 avatar,
             })));
@@ -566,6 +571,14 @@ impl ChatView {
         if text.is_empty() {
             return;
         }
+        if text.starts_with("/poll") {
+            let text = text.to_string();
+            if self.try_poll_command(&text) {
+                self.input.update(cx, |input, cx| input.set_value("", window, cx));
+            }
+            cx.notify();
+            return;
+        }
         match self.editing.take() {
             Some(id) => self.backend.send(Command::Edit {
                 chat: self.chat.jid.clone(),
@@ -655,6 +668,13 @@ impl ChatView {
                 let _ = entity.update(cx, |this, cx| this.open_media(&media_id, cx));
             })),
             audio: self.audio.as_ref().and_then(|player| player.playback()),
+            poll_vote: Some({
+                let entity = cx.entity().downgrade();
+                let poll_id = id.clone();
+                Rc::new(move |index: usize, _: &mut Window, cx: &mut App| {
+                    let _ = entity.update(cx, |this, cx| this.vote(&poll_id, index, cx));
+                })
+            }),
             quote: view.row.quoted_id.clone().map(|quoted| {
                 let entity = cx.entity().downgrade();
                 Rc::new(move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
@@ -1926,5 +1946,66 @@ impl ChatView {
             }
         }
         self.members = members;
+    }
+}
+
+impl ChatView {
+    /// Picks (or un-picks) an option of a poll and sends the resulting vote.
+    fn vote(&mut self, poll_id: &str, index: usize, cx: &mut Context<Self>) {
+        let Some(poll) = self.items.iter().find_map(|item| match item {
+            Item::Msg(view) if view.row.id == poll_id => view.poll.clone(),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(clicked) = poll.options.get(index) else {
+            return;
+        };
+        let mut picked: Vec<String> = poll
+            .options
+            .iter()
+            .filter(|option| option.mine)
+            .map(|option| option.name.clone())
+            .collect();
+        if clicked.mine {
+            picked.retain(|name| *name != clicked.name);
+        } else if poll.selectable == 1 {
+            picked = vec![clicked.name.clone()];
+        } else {
+            picked.push(clicked.name.clone());
+        }
+        self.backend.send(Command::VotePoll {
+            chat: self.chat.jid.clone(),
+            id: poll_id.to_string(),
+            options: picked,
+        });
+        cx.notify();
+    }
+
+    /// `/poll Question | Option A | Option B` in the composer creates a poll.
+    fn try_poll_command(&mut self, text: &str) -> bool {
+        let Some(spec) = text.strip_prefix("/poll ") else {
+            return false;
+        };
+        let parts: Vec<String> = spec
+            .split('|')
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect();
+        match parts.split_first() {
+            Some((question, options)) if options.len() >= 2 => {
+                self.backend.send(Command::CreatePoll {
+                    chat: self.chat.jid.clone(),
+                    question: question.clone(),
+                    options: options.to_vec(),
+                    multiple: false,
+                });
+                true
+            }
+            _ => {
+                self.notice = Some("Poll: /poll Question | Option A | Option B".to_string());
+                false
+            }
+        }
     }
 }

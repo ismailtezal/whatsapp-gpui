@@ -287,6 +287,51 @@ fn main() -> Result<()> {
             let admins = members.iter().filter(|(_, rank)| *rank > 0).count();
             println!("members before={before} after={} admins={admins}", members.len());
         }
+        "poll" => {
+            // Create a poll: wa-test poll <group> "Question | Option A | Option B"
+            let chat = group(&store, &args[1])?;
+            let parts: Vec<String> = args[2..]
+                .join(" ")
+                .split('|')
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect();
+            let (question, options) = parts.split_first().ok_or_else(|| anyhow!("give a question"))?;
+            backend.send(Command::CreatePoll {
+                chat: chat.clone(),
+                question: question.clone(),
+                options: options.to_vec(),
+                multiple: false,
+            });
+            std::thread::sleep(Duration::from_secs(4));
+            let sent = newest(&store, &chat, true)?;
+            let view = store.poll(&chat, &sent.id, &sent.proto);
+            println!(
+                "poll id={} kind={:?} options={:?}",
+                sent.id,
+                sent.kind,
+                view.map(|v| v.options.len())
+            );
+        }
+        "vote" => {
+            // Vote on the newest poll of a group: wa-test vote <group> <option name>
+            let chat = group(&store, &args[1])?;
+            let poll = store
+                .messages(&chat, None, 60)?
+                .into_iter()
+                .rev()
+                .find(|m| m.kind == whatsapp_gpui::model::MsgKind::Poll)
+                .ok_or_else(|| anyhow!("no poll found"))?;
+            backend.send(Command::VotePoll {
+                chat: chat.clone(),
+                id: poll.id.clone(),
+                options: vec![args[2..].join(" ")],
+            });
+            std::thread::sleep(Duration::from_secs(4));
+            let view = store.poll(&chat, &poll.id, &poll.proto).ok_or_else(|| anyhow!("not a poll"))?;
+            let tally: Vec<(usize, bool)> = view.options.iter().map(|o| (o.votes, o.mine)).collect();
+            println!("voters={} tally(votes, mine)={tally:?}", view.voters);
+        }
         "listen" => {
             let seconds: u64 = args.get(1).and_then(|n| n.parse().ok()).unwrap_or(15);
             let mut counts = std::collections::BTreeMap::new();

@@ -65,6 +65,7 @@ pub struct MsgView {
     /// The text with formatting, links and mentions resolved.
     pub rich: Option<Rich>,
     pub avatar: Option<std::path::PathBuf>,
+    pub poll: Option<crate::polls::PollView>,
 }
 
 /// What a click on a part of a row does.
@@ -79,6 +80,8 @@ pub struct RowHooks {
     pub audio: Option<crate::audio::Playback>,
     /// Jump to the message this one replies to.
     pub quote: Option<ClickFn>,
+    /// Vote for the option at this index of a poll.
+    pub poll_vote: Option<Rc<dyn Fn(usize, &mut Window, &mut App)>>,
 }
 
 /// Extracts what a row needs from the stored record.
@@ -565,6 +568,102 @@ fn content(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> Div {
                         text.unwrap_or("This message type is not shown yet. Open it on your phone.").to_string(),
                     )),
             );
+        }
+        Poll if view.poll.is_some() => {
+            let Some(poll) = view.poll.as_ref() else {
+                return column;
+            };
+            // Bars are relative to the most-voted option.
+            let most = poll.options.iter().map(|o| o.votes).max().unwrap_or(0).max(1);
+            let mut card = div()
+                .w(px(340.))
+                .rounded(R_LG)
+                .border_1()
+                .border_color(t.border)
+                .bg(t.card)
+                .p(px(12.))
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.foreground)
+                        .child(SharedString::from(poll.question.clone())),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(t.muted_foreground)
+                        .child(if poll.selectable == 1 {
+                            "Select one"
+                        } else {
+                            "Select one or more"
+                        }),
+                );
+            for (index, option) in poll.options.iter().enumerate() {
+                let fraction = option.votes as f32 / most as f32;
+                let mine = option.mine;
+                let row = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .size(px(16.))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(if mine { t.primary } else { t.fg(0.3) })
+                                    .when(mine, |this| this.bg(t.primary))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(t.primary_foreground)
+                                    .when(mine, |this| this.child(icon("check").size(px(10.)))),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(14.))
+                                    .text_color(t.fg(0.9))
+                                    .child(SharedString::from(option.name.clone())),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(t.muted_foreground)
+                                    .child(option.votes.to_string()),
+                            ),
+                    )
+                    .child(
+                        div().h(px(4.)).rounded_full().bg(t.fg(0.10)).child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(fraction))
+                                .rounded_full()
+                                .bg(t.primary),
+                        ),
+                    );
+                card = card.child(match &hooks.poll_vote {
+                    Some(hook) => {
+                        let hook = hook.clone();
+                        row.id(("poll-option", key * 16 + index))
+                            .cursor_pointer()
+                            .on_click(move |_, window, cx| hook(index, window, cx))
+                            .into_any_element()
+                    }
+                    None => row.into_any_element(),
+                });
+            }
+            column = column.child(card);
         }
         other => {
             let label = preview_label(other, None);
