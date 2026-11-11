@@ -25,6 +25,7 @@ pub mod store;
 pub mod store_more;
 pub mod system;
 pub mod thumbs;
+pub mod tray;
 pub mod video;
 pub mod voice;
 pub mod ui;

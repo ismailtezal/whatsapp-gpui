@@ -133,6 +133,29 @@ pub fn run() {
                 if offscreen {
                     move_off_screen(window);
                 }
+                // The tray icon, and closing to it. Test copies stay out of the tray.
+                if std::env::var("WA_OFFLINE").is_err()
+                    && let Some(native) = native_window(window)
+                {
+                    crate::tray::set_keep_running(
+                        store.kv("background").ok().flatten().as_deref() != Some("off"),
+                    );
+                    if crate::tray::Tray::start(native).is_some() {
+                        window.on_window_should_close(cx, |_, _| {
+                            // Closing hides the window; Quit in the tray menu ends the app.
+                            if crate::tray::keep_running() && !crate::tray::quitting() {
+                                crate::tray::hide_main_window();
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        // Started by Windows at sign-in: stay in the tray.
+                        if std::env::args().any(|arg| arg == "--background") {
+                            crate::tray::hide_main_window();
+                        }
+                    }
+                }
                 let shell = cx.new(|cx| shell::Shell::new(backend, window, cx));
                 cx.new(|cx| Root::new(shell, window, cx))
             },
@@ -140,6 +163,9 @@ pub fn run() {
         .expect("open main window");
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
+                if let Some(tray) = crate::tray::current() {
+                    tray.remove();
+                }
                 cx.quit();
             }
         })
@@ -148,6 +174,16 @@ pub fn run() {
             cx.activate(true);
         }
     });
+}
+
+/// The window's native handle, as a number.
+fn native_window(window: &gpui::Window) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+        _ => None,
+    }
 }
 
 /// Moves the window far outside every screen without changing its size. GPUI itself

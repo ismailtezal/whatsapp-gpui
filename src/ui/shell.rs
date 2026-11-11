@@ -129,6 +129,8 @@ pub struct Shell {
     /// The name field must be refilled from the account (done at the next render, which
     /// has the window an input needs).
     profile_name_stale: bool,
+    /// Whether the app is set to start with Windows (read once at start).
+    autostart: bool,
     /// New chat panel: an invite link to join a group with.
     join_link: Entity<InputState>,
     /// Settings: the name and About fields.
@@ -212,6 +214,8 @@ impl Shell {
             let chat = response.tag.to_string();
             let shell = shell.clone();
             let _ = handle.update(cx, |_, window, cx| {
+                // The window may be hidden behind the tray icon.
+                crate::tray::show_main_window();
                 window.activate_window();
                 let _ = shell.update(cx, |this, cx| this.open_chat(&chat, window, cx));
             });
@@ -270,6 +274,7 @@ impl Shell {
             backdrop: None,
             stale_chats: false,
             stale_open_chat: false,
+            autostart: crate::tray::starts_with_windows(),
             join_link,
             profile_name_stale: true,
             profile_name,
@@ -321,6 +326,28 @@ impl Shell {
     fn reload(&mut self) {
         let _perf = crate::perf::scope("shell.reload");
         self.titles.borrow_mut().clear();
+        self.reload_chats_and_badge();
+    }
+
+    /// Tells the tray icon and the taskbar badge how many messages are unread.
+    fn update_badge(&self) {
+        if let Some(tray) = crate::tray::current() {
+            let unread: i64 = self
+                .chats
+                .iter()
+                .filter(|chat| chat.mute_until == 0 && !chat.archived)
+                .map(|chat| chat.unread.max(chat.marked_unread as i64))
+                .sum();
+            tray.set_unread(unread.clamp(0, u32::MAX as i64) as u32);
+        }
+    }
+
+    fn reload_chats_and_badge(&mut self) {
+        self.reload_lists();
+        self.update_badge();
+    }
+
+    fn reload_lists(&mut self) {
         self.chats = self
             .store
             .chats(self.section == Section::Archived)
@@ -1882,6 +1909,9 @@ impl Shell {
                             }))),
                     )
                     .child(rule())
+                    .child(heading("Windows", "How the app behaves on this PC."))
+                    .child(self.windows_rows(cx))
+                    .child(rule())
                     .child(heading(
                         "Storage",
                         "Chats, the linked session and downloaded media are kept in this folder.",
@@ -2985,6 +3015,83 @@ impl Shell {
                         this.backend.send(Command::SetProfilePhoto { path: None });
                         cx.notify();
                     }))),
+            )
+            .into_any_element()
+    }
+}
+
+impl Shell {
+    /// Settings: keep running behind the tray icon, and start with Windows.
+    fn windows_rows(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = tokens(cx).clone();
+        let switch = |on: bool| {
+            div()
+                .w(px(32.))
+                .h(px(18.))
+                .rounded_full()
+                .p(px(2.))
+                .flex()
+                .flex_shrink_0()
+                .when(on, |this| this.bg(t.primary).justify_end())
+                .when(!on, |this| this.bg(t.fg(0.18)))
+                .child(div().size(px(14.)).rounded_full().bg(gpui::white()))
+        };
+        let row = |id: &'static str, title: &'static str, detail: &'static str, on: bool| {
+            let hover = t.fg(0.05);
+            div()
+                .id(id)
+                .py(px(8.))
+                .px(px(8.))
+                .mx(px(-8.))
+                .rounded(R_LG)
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_size(px(14.)).child(title))
+                        .child(div().text_size(px(12.)).text_color(t.muted_foreground).child(detail)),
+                )
+                .child(switch(on))
+        };
+        let keep = crate::tray::keep_running();
+        let autostart = self.autostart;
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                row(
+                    "setting-background",
+                    "Keep running when the window is closed",
+                    "Messages keep arriving and notifications keep showing. Quit from the icon next to the clock.",
+                    keep,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    crate::tray::set_keep_running(!keep);
+                    let _ = this.store.set_kv("background", if keep { "off" } else { "on" });
+                    cx.notify();
+                })),
+            )
+            .child(
+                row(
+                    "setting-autostart",
+                    "Start with Windows",
+                    "Starts in the background when you sign in.",
+                    autostart,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if crate::tray::set_start_with_windows(!autostart) {
+                        this.autostart = !autostart;
+                    } else {
+                        this.last_error = Some("Windows did not accept the start-up change.".to_string());
+                    }
+                    cx.notify();
+                })),
             )
             .into_any_element()
     }
