@@ -107,6 +107,9 @@ pub struct ChatView {
     forward_targets: Vec<ChatRow>,
     /// ID of the own message whose receipts are being shown.
     info_for: Option<String>,
+    video: Option<VideoPlay>,
+    /// A video to start on the next frame: (message ID, file, whether it loops).
+    pending_video: Option<(String, PathBuf, bool)>,
     /// Files picked, dropped or pasted that wait for Enter before they are sent.
     pending: Vec<PathBuf>,
     /// When the typing indicator was last sent, to avoid sending it on every keystroke.
@@ -199,6 +202,8 @@ impl ChatView {
             forwarding: None,
             forward_targets: Vec::new(),
             info_for: None,
+            video: None,
+            pending_video: None,
             pending: Vec::new(),
             typing_sent: None,
             mention_map: Vec::new(),
@@ -228,6 +233,18 @@ impl ChatView {
             chat: view.chat.jid.clone(),
         });
         // Development aid: start with the info panel open.
+        // Development aid: start playing the newest downloaded GIF of this chat.
+        if std::env::var("WA_PLAY_GIF").is_ok() {
+            let newest = view.items.iter().rev().find_map(|item| match item {
+                Item::Msg(msg) if msg.row.kind == MsgKind::Gif => {
+                    msg.row.media_path.clone().map(|path| (msg.row.id.clone(), path))
+                }
+                _ => None,
+            });
+            if let Some((id, path)) = newest {
+                view.pending_video = Some((id, PathBuf::from(path), true));
+            }
+        }
         if std::env::var("WA_INFO").is_ok() {
             view.toggle_info(cx);
         }
@@ -591,6 +608,9 @@ impl ChatView {
         match self.row(id).map(|r| r.kind) {
             Some(MsgKind::Image) => self.viewer = Some(path),
             Some(MsgKind::Voice | MsgKind::Audio) => self.play_audio(id, &path, cx),
+            Some(kind @ (MsgKind::Video | MsgKind::Gif | MsgKind::VideoNote)) => {
+                self.pending_video = Some((id.to_string(), path, kind == MsgKind::Gif));
+            }
             None if matches!(
                 path.extension().and_then(|e| e.to_str()),
                 Some("jpg" | "jpeg" | "png" | "webp")
@@ -1485,6 +1505,9 @@ impl Render for ChatView {
         let older = self.has_older;
         let menu = self.menu_overlay(window, cx);
         let emoji = self.emoji_overlay(window, cx);
+        if let Some((id, path, looping)) = self.pending_video.take() {
+            self.start_video(&id, path, looping, window, cx);
+        }
         let viewer = self.viewer_overlay(cx);
         div()
             .size_full()
@@ -1539,6 +1562,7 @@ impl Render for ChatView {
                     .children(self.info_panel(cx)),
             )
             .children(viewer)
+            .children(self.video_overlay(cx))
             .children(self.forward_overlay(window, cx))
             .children(self.info_overlay(window, cx))
             .children(self.sticker_overlay(window, cx))
@@ -3118,5 +3142,171 @@ impl ChatView {
             );
         }
         Some(tray.into_any_element())
+    }
+}
+
+/// A video or GIF playing in the viewer.
+struct VideoPlay {
+    /// The picture currently on screen.
+    frame: Option<Arc<gpui::RenderImage>>,
+    /// The newest decoded picture, handed over from the decoding thread: (BGRA, width, height).
+    latest: Arc<std::sync::Mutex<Option<(Vec<u8>, u32, u32)>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    size: (u32, u32),
+    error: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl ChatView {
+    /// Starts playing a video file in the viewer. GIFs loop and have no sound.
+    fn start_video(&mut self, id: &str, path: PathBuf, looping: bool, window: &mut Window, cx: &mut Context<Self>) {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        self.stop_video(window);
+
+        let latest = Arc::new(std::sync::Mutex::new(None));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let error = Arc::new(std::sync::Mutex::new(None));
+        {
+            let (latest, stop, error, path) = (latest.clone(), stop.clone(), error.clone(), path.clone());
+            std::thread::Builder::new()
+                .name("video-decode".into())
+                .spawn(move || {
+                    loop {
+                        let mut reader = match crate::video::VideoReader::open(&path) {
+                            Ok(reader) => reader,
+                            Err(problem) => {
+                                if let Ok(mut slot) = error.lock() {
+                                    *slot = Some(format!("{problem:#}"));
+                                }
+                                return;
+                            }
+                        };
+                        let (width, height) = (reader.width, reader.height);
+                        let started = Instant::now();
+                        while let Ok(Some(frame)) = reader.next_frame() {
+                            if stop.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            // Show each picture at its own time.
+                            let due = started + Duration::from_secs_f64(frame.at_secs.max(0.));
+                            if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                                std::thread::sleep(wait);
+                            }
+                            if let Ok(mut slot) = latest.lock() {
+                                *slot = Some((frame.bgra, width, height));
+                            }
+                        }
+                        if !looping || stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                    }
+                })
+                .ok();
+        }
+
+        // The sound track plays through the audio player, started at the same moment.
+        if !looping {
+            if self.audio.is_none() {
+                self.audio = crate::audio::AudioPlayer::new().ok();
+            }
+            if let Some(player) = self.audio.as_mut() {
+                let _ = player.play(id, &path);
+            }
+        }
+
+        self.video = Some(VideoPlay {
+            frame: None,
+            latest,
+            stop,
+            size: (0, 0),
+            error,
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(30)).await;
+                let alive = this
+                    .update_in(cx, |this, window, cx| {
+                        let Some(play) = this.video.as_mut() else {
+                            return false;
+                        };
+                        let newest = play.latest.lock().ok().and_then(|mut slot| slot.take());
+                        if let Some((bgra, width, height)) = newest
+                            && let Some(buffer) = image::RgbaImage::from_raw(width, height, bgra)
+                        {
+                            let picture = Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buffer)]));
+                            play.size = (width, height);
+                            // Each picture is its own texture; release the one it replaces.
+                            if let Some(old) = play.frame.replace(picture) {
+                                let _ = window.drop_image(old);
+                            }
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn stop_video(&mut self, window: &mut Window) {
+        if let Some(play) = self.video.take() {
+            play.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(frame) = play.frame {
+                let _ = window.drop_image(frame);
+            }
+            if let Some(player) = self.audio.as_mut() {
+                player.stop();
+            }
+        }
+    }
+
+    /// The video viewer: the playing picture on a dark backdrop; a click closes it.
+    fn video_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let play = self.video.as_ref()?;
+        let problem = play.error.lock().ok().and_then(|slot| slot.clone());
+        let body: AnyElement = match (&play.frame, problem) {
+            (Some(frame), _) => {
+                // Small clips are enlarged, large ones fitted, both keeping their shape.
+                let (width, height) = (play.size.0.max(1) as f32, play.size.1.max(1) as f32);
+                let scale = (760. / width).min(560. / height).min(4.);
+                gpui::img(frame.clone())
+                    .w(px(width * scale))
+                    .h(px(height * scale))
+                    .rounded(R_LG)
+                    .object_fit(gpui::ObjectFit::Contain)
+                    .into_any_element()
+            }
+            (None, Some(problem)) => div()
+                .max_w(px(420.))
+                .text_color(gpui::white())
+                .child(SharedString::from(format!("This video cannot be played here: {problem}")))
+                .into_any_element(),
+            (None, None) => div().text_color(gpui::white()).child("Loading…").into_any_element(),
+        };
+        Some(
+            div()
+                .id("video-viewer")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .occlude()
+                .bg(gpui::hsla(0., 0., 0., 0.92))
+                .flex()
+                .items_center()
+                .justify_center()
+                .p(px(24.))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.stop_video(window);
+                    cx.notify();
+                }))
+                .child(body)
+                .into_any_element(),
+        )
     }
 }

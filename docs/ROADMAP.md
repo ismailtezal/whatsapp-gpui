@@ -73,8 +73,8 @@ member) and in an empty test group created for the purpose, never with another p
 | Stickers: send | Verified | |
 | Sticker picker | Built | Lists stickers already downloaded to this PC. No favourites, no sticker packs. |
 | Video and GIF previews | Verified | GIFs and videos up to 16 MB download on view; Windows makes the preview picture. |
-| Video: play in app | Not done | A click opens it in the default player. |
-| GIFs: play in app | Not done | Shown as a still preview; a click opens the default player. |
+| GIFs: play in app | Verified | A click opens the viewer, where the GIF loops. Seen playing on screen. In the conversation itself a GIF is a still preview; it does not autoplay inline. |
+| Video: play in app | Built | Same viewer, with the sound track played alongside. Not run, because unattended tests must stay silent, so picture-sound sync is unproven. No pause, seek or volume controls yet; a click closes it. |
 | Documents: open | Built | Downloads and opens with the default app. |
 | Albums | Built | Photos sent together are shown as a two-column grid. Videos in an album are still listed separately. |
 | Camera capture | Not done | |
