@@ -313,15 +313,25 @@ pub enum Palette {
     Midnight,
     Mono,
     Amber,
+    Ocean,
+    Violet,
+    Rose,
+    Pomegranate,
+    Forest,
 }
 
 impl Palette {
-    pub const ALL: [Palette; 5] = [
+    pub const ALL: [Palette; 10] = [
         Palette::Neutral,
         Palette::Turquoise,
         Palette::Midnight,
         Palette::Mono,
         Palette::Amber,
+        Palette::Ocean,
+        Palette::Violet,
+        Palette::Rose,
+        Palette::Pomegranate,
+        Palette::Forest,
     ];
 
     pub fn name(self) -> &'static str {
@@ -331,6 +341,11 @@ impl Palette {
             Palette::Midnight => "Midnight",
             Palette::Mono => "Mono",
             Palette::Amber => "Amber",
+            Palette::Ocean => "Ocean",
+            Palette::Violet => "Violet",
+            Palette::Rose => "Rose",
+            Palette::Pomegranate => "Pomegranate",
+            Palette::Forest => "Forest",
         }
     }
 
@@ -345,8 +360,43 @@ impl Palette {
     /// primary-foreground, secondary, muted, muted-foreground, accent, destructive, ring,
     /// sidebar, sidebar-foreground, sidebar-accent, rail, tooltip, link, mention, code.
     fn values(self, dark: bool) -> Option<[u32; 20]> {
+        // The five palettes below are not hand-tuned: they are worked out from a hue, a
+        // tint and six accent colours, the way the design's own theme script does it.
+        let derive = |hue: f32, tint: f32, dark_accent: [[f32; 3]; 3], light_accent: [[f32; 3]; 3]| {
+            derived(hue, tint, if dark { dark_accent } else { light_accent }, dark)
+        };
         Some(match (self, dark) {
             (Palette::Neutral, _) => return None,
+            (Palette::Ocean, _) => derive(
+                235.,
+                1.7,
+                [[0.74, 0.13, 220.], [0.18, 0.05, 235.], [0.8, 0.1, 215.]],
+                [[0.52, 0.13, 235.], [0.99, 0., 0.], [0.5, 0.14, 240.]],
+            ),
+            (Palette::Violet, _) => derive(
+                292.,
+                1.5,
+                [[0.72, 0.15, 300.], [0.2, 0.06, 300.], [0.78, 0.12, 290.]],
+                [[0.53, 0.19, 300.], [0.99, 0., 0.], [0.5, 0.17, 290.]],
+            ),
+            (Palette::Rose, _) => derive(
+                350.,
+                1.2,
+                [[0.74, 0.14, 355.], [0.2, 0.06, 355.], [0.8, 0.1, 340.]],
+                [[0.56, 0.19, 5.], [0.99, 0., 0.], [0.52, 0.16, 355.]],
+            ),
+            (Palette::Pomegranate, _) => derive(
+                25.,
+                1.,
+                [[0.59, 0.2, 25.], [0.99, 0., 0.], [0.78, 0.12, 35.]],
+                [[0.54, 0.21, 25.], [0.99, 0., 0.], [0.5, 0.18, 30.]],
+            ),
+            (Palette::Forest, _) => derive(
+                150.,
+                1.3,
+                [[0.75, 0.15, 155.], [0.2, 0.05, 155.], [0.8, 0.12, 160.]],
+                [[0.52, 0.13, 155.], [0.99, 0., 0.], [0.48, 0.12, 160.]],
+            ),
             (Palette::Turquoise, true) => [
                 0x14171b, 0xeef0f3, 0x1b1e23, 0x1b1e23, 0x42d8c8, 0x001e1e, 0x23272c, 0x1d2125, 0x999fa7, 0x25292f,
                 0xf04c55, 0x42d8c8, 0x0d1013, 0xd5d8db, 0x1d2125, 0x0d1013, 0x2c3136, 0x58d1e5, 0xefb146, 0x0f1215,
@@ -897,4 +947,121 @@ pub fn set_backdrop(backdrop: Backdrop, cx: &mut App) {
     cx.set_global(BackdropChoice(backdrop));
     let dark = cx.try_global::<Tokens>().map(|t| t.dark).unwrap_or(true);
     install(dark, cx);
+}
+
+/// An OKLCH colour (lightness 0 to 1, chroma, hue in degrees) as 0xRRGGBB. Colours a
+/// screen cannot show are clipped channel by channel.
+fn oklch(lightness: f32, chroma: f32, hue: f32) -> u32 {
+    let (a, b) = (chroma * hue.to_radians().cos(), chroma * hue.to_radians().sin());
+    let l = (lightness + 0.396_337_78 * a + 0.215_803_76 * b).powi(3);
+    let m = (lightness - 0.105_561_346 * a - 0.063_854_17 * b).powi(3);
+    let s = (lightness - 0.089_484_18 * a - 1.291_485_5 * b).powi(3);
+    let linear = [
+        4.076_741_7 * l - 3.307_711_6 * m + 0.230_969_93 * s,
+        -1.268_438 * l + 2.609_757_4 * m - 0.341_319_4 * s,
+        -0.004_196_086_3 * l - 0.703_418_6 * m + 1.707_614_7 * s,
+    ];
+    let encode = |value: f32| {
+        let value = value.clamp(0., 1.);
+        let srgb = if value <= 0.003_130_8 {
+            12.92 * value
+        } else {
+            1.055 * value.powf(1. / 2.4) - 0.055
+        };
+        (srgb * 255.).round() as u32
+    };
+    (encode(linear[0]) << 16) | (encode(linear[1]) << 8) | encode(linear[2])
+}
+
+/// A palette worked out from the neutral one: the same ladder of lightness steps, with
+/// every grey given the palette's hue (chroma multiplied by `tint`) and its own accent,
+/// text-on-accent and link colours. The order is that of [`Palette::values`].
+fn derived(hue: f32, tint: f32, accent: [[f32; 3]; 3], dark: bool) -> [u32; 20] {
+    let grey = |lightness: f32, chroma: f32| oklch(lightness, chroma * tint, hue);
+    let [primary, on_primary, link] = accent.map(|[l, c, h]| oklch(l, c, h));
+    if dark {
+        [
+            grey(0.135, 0.008),
+            grey(0.95, 0.003),
+            grey(0.165, 0.009),
+            grey(0.175, 0.009),
+            primary,
+            on_primary,
+            grey(0.205, 0.01),
+            grey(0.2, 0.01),
+            grey(0.65, 0.014),
+            grey(0.215, 0.011),
+            0xed4a49,
+            primary,
+            grey(0.115, 0.008),
+            grey(0.9, 0.005),
+            grey(0.19, 0.01),
+            grey(0.095, 0.007),
+            grey(0.26, 0.011),
+            link,
+            0xefb146,
+            grey(0.115, 0.008),
+        ]
+    } else {
+        [
+            grey(0.99, 0.002),
+            grey(0.21, 0.012),
+            0xffffff,
+            0xffffff,
+            primary,
+            on_primary,
+            grey(0.955, 0.004),
+            grey(0.96, 0.004),
+            grey(0.53, 0.013),
+            grey(0.945, 0.005),
+            0xdf2225,
+            primary,
+            grey(0.97, 0.003),
+            grey(0.27, 0.012),
+            grey(0.93, 0.006),
+            grey(0.945, 0.004),
+            grey(0.22, 0.012),
+            link,
+            0xe49e22,
+            grey(0.965, 0.004),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod palette_tests {
+    use super::*;
+
+    /// Channel-wise distance between two colours.
+    fn apart(a: u32, b: u32) -> u32 {
+        (0..3)
+            .map(|channel| {
+                let shift = channel * 8;
+                (((a >> shift) & 0xff) as i32 - ((b >> shift) & 0xff) as i32).unsigned_abs()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The derived palettes must land on the colours the design's own table lists
+    /// (docs/design-spec.md, section 2.6), within rounding.
+    #[test]
+    fn derived_palettes_match_the_design_table() {
+        // (palette, dark background, dark primary, dark link, light primary)
+        let table = [
+            (Palette::Ocean, 0x04090d, 0x1ebde3, 0x69cee6, 0x0072a8),
+            (Palette::Violet, 0x08070d, 0xb48df4, 0xb6aaff, 0x7f47c7),
+            (Palette::Rose, 0x0b0709, 0xee83af, 0xeaa4d2, 0xc83065),
+            (Palette::Pomegranate, 0x0b0707, 0xdb373a, 0xfa9b82, 0xcd1526),
+            (Palette::Forest, 0x060906, 0x4ec983, 0x71d6a3, 0x007e46),
+        ];
+        for (palette, background, primary, link, light_primary) in table {
+            let dark = palette.values(true).expect("derived");
+            let light = palette.values(false).expect("derived");
+            assert!(apart(dark[0], background) <= 3, "{palette:?} background {:06x}", dark[0]);
+            assert!(apart(dark[4], primary) <= 6, "{palette:?} primary {:06x}", dark[4]);
+            assert!(apart(dark[17], link) <= 6, "{palette:?} link {:06x}", dark[17]);
+            assert!(apart(light[4], light_primary) <= 8, "{palette:?} light primary {:06x}", light[4]);
+        }
+    }
 }

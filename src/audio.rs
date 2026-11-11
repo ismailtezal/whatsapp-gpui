@@ -25,6 +25,11 @@ pub struct Playback {
     pub duration_secs: f64,
 }
 
+/// Whether this run must stay silent (`WA_MUTE` is set).
+fn silenced() -> bool {
+    std::env::var("WA_MUTE").is_ok_and(|value| !value.is_empty())
+}
+
 fn file_uri(path: &Path) -> String {
     let text = path.to_string_lossy().replace('\\', "/");
     let mut uri = String::from("file:///");
@@ -42,6 +47,10 @@ fn file_uri(path: &Path) -> String {
 impl AudioPlayer {
     pub fn new() -> Result<Self> {
         let player = MediaPlayer::new().context("creating the media player")?;
+        // Test runs set WA_MUTE so nothing comes out of the speakers.
+        if silenced() {
+            let _ = player.SetIsMuted(true);
+        }
         Ok(AudioPlayer {
             player,
             current: None,
@@ -67,6 +76,38 @@ impl AudioPlayer {
             self.player.Play()?;
             Ok(true)
         }
+    }
+
+    /// Jumps to a position in the current clip, in seconds.
+    pub fn seek(&mut self, seconds: f64) -> Result<()> {
+        let session = self.player.PlaybackSession()?;
+        session.SetPosition(windows::Foundation::TimeSpan {
+            Duration: (seconds.max(0.) * 10_000_000.) as i64,
+        })?;
+        Ok(())
+    }
+
+    /// Plays faster or slower: 1 is normal speed.
+    pub fn set_rate(&mut self, rate: f64) {
+        if let Ok(session) = self.player.PlaybackSession() {
+            let _ = session.SetPlaybackRate(rate);
+        }
+    }
+
+    pub fn rate(&self) -> f64 {
+        self.player
+            .PlaybackSession()
+            .and_then(|session| session.PlaybackRate())
+            .unwrap_or(1.)
+    }
+
+    /// Turns the sound off or back on. Stays off in test runs.
+    pub fn set_muted(&mut self, muted: bool) {
+        let _ = self.player.SetIsMuted(muted || silenced());
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.player.IsMuted().unwrap_or(false)
     }
 
     pub fn stop(&mut self) {

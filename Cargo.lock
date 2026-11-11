@@ -1666,6 +1666,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "emojis"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "99e1f1df1f181f2539bac8bf027d31ca5ffbf9e559e3f2d09413b9107b5c02f4"
+dependencies = [
+ "phf",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8082,6 +8091,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cpal",
+ "emojis",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",

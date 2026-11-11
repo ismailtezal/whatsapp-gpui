@@ -36,20 +36,6 @@ const EDIT_WINDOW_SECS: i64 = 15 * 60;
 
 const QUICK_REACTIONS: [&str; 6] = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
 
-const EMOJI: &[&str] = &[
-    "😀", "😃", "😄", "😁", "😆", "😅", "🤣", "😂", "🙂", "🙃", "😉", "😊", "😇", "🥰", "😍", "🤩",
-    "😘", "😗", "😚", "😙", "😋", "😛", "😜", "🤪", "😝", "🤑", "🤗", "🤭", "🤫", "🤔", "🤐", "🤨",
-    "😐", "😑", "😶", "😏", "😒", "🙄", "😬", "🤥", "😌", "😔", "😪", "🤤", "😴", "😷", "🤒", "🤕",
-    "🤢", "🤮", "🤧", "🥵", "🥶", "🥴", "😵", "🤯", "🤠", "🥳", "😎", "🤓", "🧐", "😕", "😟", "🙁",
-    "😮", "😯", "😲", "😳", "🥺", "😦", "😧", "😨", "😰", "😥", "😢", "😭", "😱", "😖", "😣", "😞",
-    "😓", "😩", "😫", "🥱", "😤", "😡", "😠", "🤬", "😈", "👿", "💀", "💩", "🤡", "👻", "👽", "🤖",
-    "👍", "👎", "👌", "✌️", "🤞", "🤟", "🤘", "🤙", "👈", "👉", "👆", "👇", "☝️", "✋", "🤚", "🖐️",
-    "👋", "👏", "🙌", "👐", "🤲", "🤝", "🙏", "✍️", "💪", "👀", "🧠", "🫶", "❤️", "🧡", "💛", "💚",
-    "💙", "💜", "🖤", "🤍", "🤎", "💔", "❣️", "💕", "💞", "💓", "💗", "💖", "💘", "💝", "💯", "💢",
-    "🔥", "✨", "🎉", "🎊", "🎁", "🏆", "⭐", "🌟", "⚡", "☀️", "🌙", "🌈", "☁️", "❄️", "🌹", "🌸",
-    "🍀", "🍎", "🍕", "🍔", "🍟", "🍰", "☕", "🍺", "🍷", "⚽", "🏀", "🎮", "🎵", "🎬", "📷", "💻",
-    "📱", "⏰", "📌", "📎", "✅", "❌", "❗", "❓", "⚠️", "🚀", "🚗", "✈️", "🏠", "💰", "🔒", "🔑",
-];
 
 enum Item {
     Day(i64),
@@ -73,6 +59,11 @@ enum EmojiTarget {
 struct EmojiState {
     target: EmojiTarget,
     at: Point<Pixels>,
+}
+
+/// Emoji the system font is sure to have: Windows 11 draws Unicode 15, not later ones.
+fn drawable(emoji: &emojis::Emoji) -> bool {
+    emoji.unicode_version().major() <= 15
 }
 
 pub struct ChatView {
@@ -116,6 +107,11 @@ pub struct ChatView {
     /// The identity and appearance stamp of each list item, to tell the list exactly
     /// which rows changed on a reload.
     item_keys: Vec<(String, u64)>,
+    /// Emoji picker: the search box, the group shown, the emoji listed, and the recent ones.
+    emoji_query: Entity<gpui_component::input::InputState>,
+    emoji_group: usize,
+    emoji_shown: Rc<Vec<&'static str>>,
+    emoji_recent: Vec<&'static str>,
     /// The voice message being recorded, if any.
     recorder: Option<crate::voice::Recorder>,
     pins: Vec<String>,
@@ -166,6 +162,23 @@ impl ChatView {
         let store = backend.store().clone();
         let placeholder = format!("Message {}", chat.title);
         let draft = chat.draft.clone().unwrap_or_default();
+        let emoji_query = cx.new(|cx| gpui_component::input::InputState::new(window, cx).placeholder("Search emoji"));
+        cx.subscribe_in(&emoji_query, window, |this, _, event: &InputEvent, _window, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.refresh_emoji(cx);
+                cx.notify();
+            }
+        })
+        .detach();
+        // Recently used emoji are remembered across runs.
+        let emoji_recent: Vec<&'static str> = store
+            .kv("emoji-recent")
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .split(' ')
+            .filter_map(|text| emojis::get(text).map(|emoji| emoji.as_str()))
+            .collect();
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 14)
@@ -225,6 +238,10 @@ impl ChatView {
             info_for: None,
             members_expanded: false,
             item_keys: Vec::new(),
+            emoji_query,
+            emoji_group: 1,
+            emoji_shown: Rc::new(Vec::new()),
+            emoji_recent,
             recorder: None,
             pins: Vec::new(),
             pin_text: None,
@@ -887,7 +904,47 @@ impl ChatView {
         cx.notify();
     }
 
+    /// Works out which emoji the picker lists: the matches of the search, or the group.
+    fn refresh_emoji(&mut self, cx: &mut Context<Self>) {
+        let query = self.emoji_query.read(cx).value().trim().to_lowercase();
+        let shown: Vec<&'static str> = if !query.is_empty() {
+            emojis::iter()
+                .filter(|emoji| drawable(emoji))
+                .filter(|emoji| {
+                    emoji.name().contains(&query) || emoji.shortcodes().any(|code| code.contains(&query))
+                })
+                .map(|emoji| emoji.as_str())
+                .collect()
+        } else if self.emoji_group == 0 {
+            self.emoji_recent.clone()
+        } else {
+            emojis::Group::iter()
+                .nth(self.emoji_group - 1)
+                .map(|group| {
+                    group
+                        .emojis()
+                        .filter(|emoji| drawable(emoji))
+                        .map(|emoji| emoji.as_str())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        self.emoji_shown = Rc::new(shown);
+    }
+
+    /// Puts an emoji at the front of the recent ones and saves them.
+    fn remember_emoji(&mut self, emoji: &str) {
+        let Some(emoji) = emojis::get(emoji).map(|emoji| emoji.as_str()) else {
+            return;
+        };
+        self.emoji_recent.retain(|recent| *recent != emoji);
+        self.emoji_recent.insert(0, emoji);
+        self.emoji_recent.truncate(36);
+        let _ = self.store.set_kv("emoji-recent", &self.emoji_recent.join(" "));
+    }
+
     fn pick_emoji(&mut self, emoji: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.remember_emoji(emoji);
         match self.emoji.take().map(|state| state.target) {
             Some(EmojiTarget::Message(id)) => self.react(&id, emoji, cx),
             _ => {
@@ -919,6 +976,19 @@ impl ChatView {
                 let _ = entity.update(cx, |this, cx| this.open_media(&media_id, cx));
             })),
             audio: self.audio.as_ref().and_then(|player| player.playback()),
+            rate: self.audio.as_ref().map(|player| player.rate() as f32).unwrap_or(1.),
+            seek: Some({
+                let entity = cx.entity().downgrade();
+                Rc::new(move |id: String, fraction: f32, _: &mut Window, cx: &mut App| {
+                    let _ = entity.update(cx, |this, cx| this.seek_audio(&id, fraction, cx));
+                })
+            }),
+            speed: Some({
+                let entity = cx.entity().downgrade();
+                Rc::new(move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                    let _ = entity.update(cx, |this, cx| this.step_audio_speed(cx));
+                }) as super::message::ClickFn
+            }),
             media_id: Some({
                 let entity = cx.entity().downgrade();
                 Rc::new(move |picture: String, _: &mut Window, cx: &mut App| {
@@ -1285,28 +1355,107 @@ impl ChatView {
 
     fn emoji_overlay(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let state = self.emoji.clone()?;
+        // The list is worked out when the picker first opens.
+        if self.emoji_shown.is_empty() && self.emoji_group != 0 {
+            self.refresh_emoji(cx);
+        }
         let t = tokens(cx).clone();
         let hover = t.accent;
-        let mut grid = div().flex().flex_wrap().p(px(6.));
-        for (slot, emoji) in EMOJI.iter().enumerate() {
-            grid = grid.child(
+        // Group tabs: recent first, then the standard groups.
+        const TABS: [(&str, &str); 10] = [
+            ("\u{1f552}", "Recent"),
+            ("\u{1f600}", "Smileys"),
+            ("\u{1f44b}", "People"),
+            ("\u{1f43b}", "Animals and nature"),
+            ("\u{1f354}", "Food and drink"),
+            ("\u{2708}\u{fe0f}", "Travel and places"),
+            ("\u{26bd}", "Activities"),
+            ("\u{1f4a1}", "Objects"),
+            ("\u{1f523}", "Symbols"),
+            ("\u{1f3f3}\u{fe0f}", "Flags"),
+        ];
+        let searching = !self.emoji_query.read(cx).value().trim().is_empty();
+        let mut tabs = div().px(px(6.)).pb(px(4.)).flex().flex_shrink_0();
+        for (index, (glyph, name)) in TABS.iter().enumerate() {
+            let active = !searching && index == self.emoji_group;
+            tabs = tabs.child(
                 div()
-                    .id(("emoji", slot))
-                    .size(px(36.))
+                    .id(("emoji-tab", index))
+                    .flex_1()
+                    .h(px(30.))
                     .rounded(R_MD)
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(22.))
+                    .text_size(px(16.))
                     .cursor_pointer()
+                    .when(active, |this| this.bg(t.tint(0.14)))
                     .hover(move |style| style.bg(hover))
-                    .child(*emoji)
-                    .on_click(cx.listener(move |this, _, window, cx| this.pick_emoji(emoji, window, cx))),
+                    .child(*glyph)
+                    .tooltip(tip(*name))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.emoji_group = index;
+                        this.emoji_query.update(cx, |input, cx| input.set_value("", window, cx));
+                        this.refresh_emoji(cx);
+                        cx.notify();
+                    })),
             );
         }
+        // Nine to a row; only the rows on screen are built.
+        const PER_ROW: usize = 9;
+        let shown = self.emoji_shown.clone();
+        let rows = shown.len().div_ceil(PER_ROW);
+        let grid: AnyElement = if shown.is_empty() {
+            div()
+                .flex_1()
+                .p(px(16.))
+                .text_size(px(13.))
+                .text_color(t.muted_foreground)
+                .child(if searching {
+                    "No emoji matches."
+                } else {
+                    "Emoji you use will show here."
+                })
+                .into_any_element()
+        } else {
+            gpui::uniform_list(
+                "emoji-grid",
+                rows,
+                cx.processor(move |_this, range: std::ops::Range<usize>, _window, cx| {
+                    range
+                        .map(|row| {
+                            let mut line = div().h(px(36.)).px(px(6.)).flex();
+                            for (column, emoji) in shown.iter().skip(row * PER_ROW).take(PER_ROW).enumerate() {
+                                let emoji: &'static str = emoji;
+                                line = line.child(
+                                    div()
+                                        .id(("emoji", row * PER_ROW + column))
+                                        .size(px(36.))
+                                        .rounded(R_MD)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(22.))
+                                        .cursor_pointer()
+                                        .hover(move |style| style.bg(hover))
+                                        .child(emoji)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.pick_emoji(emoji, window, cx)
+                                        })),
+                                );
+                            }
+                            line
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .flex_1()
+            .min_h_0()
+            .into_any_element()
+        };
         let panel = div()
             .w(px(336.))
-            .h(px(380.))
+            .h(px(420.))
             .rounded(R_XL)
             .border_1()
             .border_color(t.border)
@@ -1318,18 +1467,15 @@ impl ChatView {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 div()
-                    .px(px(12.))
-                    .pt(px(8.))
-                    .pb(px(4.))
-                    .text_size(px(12.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(t.muted_foreground)
-                    .child("Emoji"),
+                    .p(px(8.))
+                    .flex_shrink_0()
+                    .child(gpui_component::input::Input::new(&self.emoji_query).cleanable(true)),
             )
-            .child(div().id("emoji-scroll").flex_1().min_h_0().overflow_y_scroll().child(grid));
+            .child(tabs)
+            .child(grid);
         // Open upward from the composer, downward from a message.
         let at = if state.target == EmojiTarget::Composer {
-            point(state.at.x - px(300.), state.at.y - px(400.))
+            point(state.at.x - px(300.), state.at.y - px(440.))
         } else {
             state.at
         };
@@ -3506,6 +3652,23 @@ struct VideoPlay {
     stop: Arc<std::sync::atomic::AtomicBool>,
     size: (u32, u32),
     error: Arc<std::sync::Mutex<Option<String>>>,
+    /// Pause, jump and position, shared with the decoding thread.
+    control: Arc<VideoControl>,
+    /// A GIF: loops silently and has no controls.
+    looping: bool,
+    /// Length in seconds as the message states it, until the player reports its own.
+    stated_secs: f64,
+}
+
+/// What the video controls and the decoding thread tell each other.
+struct VideoControl {
+    paused: std::sync::atomic::AtomicBool,
+    /// The video has played to its end and waits for a jump back.
+    ended: std::sync::atomic::AtomicBool,
+    /// A jump asked for, in milliseconds; -1 when none is waiting.
+    seek_ms: std::sync::atomic::AtomicI64,
+    /// Time of the picture on screen, in milliseconds.
+    position_ms: std::sync::atomic::AtomicU64,
 }
 
 impl ChatView {
@@ -3518,38 +3681,115 @@ impl ChatView {
         let latest = Arc::new(std::sync::Mutex::new(None));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let error = Arc::new(std::sync::Mutex::new(None));
+        let control = Arc::new(VideoControl {
+            paused: false.into(),
+            ended: false.into(),
+            seek_ms: (-1).into(),
+            position_ms: 0.into(),
+        });
         {
-            let (latest, stop, error, path) = (latest.clone(), stop.clone(), error.clone(), path.clone());
+            let (latest, stop, error, path, control) =
+                (latest.clone(), stop.clone(), error.clone(), path.clone(), control.clone());
             std::thread::Builder::new()
                 .name("video-decode".into())
                 .spawn(move || {
-                    loop {
-                        let mut reader = match crate::video::VideoReader::open(&path) {
-                            Ok(reader) => reader,
-                            Err(problem) => {
-                                if let Ok(mut slot) = error.lock() {
-                                    *slot = Some(format!("{problem:#}"));
-                                }
-                                return;
+                    let open = |error: &Arc<std::sync::Mutex<Option<String>>>| match crate::video::VideoReader::open(&path) {
+                        Ok(reader) => Some(reader),
+                        Err(problem) => {
+                            if let Ok(mut slot) = error.lock() {
+                                *slot = Some(format!("{problem:#}"));
                             }
+                            None
+                        }
+                    };
+                    let Some(mut reader) = open(&error) else {
+                        return;
+                    };
+                    let (width, height) = (reader.width, reader.height);
+                    let step = Duration::from_millis(15);
+                    // `base` is the moment the video time `offset` was on screen.
+                    let mut base = Instant::now();
+                    let mut offset = 0f64;
+                    // Sits out a pause; returns how long it lasted.
+                    let wait_while_paused = |control: &VideoControl, stop: &std::sync::atomic::AtomicBool| {
+                        let began = Instant::now();
+                        while control.paused.load(Ordering::Relaxed)
+                            && !stop.load(Ordering::Relaxed)
+                            && control.seek_ms.load(Ordering::Relaxed) < 0
+                        {
+                            std::thread::sleep(step);
+                        }
+                        began.elapsed()
+                    };
+                    loop {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        // A jump asked for from the controls.
+                        let jump = control.seek_ms.swap(-1, Ordering::Relaxed);
+                        if jump >= 0 {
+                            let to = jump as f64 / 1000.;
+                            if reader.seek(to).is_err() {
+                                match open(&error) {
+                                    Some(fresh) => reader = fresh,
+                                    None => return,
+                                }
+                            }
+                            base = Instant::now();
+                            offset = to;
+                            control.ended.store(false, Ordering::Relaxed);
+                        }
+                        if control.ended.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(30));
+                            continue;
+                        }
+                        if control.paused.load(Ordering::Relaxed) {
+                            base += wait_while_paused(&control, &stop);
+                            continue;
+                        }
+                        let Ok(Some(frame)) = reader.next_frame() else {
+                            if looping {
+                                match open(&error) {
+                                    Some(fresh) => reader = fresh,
+                                    None => return,
+                                }
+                                base = Instant::now();
+                                offset = 0.;
+                            } else {
+                                control.ended.store(true, Ordering::Relaxed);
+                            }
+                            continue;
                         };
-                        let (width, height) = (reader.width, reader.height);
-                        let started = Instant::now();
-                        while let Ok(Some(frame)) = reader.next_frame() {
+                        // Wait for the picture's time in short steps, so that stop, pause
+                        // and jumps are noticed at once.
+                        let mut interrupted = false;
+                        loop {
+                            let due = base + Duration::from_secs_f64((frame.at_secs - offset).max(0.));
+                            let now = Instant::now();
+                            if now >= due {
+                                break;
+                            }
                             if stop.load(Ordering::Relaxed) {
                                 return;
                             }
-                            // Show each picture at its own time.
-                            let due = started + Duration::from_secs_f64(frame.at_secs.max(0.));
-                            if let Some(wait) = due.checked_duration_since(Instant::now()) {
-                                std::thread::sleep(wait);
+                            if control.seek_ms.load(Ordering::Relaxed) >= 0 {
+                                interrupted = true;
+                                break;
                             }
-                            if let Ok(mut slot) = latest.lock() {
-                                *slot = Some((frame.bgra, width, height));
+                            if control.paused.load(Ordering::Relaxed) {
+                                base += wait_while_paused(&control, &stop);
+                                continue;
                             }
+                            std::thread::sleep((due - now).min(step));
                         }
-                        if !looping || stop.load(Ordering::Relaxed) {
-                            return;
+                        if interrupted {
+                            continue;
+                        }
+                        control
+                            .position_ms
+                            .store((frame.at_secs.max(0.) * 1000.) as u64, Ordering::Relaxed);
+                        if let Ok(mut slot) = latest.lock() {
+                            *slot = Some((frame.bgra, width, height));
                         }
                     }
                 })
@@ -3566,12 +3806,23 @@ impl ChatView {
             }
         }
 
+        let stated_secs = self
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Msg(view) if view.row.id == id => Some(view.media.seconds as f64),
+                _ => None,
+            })
+            .unwrap_or(0.);
         self.video = Some(VideoPlay {
             frame: None,
             latest,
             stop,
             size: (0, 0),
             error,
+            control,
+            looping,
+            stated_secs,
         });
         cx.spawn_in(window, async move |this, cx| {
             loop {
@@ -3653,11 +3904,168 @@ impl ChatView {
                 .items_center()
                 .justify_center()
                 .p(px(24.))
+                .flex_col()
+                .gap(px(14.))
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.stop_video(window);
                     cx.notify();
                 }))
                 .child(body)
+                .children(self.video_controls(cx))
+                .into_any_element(),
+        )
+    }
+
+    /// Length of the playing video in seconds: what the player reports, or failing that
+    /// what the message said.
+    fn video_length(&self) -> f64 {
+        let reported = self
+            .audio
+            .as_ref()
+            .and_then(|player| player.playback())
+            .map(|playback| playback.duration_secs)
+            .unwrap_or(0.);
+        if reported > 0. {
+            reported
+        } else {
+            self.video.as_ref().map(|play| play.stated_secs).unwrap_or(0.)
+        }
+    }
+
+    fn toggle_video_pause(&mut self, cx: &mut Context<Self>) {
+        use std::sync::atomic::Ordering;
+        let Some(play) = self.video.as_ref() else {
+            return;
+        };
+        if play.control.ended.load(Ordering::Relaxed) {
+            // Played to the end: start over.
+            play.control.paused.store(false, Ordering::Relaxed);
+            play.control.seek_ms.store(0, Ordering::Relaxed);
+            if let Some(player) = self.audio.as_mut() {
+                let _ = player.seek(0.);
+                if !player.is_playing() {
+                    let _ = player.toggle();
+                }
+            }
+        } else {
+            let pause = !play.control.paused.load(Ordering::Relaxed);
+            play.control.paused.store(pause, Ordering::Relaxed);
+            if let Some(player) = self.audio.as_mut()
+                && player.is_playing() == pause
+            {
+                let _ = player.toggle();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Jumps to a fraction (0 to 1) of the playing video.
+    fn seek_video(&mut self, fraction: f64, cx: &mut Context<Self>) {
+        use std::sync::atomic::Ordering;
+        let length = self.video_length();
+        let Some(play) = self.video.as_ref() else {
+            return;
+        };
+        if length <= 0. {
+            return;
+        }
+        let to = (length * fraction).clamp(0., (length - 0.1).max(0.));
+        play.control.seek_ms.store((to * 1000.) as i64, Ordering::Relaxed);
+        play.control.position_ms.store((to * 1000.) as u64, Ordering::Relaxed);
+        if let Some(player) = self.audio.as_mut() {
+            let _ = player.seek(to);
+        }
+        cx.notify();
+    }
+
+    /// Play or pause, the time, a bar to jump with, and mute. Not shown for GIFs.
+    fn video_controls(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use std::sync::atomic::Ordering;
+        let play = self.video.as_ref()?;
+        if play.looping || play.frame.is_none() {
+            return None;
+        }
+        let length = self.video_length();
+        let position = play.control.position_ms.load(Ordering::Relaxed) as f64 / 1000.;
+        let paused = play.control.paused.load(Ordering::Relaxed) || play.control.ended.load(Ordering::Relaxed);
+        let muted = self.audio.as_ref().is_some_and(|player| player.is_muted());
+        let clock = |seconds: f64| {
+            let whole = seconds.max(0.) as u64;
+            format!("{}:{:02}", whole / 60, whole % 60)
+        };
+        let done = if length > 0. { (position / length).clamp(0., 1.) } else { 0. };
+        // The bar is a row of thin slices; a click on one jumps there.
+        const SLICES: usize = 120;
+        let mut bar = div().id("video-track").w(px(420.)).h(px(16.)).flex().items_center().cursor_pointer();
+        for slice in 0..SLICES {
+            let filled = (slice as f64 + 0.5) / SLICES as f64 <= done;
+            bar = bar.child(
+                div()
+                    .id(("video-slice", slice))
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .child(div().w_full().h(px(4.)).bg(if filled {
+                        gpui::white()
+                    } else {
+                        gpui::hsla(0., 0., 1., 0.28)
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.seek_video((slice as f64 + 0.5) / SLICES as f64, cx);
+                    })),
+            );
+        }
+        let button = |id: &'static str, glyph: &'static str| {
+            div()
+                .id(id)
+                .size(px(32.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(gpui::white())
+                .cursor_pointer()
+                .hover(|style| style.bg(gpui::hsla(0., 0., 1., 0.14)))
+                .child(icon(glyph))
+        };
+        Some(
+            div()
+                .id("video-controls")
+                .h(px(44.))
+                .px(px(10.))
+                .rounded_full()
+                .bg(gpui::hsla(0., 0., 0.1, 0.8))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .text_size(px(12.))
+                .text_color(gpui::white())
+                // A click on the controls must not close the viewer behind them.
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(
+                    button("video-toggle", if paused { "play" } else { "pause" }).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_video_pause(cx);
+                        },
+                    )),
+                )
+                .child(div().w(px(36.)).child(clock(position)))
+                .child(bar)
+                .child(div().w(px(36.)).child(clock(length)))
+                .child(
+                    button("video-mute", if muted { "volume-x" } else { "volume-2" }).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(player) = this.audio.as_mut() {
+                                player.set_muted(!muted);
+                            }
+                            cx.notify();
+                        },
+                    )),
+                )
                 .into_any_element(),
         )
     }
@@ -4121,5 +4529,35 @@ impl ChatView {
             }
         }
         rows
+    }
+}
+
+impl ChatView {
+    /// Jumps within a voice message. Only the clip that is loaded can be jumped in; a
+    /// click on another one's bars starts it instead.
+    fn seek_audio(&mut self, id: &str, fraction: f32, cx: &mut Context<Self>) {
+        let loaded = self.audio.as_ref().and_then(|player| player.playback()).filter(|p| p.id == id);
+        match loaded {
+            Some(playback) if playback.duration_secs > 0. => {
+                if let Some(player) = self.audio.as_mut() {
+                    let _ = player.seek(playback.duration_secs * fraction as f64);
+                }
+            }
+            _ => self.open_media(id, cx),
+        }
+        cx.notify();
+    }
+
+    /// Steps the playback speed: 1, 1.5, 2, and back to 1.
+    fn step_audio_speed(&mut self, cx: &mut Context<Self>) {
+        if let Some(player) = self.audio.as_mut() {
+            let next = match player.rate() {
+                rate if rate >= 1.9 => 1.,
+                rate if rate >= 1.4 => 2.,
+                _ => 1.5,
+            };
+            player.set_rate(next);
+        }
+        cx.notify();
     }
 }

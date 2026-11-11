@@ -36,7 +36,7 @@ case "${1:-}" in
     taskkill //IM wa-uitest.exe //F >/dev/null 2>&1
     sleep 0.5
     [ -f "$data/chats.db" ] || snapshot
-    (WA_DATA_DIR="$(cygpath -w "$data")" WA_OFFLINE=1 WA_OFFSCREEN=1 WA_READONLY=1 WA_OPEN_CHAT="${2:-}" "$exe" > .reference/uitest.log 2>&1 &)
+    (WA_DATA_DIR="$(cygpath -w "$data")" WA_MUTE=1 WA_OFFLINE=1 WA_OFFSCREEN=1 WA_READONLY=1 WA_OPEN_CHAT="${2:-}" "$exe" > .reference/uitest.log 2>&1 &)
     ;;
   shot)
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts/shot.ps1 -ProcessName wa-uitest -Out "$(pwd -W)/.reference/${2:-shot.png}"

@@ -16,12 +16,13 @@ anyhow = "1.0.104"
 rust-embed = "8"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 ureq = "3.5"
-windows = { version = "0.62", features = ["Media_Playback", "Media_Core", "Foundation", "Storage", "Storage_FileProperties", "Storage_Streams", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }
+windows = { version = "0.62", features = ["Media_Playback", "Media_Core", "Foundation", "Storage", "Storage_FileProperties", "Storage_Streams", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Com_StructuredStorage", "Win32_System_Variant"] }
 sha2 = "0.10"
 raw-window-handle = "0.6"
 cpal = "0.18"
 ogg = "0.9"
 unsafe-libopus = "0.2"
+emojis = "0.6"
 
 [build-dependencies]
 winresource = "0.1"

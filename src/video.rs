@@ -88,6 +88,19 @@ impl VideoReader {
         }
     }
 
+    /// Jumps to a position, in seconds. The next picture decoded is the key frame at or
+    /// before it; the caller shows the ones up to the position without waiting.
+    pub fn seek(&mut self, seconds: f64) -> Result<()> {
+        let position = windows::Win32::System::Com::StructuredStorage::PROPVARIANT::from((seconds.max(0.) * 10_000_000.) as i64);
+        // SAFETY: the reader is live; a null time format means 100-nanosecond units.
+        unsafe {
+            self.reader
+                .SetCurrentPosition(&windows::core::GUID::zeroed(), &position)
+                .context("jumping in the video")?;
+        }
+        Ok(())
+    }
+
     /// Decodes the next picture. `None` at the end of the video.
     pub fn next_frame(&mut self) -> Result<Option<Frame>> {
         unsafe {

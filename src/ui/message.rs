@@ -50,6 +50,8 @@ pub struct Media {
     pub thumb_file: Option<std::path::PathBuf>,
     /// The display copy of a downloaded photo: small enough to show without a hitch.
     pub display: Option<std::path::PathBuf>,
+    /// Loudness bars of a voice message (0 to 100 each), as its sender recorded them.
+    pub waveform: Vec<u8>,
 }
 
 /// A stored message with everything the row needs resolved.
@@ -95,6 +97,12 @@ pub struct RowHooks {
     pub open_chat: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
     /// Open the photo of the message with this ID (for album tiles).
     pub media_id: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
+    /// Jump to a fraction (0 to 1) of the voice message with this ID.
+    pub seek: Option<Rc<dyn Fn(String, f32, &mut Window, &mut App)>>,
+    /// Step the playback speed of the clip that is loaded (1, 1.5, 2).
+    pub speed: Option<ClickFn>,
+    /// The playback speed in use.
+    pub rate: f32,
 }
 
 /// Extracts what a row needs from the stored record.
@@ -124,6 +132,7 @@ pub fn media_of(record: &wa::WebMessageInfo) -> (Media, bool) {
         media.file_size = m.file_length.unwrap_or(0);
         media.mime = m.mimetype.clone();
     } else if let Some(m) = base.audio_message.as_option() {
+        media.waveform = m.waveform.clone().unwrap_or_default();
         media.seconds = m.seconds.unwrap_or(0);
         media.file_size = m.file_length.unwrap_or(0);
         media.mime = m.mimetype.clone();
@@ -528,15 +537,49 @@ fn content(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> Div {
                         .flex()
                         .flex_col()
                         .gap(px(6.))
-                        .child(
-                            div().h(px(4.)).rounded_full().bg(t.fg(0.12)).child(
-                                div()
-                                    .h_full()
-                                    .w(gpui::relative(fraction))
-                                    .rounded_full()
-                                    .bg(t.primary),
-                            ),
-                        )
+                        .child(if view.media.waveform.is_empty() {
+                            div()
+                                .h(px(4.))
+                                .rounded_full()
+                                .bg(t.fg(0.12))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(gpui::relative(fraction))
+                                        .rounded_full()
+                                        .bg(t.primary),
+                                )
+                                .into_any_element()
+                        } else {
+                            // The recording's own loudness bars; the played part is
+                            // coloured, and a click on a bar jumps there.
+                            let bars = &view.media.waveform;
+                            let mut wave = div().h(px(22.)).flex().items_center().gap(px(1.));
+                            for (index, level) in bars.iter().enumerate() {
+                                let at = (index as f32 + 0.5) / bars.len() as f32;
+                                let height = 3. + (*level as f32 / 100.).clamp(0., 1.) * 19.;
+                                let mut bar = div()
+                                    .id(("wave", key * 128 + index))
+                                    .flex_1()
+                                    .h(px(22.))
+                                    .flex()
+                                    .items_center()
+                                    .child(div().w_full().h(px(height)).rounded(px(1.)).bg(if at <= fraction {
+                                        t.primary
+                                    } else {
+                                        t.fg(0.28)
+                                    }));
+                                if let Some(seek) = hooks.seek.clone() {
+                                    let id = row.id.clone();
+                                    bar = bar.on_click(move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        seek(id.clone(), at, window, cx);
+                                    });
+                                }
+                                wave = wave.child(bar);
+                            }
+                            wave.into_any_element()
+                        })
                         .child(
                             div()
                                 .flex()
@@ -545,7 +588,37 @@ fn content(view: &MsgView, hooks: &RowHooks, t: &Tokens) -> Div {
                                 .text_size(px(11.))
                                 .text_color(t.muted_foreground)
                                 .child(icon(if row.kind == Voice { "mic" } else { "music" }).size(px(11.)))
-                                .child(times),
+                                .child(times)
+                                .child(div().flex_1())
+                                .when_some(hooks.speed.clone().filter(|_| state.is_some()), |this, speed| {
+                                    // Shown on the clip that is loaded: 1, 1.5, 2 times.
+                                    let label = if hooks.rate >= 1.9 {
+                                        "2\u{d7}"
+                                    } else if hooks.rate >= 1.4 {
+                                        "1.5\u{d7}"
+                                    } else {
+                                        "1\u{d7}"
+                                    };
+                                    this.child(
+                                        div()
+                                            .id(("speed", key))
+                                            .px(px(6.))
+                                            .h(px(16.))
+                                            .rounded_full()
+                                            .bg(t.fg(0.10))
+                                            .flex()
+                                            .items_center()
+                                            .text_size(px(10.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(t.foreground)
+                                            .cursor_pointer()
+                                            .child(label)
+                                            .on_click(move |event, window, cx| {
+                                                cx.stop_propagation();
+                                                speed(event, window, cx);
+                                            }),
+                                    )
+                                }),
                         ),
                 );
             column = column.child(clickable(card, ("media", key), &hooks.media));
