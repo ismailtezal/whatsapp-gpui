@@ -132,6 +132,15 @@ impl Store {
         })
     }
 
+    /// The disappearing-message timer of a chat, in seconds (0 when off).
+    pub fn chat_timer(&self, chat: &str) -> Result<i64> {
+        self.read(|conn| {
+            Ok(conn
+                .query_row("SELECT ephemeral FROM chats WHERE jid = ?1", [chat], |row| row.get(0))
+                .unwrap_or(0))
+        })
+    }
+
     /// Saved contacts (people with an address-book name), by name.
     pub fn contacts(&self) -> Result<Vec<ContactRow>> {
         self.read(|conn| {

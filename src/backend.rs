@@ -745,6 +745,14 @@ async fn execute(
                 .fetch_metadata(&jid(&chat)?)
                 .await
                 .map_err(|error| anyhow!("could not read the group details: {error}"))?;
+            let group_settings = crate::events::GroupSettings {
+                locked: meta.is_locked,
+                announce: meta.is_announcement,
+                approval: meta.membership_approval,
+                members_can_add: matches!(meta.member_add_mode, Some(whatsapp_rust::MemberAddMode::AllMemberAdd)),
+                timer: meta.ephemeral.as_ref().and_then(|timer| timer.expiration).unwrap_or(0),
+            };
+            store.set_kv(&crate::events::GroupSettings::key(&chat), &group_settings.encode())?;
             store.batch(|tx| {
                 tx.patch_chat(
                     &chat,
@@ -752,6 +760,7 @@ async fn execute(
                         name: meta.subject.clone(),
                         description: meta.description.clone(),
                         created_at: meta.creation_time.map(|t| t as i64),
+                        ephemeral: Some(group_settings.timer as i64),
                         ..Default::default()
                     },
                 )?;
@@ -935,6 +944,141 @@ async fn execute(
             outcome.map_err(|error| anyhow!("could not change the members: {error}"))?;
             // Read the result back from the server rather than guessing it.
             Box::pin(execute(client, store, events, Command::RefreshGroup { chat })).await?;
+        }
+
+        Command::SetGroupSetting { chat, setting } => {
+            use crate::events::GroupSetting;
+            use whatsapp_rust::{MemberAddMode, MembershipApprovalMode};
+            let group = jid(&chat)?;
+            let groups = client.groups();
+            let outcome = match setting {
+                GroupSetting::Locked(on) => groups.set_locked(group, on).await,
+                GroupSetting::Announce(on) => groups.set_announce(group, on).await,
+                GroupSetting::Approval(on) => {
+                    let mode = if on {
+                        MembershipApprovalMode::On
+                    } else {
+                        MembershipApprovalMode::Off
+                    };
+                    groups.set_membership_approval(group, mode).await
+                }
+                GroupSetting::MembersCanAdd(on) => {
+                    let mode = if on {
+                        MemberAddMode::AllMemberAdd
+                    } else {
+                        MemberAddMode::AdminAdd
+                    };
+                    groups.set_member_add_mode(group, mode).await
+                }
+            };
+            outcome.map_err(|error| anyhow!("the group setting could not be changed: {error}"))?;
+            Box::pin(execute(client, store, events, Command::RefreshGroup { chat })).await?;
+        }
+
+        Command::SetTimer { chat, seconds } => {
+            if ChatKind::of_jid(&chat) == ChatKind::Group {
+                client
+                    .groups()
+                    .set_ephemeral(jid(&chat)?, seconds)
+                    .await
+                    .map_err(|error| anyhow!("the message timer could not be changed: {error}"))?;
+                Box::pin(execute(client, store, events, Command::RefreshGroup { chat })).await?;
+            } else {
+                client
+                    .set_chat_disappearing_timer(jid(&chat)?, seconds)
+                    .await
+                    .map_err(|error| anyhow!("the message timer could not be changed: {error}"))?;
+                store.patch_chat(
+                    &chat,
+                    &ChatPatch {
+                        ephemeral: Some(seconds as i64),
+                        ..Default::default()
+                    },
+                )?;
+                notify(events, &chat).await;
+            }
+        }
+
+        Command::GroupInvite { chat, reset } => {
+            let link = client
+                .groups()
+                .get_invite_link(jid(&chat)?, reset)
+                .await
+                .map_err(|error| anyhow!("the invite link could not be read: {error}"))?;
+            let _ = events.send(UiEvent::InviteLink { chat, link }).await;
+        }
+
+        Command::JoinGroup { link } => {
+            use whatsapp_rust::JoinGroupResult;
+            let result = client
+                .groups()
+                .join_with_invite_code(link.trim())
+                .await
+                .map_err(|error| anyhow!("could not join with that link: {error}"))?;
+            let (group, said) = match &result {
+                JoinGroupResult::Joined(group) => (group.to_string(), "You joined the group."),
+                JoinGroupResult::PendingApproval(group) => {
+                    (group.to_string(), "Asked to join. An admin has to approve it.")
+                }
+            };
+            if matches!(result, JoinGroupResult::Joined(_)) {
+                store.ensure_chat(&group)?;
+                let _ = Box::pin(execute(client, store, events, Command::RefreshGroup { chat: group })).await;
+            }
+            let _ = events.send(UiEvent::ChatsChanged).await;
+            let _ = events.send(UiEvent::Error(said.to_string())).await;
+        }
+
+        Command::SetGroupPhoto { chat, path } => {
+            let group = jid(&chat)?;
+            match path {
+                Some(path) => {
+                    let bytes = tokio::task::spawn_blocking(move || crate::avatars::profile_jpeg(&path)).await??;
+                    client
+                        .groups()
+                        .set_profile_picture(group, bytes.clone())
+                        .await
+                        .map_err(|error| anyhow!("the group photo could not be changed: {error}"))?;
+                    crate::avatars::store(&chat, &bytes)?;
+                }
+                None => {
+                    client
+                        .groups()
+                        .remove_profile_picture(group)
+                        .await
+                        .map_err(|error| anyhow!("the group photo could not be removed: {error}"))?;
+                    crate::avatars::forget(&chat);
+                }
+            }
+            let _ = events.send(UiEvent::AvatarReady { jid: chat }).await;
+        }
+
+        Command::JoinRequests { chat } => {
+            let requests = client
+                .groups()
+                .get_membership_requests(jid(&chat)?)
+                .await
+                .map_err(|error| anyhow!("could not read who is waiting to join: {error}"))?;
+            let mut people = Vec::with_capacity(requests.len());
+            for request in requests {
+                people.push(store.canonical(&request.jid.to_non_ad_string())?);
+            }
+            let _ = events.send(UiEvent::JoinRequests { chat, people }).await;
+        }
+
+        Command::AnswerJoinRequest { chat, person, approve } => {
+            let group = jid(&chat)?;
+            let who = [jid(&person)?];
+            let outcome = if approve {
+                client.groups().approve_membership_requests(group, &who).await
+            } else {
+                client.groups().reject_membership_requests(group, &who).await
+            };
+            outcome.map_err(|error| anyhow!("could not answer the request to join: {error}"))?;
+            Box::pin(execute(client, store, events, Command::JoinRequests { chat: chat.clone() })).await?;
+            if approve {
+                Box::pin(execute(client, store, events, Command::RefreshGroup { chat })).await?;
+            }
         }
 
         Command::SetProfileName { name } => {

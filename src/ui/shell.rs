@@ -129,6 +129,8 @@ pub struct Shell {
     /// The name field must be refilled from the account (done at the next render, which
     /// has the window an input needs).
     profile_name_stale: bool,
+    /// New chat panel: an invite link to join a group with.
+    join_link: Entity<InputState>,
     /// Settings: the name and About fields.
     profile_name: Entity<InputState>,
     profile_about: Entity<InputState>,
@@ -172,6 +174,7 @@ impl Shell {
                 .placeholder("Type a status")
         });
         let status_reply = cx.new(|cx| InputState::new(window, cx).placeholder("Reply"));
+        let join_link = cx.new(|cx| InputState::new(window, cx).placeholder("Paste a group invite link"));
         let profile_name = cx.new(|cx| InputState::new(window, cx).placeholder("Your name"));
         let profile_about = cx.new(|cx| InputState::new(window, cx).placeholder("About (leave empty to remove it)"));
         cx.subscribe_in(&status_reply, window, |this, _, event: &InputEvent, window, cx| {
@@ -267,6 +270,7 @@ impl Shell {
             backdrop: None,
             stale_chats: false,
             stale_open_chat: false,
+            join_link,
             profile_name_stale: true,
             profile_name,
             profile_about,
@@ -491,6 +495,20 @@ impl Shell {
                     && let Some(view) = &self.chat
                 {
                     view.update(cx, |view, cx| view.set_presence(online, last_seen, cx));
+                }
+            }
+            UiEvent::InviteLink { chat, link } => {
+                if self.selected.as_deref() == Some(chat.as_str())
+                    && let Some(view) = &self.chat
+                {
+                    view.update(cx, |view, cx| view.invite_link_arrived(link, cx));
+                }
+            }
+            UiEvent::JoinRequests { chat, people } => {
+                if self.selected.as_deref() == Some(chat.as_str())
+                    && let Some(view) = &self.chat
+                {
+                    view.update(cx, |view, cx| view.join_requests_arrived(people, cx));
                 }
             }
             UiEvent::IncomingCall { from, video, .. } => {
@@ -1364,6 +1382,45 @@ impl Shell {
                                     })),
                             )
                         }),
+                )
+            })
+            .when(self.picking && !self.group_mode, |this| {
+                let t = t.clone();
+                let hover = t.fg(0.09);
+                this.child(
+                    div()
+                        .px(px(12.))
+                        .pb(px(8.))
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(div().flex_1().child(Input::new(&self.join_link)))
+                        .child(
+                            div()
+                                .id("join-with-link")
+                                .h(px(32.))
+                                .px(px(12.))
+                                .rounded(R_LG)
+                                .flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .bg(t.fg(0.06))
+                                .text_size(px(13.))
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(hover))
+                                .child("Join")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let link = this.join_link.read(cx).value().trim().to_string();
+                                    if link.is_empty() {
+                                        return;
+                                    }
+                                    this.backend.send(Command::JoinGroup { link });
+                                    this.join_link.update(cx, |input, cx| input.set_value("", window, cx));
+                                    this.picking = false;
+                                    cx.notify();
+                                })),
+                        ),
                 )
             })
             .when(show_filters, |this| {

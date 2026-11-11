@@ -140,6 +140,12 @@ pub struct ChatView {
     edit_field: Option<GroupField>,
     edit_input: Entity<gpui_component::input::InputState>,
     info_open: bool,
+    /// A group's switches as last read from the server (kept in the store).
+    group_settings: Option<crate::events::GroupSettings>,
+    /// The disappearing-message timer of this chat, in seconds.
+    timer: i64,
+    /// People waiting to be let into this group.
+    join_requests: Vec<String>,
     /// Group members as (JID, name, rank).
     members: Vec<(String, String, i32)>,
     gallery: Vec<PathBuf>,
@@ -236,6 +242,9 @@ impl ChatView {
             edit_field: None,
             edit_input,
             info_open: false,
+            group_settings: None,
+            timer: 0,
+            join_requests: Vec::new(),
             members: Vec::new(),
             gallery: Vec::new(),
             search_open: false,
@@ -318,6 +327,14 @@ impl ChatView {
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         let _perf = crate::perf::scope("chat.reload");
         self.pins = self.store.pinned(&self.chat.jid).unwrap_or_default();
+        // Read once per reload, not per frame.
+        self.timer = self.store.chat_timer(&self.chat.jid).unwrap_or(0);
+        self.group_settings = self
+            .store
+            .kv(&crate::events::GroupSettings::key(&self.chat.jid))
+            .ok()
+            .flatten()
+            .and_then(|text| crate::events::GroupSettings::decode(&text));
         self.pin_text = self
             .pins
             .first()
@@ -2238,6 +2255,7 @@ impl ChatView {
         if !is_person {
             panel = panel.children(self.group_actions(cx));
         }
+        panel = panel.children(self.settings_rows(cx));
 
         if !self.members.is_empty() {
             panel = panel.child(section("Members"));
@@ -3002,6 +3020,57 @@ impl ChatView {
                 action("info-describe", "file-text", "Edit description", false)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.start_group_edit(GroupField::Description, window, cx)
+                    }))
+                    .into_any_element(),
+            );
+            rows.push(
+                action("info-photo", "image-plus", "Change group photo", false)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let chosen = cx.prompt_for_paths(PathPromptOptions {
+                            files: true,
+                            directories: false,
+                            multiple: false,
+                            prompt: Some("Use as group photo".into()),
+                        });
+                        let chat = this.chat.jid.clone();
+                        cx.spawn(async move |this, cx| {
+                            if let Ok(Ok(Some(paths))) = chosen.await
+                                && let Some(path) = paths.into_iter().next()
+                            {
+                                let _ = this.update(cx, |this, cx| {
+                                    this.backend.send(Command::SetGroupPhoto {
+                                        chat,
+                                        path: Some(path),
+                                    });
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        .detach();
+                    }))
+                    .into_any_element(),
+            );
+            rows.push(
+                action("info-invite", "link", "Copy invite link", false)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.backend.send(Command::GroupInvite {
+                            chat: this.chat.jid.clone(),
+                            reset: false,
+                        });
+                        this.notice = Some("Getting the invite link…".to_string());
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            rows.push(
+                action("info-invite-reset", "refresh-cw", "Reset invite link", false)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.backend.send(Command::GroupInvite {
+                            chat: this.chat.jid.clone(),
+                            reset: true,
+                        });
+                        this.notice = Some("Making a new invite link…".to_string());
+                        cx.notify();
                     }))
                     .into_any_element(),
             );
@@ -3853,5 +3922,204 @@ impl ChatView {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+impl ChatView {
+    /// The invite link asked for has arrived: put it on the clipboard.
+    pub fn invite_link_arrived(&mut self, link: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(link));
+        self.notice = Some("Invite link copied".to_string());
+        cx.notify();
+    }
+
+    pub fn join_requests_arrived(&mut self, people: Vec<String>, cx: &mut Context<Self>) {
+        self.join_requests = people;
+        cx.notify();
+    }
+
+    /// Info panel: the disappearing-message timer, and for groups the admin switches
+    /// and the people waiting to join.
+    fn settings_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        use crate::events::GroupSetting;
+        let t = tokens(cx).clone();
+        let mut rows = Vec::new();
+        let label = |text: &'static str| {
+            div()
+                .px(px(8.))
+                .pt(px(14.))
+                .pb(px(4.))
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(t.muted_foreground)
+                .child(text)
+                .into_any_element()
+        };
+        let is_group = self.chat.kind == ChatKind::Group;
+        let can_change = !is_group || self.i_am_admin();
+
+        // Disappearing messages.
+        rows.push(label("Disappearing messages"));
+        let mut timer_row = div().px(px(8.)).flex().flex_wrap().gap(px(6.));
+        for (index, (name, seconds)) in
+            [("Off", 0u32), ("24 hours", 86_400), ("7 days", 604_800), ("90 days", 7_776_000)]
+                .into_iter()
+                .enumerate()
+        {
+            let active = self.timer == seconds as i64;
+            let hover = t.fg(0.12);
+            timer_row = timer_row.child(
+                div()
+                    .id(("timer", index))
+                    .h(px(28.))
+                    .px(px(10.))
+                    .rounded(R_MD)
+                    .flex()
+                    .items_center()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .when(active, |this| this.bg(t.tint(0.14)).text_color(t.primary))
+                    .when(!active, |this| this.bg(t.fg(0.06)).text_color(t.foreground))
+                    .when(can_change && !active, |this| {
+                        this.cursor_pointer().hover(move |style| style.bg(hover))
+                    })
+                    .child(name)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if can_change && !active {
+                            this.backend.send(Command::SetTimer {
+                                chat: this.chat.jid.clone(),
+                                seconds,
+                            });
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        rows.push(timer_row.into_any_element());
+
+        if !is_group {
+            return rows;
+        }
+        let Some(settings) = self.group_settings else {
+            return rows;
+        };
+
+        // The group's switches. Members see them; admins can flip them.
+        rows.push(label("Group settings"));
+        let switches: [(&'static str, bool, fn(bool) -> GroupSetting); 4] = [
+            ("Only admins can edit group info", settings.locked, GroupSetting::Locked),
+            ("Only admins can send messages", settings.announce, GroupSetting::Announce),
+            ("Admins approve new members", settings.approval, GroupSetting::Approval),
+            ("Members can add other people", settings.members_can_add, GroupSetting::MembersCanAdd),
+        ];
+        for (index, (name, on, make)) in switches.into_iter().enumerate() {
+            let hover = t.fg(0.06);
+            rows.push(
+                div()
+                    .id(("group-switch", index))
+                    .h(px(36.))
+                    .px(px(8.))
+                    .rounded(R_LG)
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(13.))
+                    .when(can_change, |this| this.cursor_pointer().hover(move |style| style.bg(hover)))
+                    .child(div().flex_1().child(name))
+                    .child(
+                        // A small switch: the knob sits right when on.
+                        div()
+                            .w(px(32.))
+                            .h(px(18.))
+                            .rounded_full()
+                            .p(px(2.))
+                            .flex()
+                            .when(on, |this| this.bg(t.primary).justify_end())
+                            .when(!on, |this| this.bg(t.fg(0.18)))
+                            .child(div().size(px(14.)).rounded_full().bg(gpui::white())),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if can_change {
+                            this.backend.send(Command::SetGroupSetting {
+                                chat: this.chat.jid.clone(),
+                                setting: make(!on),
+                            });
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        // People waiting to join, when admins approve members.
+        if can_change && settings.approval {
+            let hover = t.fg(0.06);
+            rows.push(
+                div()
+                    .id("join-requests-refresh")
+                    .h(px(36.))
+                    .px(px(8.))
+                    .rounded(R_LG)
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .text_size(px(13.))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .child(icon("user-plus").text_color(t.muted_foreground))
+                    .child(format!("Requests to join ({})", self.join_requests.len()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.backend.send(Command::JoinRequests {
+                            chat: this.chat.jid.clone(),
+                        });
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            for (index, person) in self.join_requests.iter().take(50).enumerate() {
+                let name = self
+                    .names
+                    .get(person)
+                    .cloned()
+                    .unwrap_or_else(|| crate::model::display_number(person));
+                let (yes, no) = (person.clone(), person.clone());
+                rows.push(
+                    div()
+                        .h(px(40.))
+                        .px(px(8.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(avatar(person, &name, 24., crate::avatars::get(person), cx))
+                        .child(div().flex_1().truncate().text_size(px(13.)).child(SharedString::from(name)))
+                        .child(
+                            icon_button(("join-yes", index), "check", cx)
+                                .tooltip(tip("Let in"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.backend.send(Command::AnswerJoinRequest {
+                                        chat: this.chat.jid.clone(),
+                                        person: yes.clone(),
+                                        approve: true,
+                                    });
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            icon_button(("join-no", index), "x", cx)
+                                .tooltip(tip("Turn down"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.backend.send(Command::AnswerJoinRequest {
+                                        chat: this.chat.jid.clone(),
+                                        person: no.clone(),
+                                        approve: false,
+                                    });
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+        rows
     }
 }

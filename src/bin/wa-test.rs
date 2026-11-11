@@ -391,6 +391,92 @@ fn main() -> Result<()> {
             std::thread::sleep(Duration::from_secs(4));
             println!("leave sent for group");
         }
+        "groupsettings" => {
+            // On a group the tests own (nobody else in it): flip each admin switch on and
+            // back off, set and clear the message timer, read the invite link, reset it.
+            use whatsapp_gpui::events::{GroupSetting, GroupSettings};
+            let chat = group(&store, &args[1])?;
+            let read = |store: &Store| -> Option<GroupSettings> {
+                store
+                    .kv(&GroupSettings::key(&chat))
+                    .ok()
+                    .flatten()
+                    .and_then(|text| GroupSettings::decode(&text))
+            };
+            let settle = |what: &str, want: &dyn Fn(&GroupSettings) -> bool| -> Result<()> {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    if read(&store).is_some_and(|settings| want(&settings)) {
+                        println!("ok: {what}");
+                        return Ok(());
+                    }
+                    if Instant::now() > deadline {
+                        bail!("timed out: {what} (now {:?})", read(&store));
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            };
+            backend.send(Command::RefreshGroup { chat: chat.clone() });
+            settle("settings read", &|_| true)?;
+            println!("start: {:?}", read(&store));
+
+            backend.send(Command::SetGroupSetting { chat: chat.clone(), setting: GroupSetting::Locked(true) });
+            settle("only admins edit info: on", &|s| s.locked)?;
+            backend.send(Command::SetGroupSetting { chat: chat.clone(), setting: GroupSetting::Locked(false) });
+            settle("only admins edit info: off", &|s| !s.locked)?;
+
+            backend.send(Command::SetGroupSetting { chat: chat.clone(), setting: GroupSetting::Announce(true) });
+            settle("only admins send: on", &|s| s.announce)?;
+            backend.send(Command::SetGroupSetting { chat: chat.clone(), setting: GroupSetting::Announce(false) });
+            settle("only admins send: off", &|s| !s.announce)?;
+
+            backend.send(Command::SetGroupSetting { chat: chat.clone(), setting: GroupSetting::Approval(true) });
+            settle("approve new members: on", &|s| s.approval)?;
+            backend.send(Command::JoinRequests { chat: chat.clone() });
+            wait_for(&backend, "join requests", Duration::from_secs(30), |event| {
+                if let UiEvent::JoinRequests { people, .. } = event {
+                    println!("ok: requests to join read ({})", people.len());
+                    return true;
+                }
+                false
+            })?;
+            backend.send(Command::SetGroupSetting { chat: chat.clone(), setting: GroupSetting::Approval(false) });
+            settle("approve new members: off", &|s| !s.approval)?;
+
+            backend.send(Command::SetTimer { chat: chat.clone(), seconds: 604_800 });
+            settle("timer: 7 days", &|s| s.timer == 604_800)?;
+            backend.send(Command::SetTimer { chat: chat.clone(), seconds: 0 });
+            settle("timer: off", &|s| s.timer == 0)?;
+
+            let mut first = String::new();
+            backend.send(Command::GroupInvite { chat: chat.clone(), reset: false });
+            wait_for(&backend, "invite link", Duration::from_secs(30), |event| {
+                if let UiEvent::InviteLink { link, .. } = event {
+                    first = link.clone();
+                    return true;
+                }
+                false
+            })?;
+            let mut second = String::new();
+            backend.send(Command::GroupInvite { chat: chat.clone(), reset: true });
+            wait_for(&backend, "new invite link", Duration::from_secs(30), |event| {
+                if let UiEvent::InviteLink { link, .. } = event {
+                    second = link.clone();
+                    return true;
+                }
+                false
+            })?;
+            println!(
+                "ok: invite link read (looks right: {}), reset gave a different one: {}",
+                first.starts_with("https://chat.whatsapp.com/"),
+                !second.is_empty() && second != first
+            );
+            // Cancel the link again so no usable invite is left behind.
+            backend.send(Command::GroupInvite { chat: chat.clone(), reset: true });
+            wait_for(&backend, "final link reset", Duration::from_secs(30), |event| {
+                matches!(event, UiEvent::InviteLink { .. })
+            })?;
+        }
         "account" => {
             // Exercise the profile and privacy calls without changing anything: set the
             // name to the name it already is, and one privacy setting to its current value.

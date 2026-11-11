@@ -65,6 +65,10 @@ pub enum UiEvent {
         lid: Option<String>,
         push_name: String,
     },
+    /// A group's invite link, asked for with `Command::GroupInvite`.
+    InviteLink { chat: String, link: String },
+    /// The people waiting to be let into a group.
+    JoinRequests { chat: String, people: Vec<String> },
     /// Privacy settings as (category, value) and the blocked people.
     AccountInfo {
         privacy: Vec<(String, String)>,
@@ -82,6 +86,58 @@ pub enum Attach {
     Voice,
     Document,
     Sticker,
+}
+
+/// One of a group's switches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupSetting {
+    /// Only admins may change the group's name, photo and description.
+    Locked(bool),
+    /// Only admins may send messages.
+    Announce(bool),
+    /// New members must be approved by an admin.
+    Approval(bool),
+    /// Members who are not admins may add people.
+    MembersCanAdd(bool),
+}
+
+/// A group's switches and timer as last read from the server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupSettings {
+    pub locked: bool,
+    pub announce: bool,
+    pub approval: bool,
+    pub members_can_add: bool,
+    /// Disappearing-message timer in seconds; 0 is off.
+    pub timer: u32,
+}
+
+impl GroupSettings {
+    /// The form kept in the store's settings table.
+    pub fn encode(&self) -> String {
+        format!(
+            "{} {} {} {} {}",
+            self.locked as u8, self.announce as u8, self.approval as u8, self.members_can_add as u8, self.timer
+        )
+    }
+
+    pub fn decode(text: &str) -> Option<Self> {
+        let mut parts = text.split(' ');
+        let mut flag = || Some(parts.next()? == "1");
+        let (locked, announce, approval, members_can_add) = (flag()?, flag()?, flag()?, flag()?);
+        Some(GroupSettings {
+            locked,
+            announce,
+            approval,
+            members_can_add,
+            timer: parts.next()?.parse().ok()?,
+        })
+    }
+
+    /// Where a group's settings are kept in the store's settings table.
+    pub fn key(chat: &str) -> String {
+        format!("group-settings:{chat}")
+    }
 }
 
 /// A request from the interface to the connection.
@@ -121,6 +177,27 @@ pub enum Command {
         sender: String,
         id: String,
         text: String,
+    },
+    /// Change one of a group's switches (admins only).
+    SetGroupSetting { chat: String, setting: GroupSetting },
+    /// The disappearing-message timer of a chat or group, in seconds; 0 turns it off.
+    SetTimer { chat: String, seconds: u32 },
+    /// Ask for a group's invite link; `reset` makes a new one and cancels the old.
+    GroupInvite { chat: String, reset: bool },
+    /// Join a group from an invite link or code.
+    JoinGroup { link: String },
+    /// Set a group's photo from a picture file, or remove it.
+    SetGroupPhoto {
+        chat: String,
+        path: Option<std::path::PathBuf>,
+    },
+    /// Ask who is waiting to be let into a group.
+    JoinRequests { chat: String },
+    /// Let someone into a group, or turn them down.
+    AnswerJoinRequest {
+        chat: String,
+        person: String,
+        approve: bool,
     },
     /// Change the name other people see.
     SetProfileName { name: String },
