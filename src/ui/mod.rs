@@ -3,6 +3,7 @@
 mod chat;
 mod editor;
 mod message;
+mod motion;
 mod shell;
 pub mod theme;
 mod widgets;

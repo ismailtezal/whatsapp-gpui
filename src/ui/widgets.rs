@@ -138,6 +138,7 @@ pub fn count_badge(count: i64, muted: bool, cx: &App) -> Div {
 pub fn icon_button(id: impl Into<gpui::ElementId>, name: &str, cx: &App) -> Stateful<Div> {
     let t = tokens(cx);
     let hover = if t.dark { t.fg(0.07) } else { t.accent };
+    let pressed = t.fg(0.12);
     let fg = t.foreground;
     div()
         .id(id)
@@ -150,6 +151,8 @@ pub fn icon_button(id: impl Into<gpui::ElementId>, name: &str, cx: &App) -> Stat
         .text_color(t.muted_foreground)
         .cursor_pointer()
         .hover(move |style| style.bg(hover).text_color(fg))
+        // A press is answered at once: the button dims while it is held.
+        .active(move |style| style.bg(pressed).text_color(fg).opacity(0.8))
         .child(icon(name))
 }
 

@@ -142,6 +142,8 @@ pub struct ChatView {
     reactors: Option<ReactorsState>,
     emoji: Option<EmojiState>,
     viewer: Option<PathBuf>,
+    /// Messages that have just arrived or been sent, and when: they rise into place.
+    fresh: (std::time::Instant, Vec<String>),
     /// How the open photo is being looked at.
     look: Look,
     /// The downloaded photos of this chat, oldest first, for paging in the viewer.
@@ -295,6 +297,7 @@ impl ChatView {
             reactors: None,
             emoji: None,
             viewer: None,
+            fresh: (std::time::Instant::now(), Vec::new()),
             look: Look::default(),
             photos: Vec::new(),
             notice: None,
@@ -823,6 +826,14 @@ view.reload(cx);
             if removed > 0 || added > 0 {
                 self.list.splice(prefix..prefix + removed, added);
             }
+            // Rows added at the end are new messages (an older page is added at the
+            // start, and a first load replaces everything).
+            if suffix == 0 && removed == 0 && added > 0 && added <= 3 {
+                self.fresh = (
+                    std::time::Instant::now(),
+                    keys[prefix..].iter().map(|(name, _)| name.clone()).collect(),
+                );
+            }
         }
         self.item_keys = keys;
         cx.notify();
@@ -1190,7 +1201,7 @@ view.reload(cx);
             list = list.child(line);
         }
         panel = panel.child(list);
-        Some(self.overlay(state.at, panel, window, cx))
+        Some(self.overlay(state.at, panel, "reactors-pop", super::motion::From::Above, window, cx))
     }
 
     /// Works out which emoji the picker lists: the matches of the search, or the group.
@@ -1324,7 +1335,9 @@ view.reload(cx);
             return row;
         }
         let menu_id = id.clone();
-        div()
+        let arriving = self.fresh.0.elapsed() < super::motion::arrival() && self.fresh.1.contains(&id);
+        let rowid = view.row.rowid as usize;
+        let row = div()
             .id(("row", index))
             .relative()
             .group("row")
@@ -1338,22 +1351,28 @@ view.reload(cx);
                     cx.notify();
                 }),
             )
-            .child(row)
-            .into_any_element()
+            .child(row);
+        if arriving {
+            // The wrapper keeps the row's place; only the row inside it moves.
+            div()
+                .child(super::motion::arrive(row, ("arrive", rowid)))
+                .into_any_element()
+        } else {
+            row.into_any_element()
+        }
     }
 
     // ---- overlays --------------------------------------------------------------------------
 
     /// Lays a viewer over the whole window below the title bar (which stays usable for
     /// moving and closing the window), whatever part of the window this chat occupies.
-    fn window_layer(window: &Window, content: gpui::Stateful<gpui::Div>) -> AnyElement {
+    fn window_layer(window: &Window, key: &'static str, content: gpui::Stateful<gpui::Div>) -> AnyElement {
         let size = window.viewport_size();
         let bar = super::theme::TITLE_BAR_H;
-        deferred(
-            anchored()
-                .position(point(px(0.), bar))
-                .child(content.w(size.width).h((size.height - bar).max(px(0.)))),
-        )
+        deferred(anchored().position(point(px(0.), bar)).child(super::motion::fade(
+            content.w(size.width).h((size.height - bar).max(px(0.))),
+            key,
+        )))
         .with_priority(5)
         .into_any_element()
     }
@@ -1363,6 +1382,8 @@ view.reload(cx);
         &self,
         at: Point<Pixels>,
         panel: impl IntoElement,
+        key: &'static str,
+        from: super::motion::From,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1391,7 +1412,7 @@ view.reload(cx);
                         anchored()
                             .position(at)
                             .snap_to_window_with_margin(px(8.))
-                            .child(panel),
+                            .child(super::motion::pop(div().child(panel), key, from)),
                     ),
             ),
         )
@@ -1423,6 +1444,8 @@ view.reload(cx);
                 .cursor_pointer()
                 .text_color(if danger { t.destructive } else { t.foreground })
                 .hover(move |style| style.bg(if danger { danger_fill } else { accent }))
+                // A press is answered at once.
+                .active(|style| style.opacity(0.7))
                 .child(icon(name).text_color(if danger { t.destructive } else { t.muted_foreground }))
                 .child(label)
         };
@@ -1619,7 +1642,7 @@ view.reload(cx);
             )));
         }
 
-        Some(self.overlay(menu.at, panel, window, cx))
+        Some(self.overlay(menu.at, panel, "menu-pop", super::motion::From::Above, window, cx))
     }
 
     fn emoji_overlay(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1743,12 +1766,13 @@ view.reload(cx);
             .child(tabs)
             .child(grid);
         // Open upward from the composer, downward from a message.
-        let at = if state.target == EmojiTarget::Composer {
-            point(state.at.x - px(300.), state.at.y - px(440.))
+        // The picker opens upward from the composer, so it enters from below there.
+        let (at, from) = if state.target == EmojiTarget::Composer {
+            (point(state.at.x - px(300.), state.at.y - px(440.)), super::motion::From::Below)
         } else {
-            state.at
+            (state.at, super::motion::From::Above)
         };
-        Some(self.overlay(at, panel, window, cx))
+        Some(self.overlay(at, panel, "emoji-pop", from, window, cx))
     }
 
     /// Shows the next or the previous photo of the chat.
@@ -1997,7 +2021,7 @@ view.reload(cx);
                     ),
             );
         }
-        Some(Self::window_layer(window, layer))
+        Some(Self::window_layer(window, "viewer-fade", layer))
     }
 
     // ---- header and composer ---------------------------------------------------------------
@@ -2325,7 +2349,7 @@ impl Render for ChatView {
         let editor = self
             .editor
             .as_ref()
-            .map(|(_, editor)| Self::window_layer(window, div().id("photo-editor-layer").child(editor.clone())));
+            .map(|(_, editor)| Self::window_layer(window, "editor-fade", div().id("photo-editor-layer").child(editor.clone())));
         if let Some((id, path, looping)) = self.pending_video.take() {
             self.start_video(&id, path, looping, window, cx);
         }
@@ -2392,11 +2416,15 @@ impl Render for ChatView {
                             .flex()
                             .flex_col()
                             .child(self.messages_area(older, view, &t, None, cx))
-                            .children(self.mention_popup(cx))
+                            .children(self.mention_popup(cx).map(|list| {
+                                super::motion::pop(div().child(list), "mention-pop", super::motion::From::Below)
+                            }))
                             .child(self.composer(cx))
                             .into_any_element()
                     })
-                    .children(self.info_panel(cx)),
+                    .children(self.info_panel(cx).map(|panel| {
+                        super::motion::slide_in(div().h_full().flex_shrink_0().child(panel), "info-slide")
+                    })),
             )
             .children(viewer)
             .children(self.video_overlay(window, cx))
@@ -2601,7 +2629,9 @@ impl ChatView {
                     .bottom_0()
                     .left_0()
                     .right_0()
-                    .children(self.mention_popup(cx))
+                    .children(self.mention_popup(cx).map(|list| {
+                                super::motion::pop(div().child(list), "mention-pop", super::motion::From::Below)
+                            }))
                     .child(self.composer(cx))
                     .child(measure(self.insets.clone(), false)),
             )
@@ -3458,7 +3488,7 @@ impl ChatView {
     ) -> AnyElement {
         let size = window.viewport_size();
         deferred(
-            anchored().position(point(px(0.), px(0.))).child(
+            anchored().position(point(px(0.), px(0.))).child(super::motion::fade(
                 div()
                     .w(size.width)
                     .h(size.height)
@@ -3468,8 +3498,13 @@ impl ChatView {
                     .items_center()
                     .justify_center()
                     .on_mouse_down(MouseButton::Left, close)
-                    .child(panel.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())),
-            ),
+                    .child(super::motion::settle(
+                        panel.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+                        "dialog-settle",
+                        super::motion::From::Below,
+                    )),
+                "dialog-fade",
+            )),
         )
         .with_priority(10)
         .into_any_element()
@@ -3615,6 +3650,8 @@ impl ChatView {
                 .cursor_pointer()
                 .text_color(if danger { t.destructive } else { t.foreground })
                 .hover(move |style| style.bg(if danger { danger_fill } else { accent }))
+                // A press is answered at once.
+                .active(|style| style.opacity(0.7))
                 .child(icon(name).text_color(if danger { t.destructive } else { t.muted_foreground }))
                 .child(label)
         };
@@ -4642,6 +4679,7 @@ impl ChatView {
         };
         Some(Self::window_layer(
             window,
+            "video-fade",
             div()
                 .id("video-viewer")
                 .occlude()

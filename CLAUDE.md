@@ -84,6 +84,11 @@ connection. Windows only. Private now, open source later.
   scrolling, frame timing); see `vendor/README.md`.
 - Development aids: `WA_OPEN_CHAT`, `WA_SECTION` (calls, status, starred, settings,
   archived), `WA_INFO`, `WA_STYLE`, `WA_THEME`, `WA_PALETTE`.
+- More development aids: `WA_STAGE=<file>` stages a file as if attached and `WA_EDIT=1` opens
+  the photo editor on it; `WA_SLOWMO=<factor>` stretches every animation. `scripts/type.ps1`
+  (text and keys), `scripts/drag.ps1`, `scripts/click.ps1 -Middle` and `scripts/crop.ps1`
+  (look at only part of a screenshot) work on the test copy. `wa-video <folder>` reports how
+  video files decode. All animations live in `src/ui/motion.rs`; add new ones there.
 - Source files are reformatted after being written, so line-exact text replacement is
   fragile. Insert by anchor line, or append a new `impl` block.
 - Icons are Lucide SVGs in `assets/icons` at stroke width 1.75; add new ones there.

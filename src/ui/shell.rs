@@ -1859,7 +1859,9 @@ impl Shell {
                         .occlude()
                         .on_mouse_down(MouseButton::Left, close)
                         .on_mouse_down(MouseButton::Right, close_right)
-                        .child(anchored().position(at).snap_to_window_with_margin(px(8.)).child(panel)),
+                        .child(anchored().position(at).snap_to_window_with_margin(px(8.)).child(
+                            super::motion::pop(div().child(panel), "chat-menu-pop", super::motion::From::Above),
+                        )),
                 ),
             )
             .with_priority(10)
@@ -3721,7 +3723,7 @@ impl Shell {
                 .right_0()
                 .flex()
                 .justify_center()
-                .child(
+                .child(super::motion::settle(
                     div()
                         .id("call-card")
                         .occlude()
@@ -3757,7 +3759,9 @@ impl Shell {
                                 ),
                         )
                         .child(buttons),
-                )
+                    "call-card-settle",
+                    super::motion::From::Above,
+                ))
                 .into_any_element(),
         )
     }
