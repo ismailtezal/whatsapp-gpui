@@ -14,7 +14,6 @@ use gpui::{App, AssetSource, Bounds, SharedString, WindowBounds, WindowOptions, 
 use gpui_component::{Root, TitleBar};
 
 use crate::backend::Backend;
-use crate::store::Store;
 
 /// Icons and fonts shipped with the app, falling back to the component library's own.
 #[derive(rust_embed::RustEmbed)]
@@ -43,10 +42,11 @@ impl AssetSource for Assets {
 
 /// Opens the main window and runs until it is closed.
 pub fn run() {
-    let store = match Store::open_default() {
-        Ok(store) => Arc::new(store),
+    // Opens the chat database, repairing it first if it is damaged.
+    let (store, repair_notice) = match crate::guard::open() {
+        Ok(opened) => (Arc::new(opened.store), opened.notice),
         Err(error) => {
-            eprintln!("could not open the chat database: {error}");
+            eprintln!("could not open the chat database: {error:#}");
             return;
         }
     };
@@ -89,6 +89,23 @@ pub fn run() {
         }
 
         let backend = Backend::start(store.clone());
+        if let Some(notice) = repair_notice.clone() {
+            backend.announce(notice);
+        }
+        // Upkeep off the interface thread: a full integrity check, then today's backup.
+        // Test copies run on a throwaway snapshot and skip it.
+        if std::env::var("WA_OFFLINE").is_err() {
+            let upkeep = backend.clone();
+            std::thread::Builder::new()
+                .name("wa-upkeep".into())
+                .spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+                    if let Some(notice) = crate::guard::maintain() {
+                        upkeep.announce(notice);
+                    }
+                })
+                .ok();
+        }
         crate::avatars::init(backend.clone());
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         // Interface test mode: the window is kept off the screen, out of the owner's way.

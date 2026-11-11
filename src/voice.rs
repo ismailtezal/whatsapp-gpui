@@ -170,17 +170,137 @@ impl Recorder {
     }
 }
 
-/// Encodes captured samples into a voice message.
+/// Encodes captured samples into a voice message, in this process.
+///
+/// The app itself does not call this: the Opus encoder is a C library translated to
+/// Rust by a tool, full of raw pointer code, and it has no business running in the
+/// process that holds the chat database and the account's keys. The app uses
+/// [`finish_isolated`], which runs this in a short-lived child process.
 pub fn finish(samples: &[f32], rate: u32) -> Result<Recording> {
+    let samples = prepare(samples, rate)?;
+    Ok(Recording {
+        ogg: encode_ogg_opus(&samples)?,
+        seconds: seconds_of(&samples),
+        waveform: waveform(&samples),
+    })
+}
+
+/// What is encoded: the recording at 48 kHz, raised to a normal loudness.
+fn prepare(samples: &[f32], rate: u32) -> Result<Vec<f32>> {
     if samples.len() < rate as usize / 2 {
         bail!("the recording is too short");
     }
-    let samples = normalise(&resample(samples, rate, RATE));
+    Ok(normalise(&resample(samples, rate, RATE)))
+}
+
+fn seconds_of(prepared: &[f32]) -> u32 {
+    (prepared.len() as f32 / RATE as f32).round().max(1.) as u32
+}
+
+/// The command-line flag that turns any of the app's programs into the encoder child.
+const CHILD_FLAG: &str = "--encode-voice";
+
+/// Encodes captured samples into a voice message in a child process (this same
+/// program started with a flag), so the encoder cannot touch this process's memory.
+/// The length and the waveform are worked out here, in ordinary safe code.
+pub fn finish_isolated(samples: &[f32], rate: u32) -> Result<Recording> {
+    let prepared = prepare(samples, rate)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let folder = std::env::temp_dir();
+    let input = folder.join(format!("wa-voice-{}-{stamp}.f32", std::process::id()));
+    let output = folder.join(format!("wa-voice-{}-{stamp}.ogg", std::process::id()));
+    let mut bytes = Vec::with_capacity(prepared.len() * 4);
+    for sample in &prepared {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    std::fs::write(&input, bytes).context("handing the recording to the encoder")?;
+
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command.arg(CHILD_FLAG).arg(&input).arg(&output);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // No console window flashes up for the child.
+        command.creation_flags(0x0800_0000);
+    }
+    let result = command.output();
+    let _ = std::fs::remove_file(&input);
+    let result = result.context("starting the encoder")?;
+    if !result.status.success() {
+        let _ = std::fs::remove_file(&output);
+        bail!(
+            "the encoder failed: {}",
+            String::from_utf8_lossy(&result.stderr).trim()
+        );
+    }
+    let ogg = std::fs::read(&output).context("reading the encoded recording")?;
+    let _ = std::fs::remove_file(&output);
+    if !ogg.starts_with(b"OggS") {
+        bail!("the encoder did not produce a voice file");
+    }
     Ok(Recording {
-        ogg: encode_ogg_opus(&samples)?,
-        seconds: (samples.len() as f32 / RATE as f32).round().max(1.) as u32,
-        waveform: waveform(&samples),
+        ogg,
+        seconds: seconds_of(&prepared),
+        waveform: waveform(&prepared),
     })
+}
+
+/// If this process was started as the encoder child, does that job and returns true:
+/// the caller must then exit instead of starting normally. Call it first in `main`.
+pub fn run_child_if_requested() -> bool {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).and_then(|arg| arg.to_str()) != Some(CHILD_FLAG) {
+        return false;
+    }
+    let work = || -> Result<()> {
+        let input = args.get(2).context("missing input file")?;
+        let output = args.get(3).context("missing output file")?;
+        let bytes = std::fs::read(input)?;
+        let samples: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+        std::fs::write(output, encode_ogg_opus(&samples)?)?;
+        Ok(())
+    };
+    if let Err(error) = work() {
+        eprintln!("{error:#}");
+        std::process::exit(1);
+    }
+    true
+}
+
+impl Recording {
+    /// Saves the voice file, and next to it a small file with its length and waveform,
+    /// which the sender reads instead of decoding the audio again.
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        std::fs::write(path, &self.ogg)?;
+        let bars: String = self.waveform.iter().map(|bar| format!("{bar:02x}")).collect();
+        std::fs::write(details_path(path), format!("{}\n{bars}\n", self.seconds))?;
+        Ok(())
+    }
+}
+
+fn details_path(voice_file: &std::path::Path) -> std::path::PathBuf {
+    let mut name = voice_file.as_os_str().to_owned();
+    name.push(".voice");
+    std::path::PathBuf::from(name)
+}
+
+/// The length in seconds and the waveform saved beside a voice file by
+/// [`Recording::save`], if they are there.
+pub fn saved_details(voice_file: &std::path::Path) -> Option<(u32, Vec<u8>)> {
+    let text = std::fs::read_to_string(details_path(voice_file)).ok()?;
+    let mut lines = text.lines();
+    let seconds: u32 = lines.next()?.trim().parse().ok()?;
+    let bars = lines.next()?.trim();
+    let waveform: Option<Vec<u8>> = (0..bars.len() / 2)
+        .map(|index| u8::from_str_radix(bars.get(index * 2..index * 2 + 2)?, 16).ok())
+        .collect();
+    Some((seconds, waveform?))
 }
 
 /// Changes the sample rate by linear interpolation. When slowing down (fewer samples

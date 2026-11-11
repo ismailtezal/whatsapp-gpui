@@ -85,6 +85,10 @@ fn wait_ack(store: &Store, chat: &str, id: &str, limit: Duration) -> Result<Ack>
 }
 
 fn main() -> Result<()> {
+    // Started as the voice encoder child: do that one job and leave.
+    if whatsapp_gpui::voice::run_child_if_requested() {
+        return Ok(());
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let action = args.first().map(String::as_str).unwrap_or("online");
     let store = Arc::new(Store::open_default()?);
@@ -384,6 +388,56 @@ fn main() -> Result<()> {
             backend.send(Command::LeaveGroup { chat: chat.clone() });
             std::thread::sleep(Duration::from_secs(4));
             println!("leave sent for group");
+        }
+        "voicenote" => {
+            // Send a voice message made from a two-second tone (no microphone involved)
+            // to a group, to check that the server accepts what the encoder produces.
+            let chat = group(&store, &args[1])?;
+            let rate = 48_000u32;
+            let samples: Vec<f32> = (0..rate as usize * 2)
+                .map(|i| {
+                    let t = i as f32 / rate as f32;
+                    // A rising tone that fades in and out, so the waveform has a shape.
+                    let envelope = (t * std::f32::consts::PI / 2.).sin();
+                    (t * (330. + 110. * t) * std::f32::consts::TAU).sin() * 0.4 * envelope
+                })
+                .collect();
+            let recording = whatsapp_gpui::voice::finish_isolated(&samples, rate)?;
+            let folder = whatsapp_gpui::paths::media_dir();
+            std::fs::create_dir_all(&folder)?;
+            let path = folder.join("voice-test.ogg");
+            recording.save(&path)?;
+            println!(
+                "encoded {} bytes, {} s, waveform bars {}",
+                recording.ogg.len(),
+                recording.seconds,
+                recording.waveform.len()
+            );
+            let before = newest(&store, &chat, true).map(|m| m.id).unwrap_or_default();
+            backend.send(Command::SendFile {
+                chat: chat.clone(),
+                kind: whatsapp_gpui::events::Attach::Voice,
+                path,
+                caption: None,
+                reply_to: None,
+            });
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let sent = loop {
+                let newest = newest(&store, &chat, true)?;
+                if newest.id != before {
+                    break newest;
+                }
+                if Instant::now() > deadline {
+                    bail!("voice message upload did not finish in time");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            println!(
+                "sent voice message id={} kind={:?} ack={:?}",
+                sent.id,
+                sent.kind,
+                wait_ack(&store, &chat, &sent.id, Duration::from_secs(30))?
+            );
         }
         "sticker" => {
             // Fetch a sticker from history (download only), then send it to a group.

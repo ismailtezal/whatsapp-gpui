@@ -28,6 +28,8 @@ use crate::{ingest, wa};
 pub struct Backend {
     commands: tokio::sync::mpsc::UnboundedSender<Command>,
     events: async_channel::Receiver<UiEvent>,
+    /// The sending side of `events`, for notices that do not come from the connection.
+    announce: async_channel::Sender<UiEvent>,
     store: Arc<Store>,
 }
 
@@ -42,6 +44,7 @@ impl Backend {
         let (commands, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let (event_tx, events) = async_channel::unbounded();
         let thread_store = store.clone();
+        let announce = event_tx.clone();
         std::thread::Builder::new()
             .name("wa-backend".into())
             .spawn(move || {
@@ -70,8 +73,14 @@ impl Backend {
         Backend {
             commands,
             events,
+            announce,
             store,
         }
+    }
+
+    /// Shows a message to the owner, the way a connection error is shown.
+    pub fn announce(&self, message: String) {
+        let _ = self.announce.send_blocking(UiEvent::Error(message));
     }
 
     pub fn send(&self, command: Command) {

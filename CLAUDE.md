@@ -44,6 +44,26 @@ connection. Windows only. Private now, open source later.
 - `whatsapp-rust` is pinned to a git commit; it bundles SQLite via `libsqlite3-sys 0.38`,
   so `rusqlite` must stay on 0.40.x.
 - Only one process may use `session.db` at a time. Close the app before `wa-test`.
+- **The chat database is the owner's data. Protect it.** On 2026-11-11 `chats.db` was
+  found damaged (SQLite could not read its schema; recent writes had been lost between
+  processes sharing the file). It was rebuilt with nothing known to be missing, but the
+  cause was not proven: force-killing concurrent writers and the voice codec were both
+  stress-tested and neither reproduced it. Rules since then:
+  - Interface tests never open the real database. `scripts/uitest.sh` works on a
+    snapshot in `%LOCALAPPDATA%\whatsapp-gpui-uitest` (`scripts/uitest.sh refresh`
+    takes a new one).
+  - `wa-test` (real sends) uses the real database: run it only while the app is closed,
+    and let it finish; do not kill it.
+  - Never copy or move a database file without its `-wal` and `-shm` files, and never
+    put a database file next to another database's `-wal`: SQLite would apply it.
+  - The Opus encoder (machine-translated C) runs only in a child process
+    (`voice::finish_isolated`), never in a process that holds the database.
+  - `src/guard.rs` opens the database for the app: if it is unreadable it is set aside
+    and rebuilt (`src/salvage.rs`); a background check and a daily backup follow
+    (`backups\`, three kept).
+  - Tools: `wa-dbcheck` (integrity per table), `wa-dbscan` (raw pages), `wa-salvage`
+    (rebuild), `wa-guard` (the app's open-and-repair path), `wa-sql` (read-only counts),
+    `wa-dbstress` + `scripts/dbstress.sh` (try to break a scratch copy).
 - **Testing the interface never touches the owner's running app.** `scripts/uitest.sh`
   builds a separate copy (`target/uitest`, run as `wa-uitest.exe`) that is off the
   screen, never connects (`WA_OFFLINE`), and never saves appearance changes.

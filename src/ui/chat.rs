@@ -3755,7 +3755,8 @@ impl ChatView {
             let made = cx
                 .background_executor()
                 .spawn(async move {
-                    let recording = crate::voice::finish(&samples, rate)?;
+                    // The encoder runs in a child process, away from the database.
+                    let recording = crate::voice::finish_isolated(&samples, rate)?;
                     let folder = crate::paths::media_dir();
                     std::fs::create_dir_all(&folder)?;
                     let stamp = std::time::SystemTime::now()
@@ -3763,7 +3764,7 @@ impl ChatView {
                         .map(|elapsed| elapsed.as_millis())
                         .unwrap_or(0);
                     let path = folder.join(format!("voice-{stamp}.ogg"));
-                    std::fs::write(&path, &recording.ogg)?;
+                    recording.save(&path)?;
                     anyhow::Ok(path)
                 })
                 .await;

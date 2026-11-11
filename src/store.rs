@@ -205,6 +205,16 @@ impl Store {
         })
     }
 
+    /// Reads a little from the main tables. Fails if SQLite cannot follow them, which is
+    /// how damage to the file shows itself.
+    pub fn probe(&self) -> Result<()> {
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM chats", [], |row| row.get::<_, i64>(0))?;
+        conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get::<_, i64>(0))?;
+        conn.query_row("SELECT MAX(rowid) FROM messages", [], |row| row.get::<_, Option<i64>>(0))?;
+        Ok(())
+    }
+
     pub fn open_default() -> Result<Self> {
         Self::open(&crate::paths::chat_db())
     }
