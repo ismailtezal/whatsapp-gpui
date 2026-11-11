@@ -289,6 +289,17 @@ impl Shell {
         match event {
             UiEvent::Connection(state) => {
                 if state == ConnState::Online {
+                    // Groups whose name never arrived get it fetched now.
+                    for chat in self
+                        .chats
+                        .iter()
+                        .filter(|chat| chat.kind == ChatKind::Group && chat.title == "Group")
+                        .take(12)
+                    {
+                        self.backend.send(Command::RefreshGroup {
+                            chat: chat.jid.clone(),
+                        });
+                    }
                     if self.section == Section::Settings {
                         self.backend.send(Command::FetchAccountInfo);
                     }
