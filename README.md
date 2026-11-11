@@ -98,3 +98,9 @@ fills. The conversation keeps WhatsApp's shape: bubbles, with your messages on t
 - Icons from [Lucide](https://lucide.dev), under the ISC license.
 - `whatsapp-rust` by João Lucas de Oliveira Lopes, under the MIT license.
 - GPUI by Zed Industries and `gpui-component` by Longbridge, under the Apache 2.0 license.
+
+## License
+
+Apache License 2.0: see [LICENSE](LICENSE) and [NOTICE](NOTICE). The copies of GPUI under
+`vendor/` keep their own Apache 2.0 license; the changes made to them are listed in
+`vendor/README.md`.

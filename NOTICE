@@ -1,0 +1,20 @@
+whatsapp-gpui
+Copyright 2026 ismailtezal and the whatsapp-gpui contributors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This is an unofficial client. It is not affiliated with, endorsed by or sponsored by
+WhatsApp or Meta. "WhatsApp" is a trademark of its owner and is used here only to say
+what the program connects to.
+
+This product includes software developed by others:
+
+- GPUI, in vendor/gpui-pre and vendor/gpui-pre-windows.
+  Copyright 2022 - 2025 Zed Industries, Inc. Licensed under the Apache License,
+  Version 2.0 (vendor/gpui-pre/LICENSE-APACHE). These copies are modified; every
+  change is marked "whatsapp-gpui patch" in the source and listed in vendor/README.md.
+- gpui-component. Copyright Longbridge. Apache License, Version 2.0.
+- whatsapp-rust. Copyright Joao Lucas de Oliveira Lopes. MIT license.
+- Figtree typeface. Copyright the Figtree Project Authors. SIL Open Font License 1.1
+  (assets/fonts/Figtree-OFL.txt).
+- Lucide icons. ISC license.

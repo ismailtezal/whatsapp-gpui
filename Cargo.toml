@@ -2,6 +2,8 @@
 name = "whatsapp-gpui"
 version = "0.3.0"
 edition = "2024"
+description = "A native Windows client for WhatsApp, built with GPUI"
+license = "Apache-2.0"
 
 [dependencies]
 whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "7e5c198e1a25ea405faa7a69a47bc727ea15484c", features = ["voip"] }
