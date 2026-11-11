@@ -493,7 +493,7 @@ async fn execute(
                         return Err(anyhow!("a status can be text, a photo or a video"));
                     }
                     let caption = Some(text.clone()).filter(|text| !text.trim().is_empty());
-                    crate::media_ops::build_file_message(client, store, chat, path, kind, caption, None).await?
+                    crate::media_ops::build_file_message(client, store, chat, path, kind, caption, None, Vec::new()).await?
                 }
                 None => {
                     let mut extended = wa::message::ExtendedTextMessage::default();
@@ -608,10 +608,14 @@ async fn execute(
             notify(events, &chat).await;
         }
 
-        Command::Edit { chat, id, text } => {
+        Command::Edit {
+            chat,
+            id,
+            text,
+            mentions,
+        } => {
             let to = jid(&chat)?;
-            let mut replacement = wa::Message::default();
-            replacement.conversation = Some(text);
+            let replacement = text_message(&text, None, &mentions);
             client
                 .edit_message_raw(to, id.clone(), replacement.clone(), EditOptions::default())
                 .await?;

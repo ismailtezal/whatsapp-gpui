@@ -68,6 +68,27 @@ struct EmojiState {
     at: Point<Pixels>,
 }
 
+/// Lower case without accents, so that typing "omer" finds "Ömer" and "isil" finds "Işıl".
+fn fold(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .filter_map(|c| match c {
+            'ö' | 'ó' | 'ò' | 'ô' | 'õ' => Some('o'),
+            'ü' | 'ú' | 'ù' | 'û' => Some('u'),
+            'ı' | 'í' | 'ì' | 'î' | 'ï' => Some('i'),
+            'ş' | 'ś' | 'š' => Some('s'),
+            'ç' | 'ć' | 'č' => Some('c'),
+            'ğ' => Some('g'),
+            'á' | 'à' | 'â' | 'ã' | 'ä' | 'å' => Some('a'),
+            'é' | 'è' | 'ê' | 'ë' => Some('e'),
+            'ñ' => Some('n'),
+            // The dot that lower-casing a Turkish capital İ leaves behind.
+            '̇' => None,
+            other => Some(other),
+        })
+        .collect()
+}
+
 /// Emoji the system font is sure to have: Windows 11 draws Unicode 15, not later ones.
 fn drawable(emoji: &emojis::Emoji) -> bool {
     emoji.unicode_version().major() <= 15
@@ -132,8 +153,8 @@ pub struct ChatView {
     pending: Vec<PathBuf>,
     /// When the typing indicator was last sent, to avoid sending it on every keystroke.
     typing_sent: Option<std::time::Instant>,
-    /// People picked from the mention list: (name shown, JID).
-    mention_map: Vec<(String, String)>,
+    /// Which line of the mention list the arrow keys are on.
+    mention_pick: usize,
     /// Where the sticker picker is anchored while it is open.
     stickers_at: Option<Point<Pixels>>,
     sticker_choices: Vec<PathBuf>,
@@ -200,8 +221,13 @@ impl ChatView {
                 .default_value(draft)
         });
         cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
-            InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
+            InputEvent::PressEnter { shift: false, .. } => {
+                if !this.pick_highlighted_mention(window, cx) {
+                    this.send(window, cx)
+                }
+            }
             InputEvent::Change => {
+                this.mention_pick = 0;
                 this.typing_tick(cx);
                 cx.notify();
             }
@@ -263,7 +289,7 @@ impl ChatView {
             pending_video: None,
             pending: Vec::new(),
             typing_sent: None,
-            mention_map: Vec::new(),
+            mention_pick: 0,
             stickers_at: None,
             sticker_choices: Vec::new(),
             member_menu: None,
@@ -559,6 +585,21 @@ view.reload(cx);
                         }
                     })
                     .collect();
+                // A number after an @ that arrived without its tag (a forwarded copy
+                // loses it) is still shown by name when the person is known.
+                let mut mentions = mentions;
+                for digits in richtext::mention_numbers(text) {
+                    if mentions.iter().any(|mention| mention.user == digits) {
+                        continue;
+                    }
+                    if let Some(name) = self.store.mention_name(&digits) {
+                        mentions.push(Mention {
+                            jid: format!("{digits}@s.whatsapp.net"),
+                            user: digits,
+                            name,
+                        });
+                    }
+                }
                 richtext::parse(text, &mentions)
             });
 
@@ -910,9 +951,10 @@ view.reload(cx);
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().to_string();
         let text = text.trim();
+        let (resolved, mentions) = self.wire_text(cx);
         if !self.pending.is_empty() {
             // Staged files go out together; what is typed becomes the first one's caption.
-            let caption = (!text.is_empty()).then(|| text.to_string());
+            let caption = (!resolved.is_empty()).then(|| resolved.clone());
             let reply = self.reply_to.take().map(|r| r.id);
             for (index, path) in std::mem::take(&mut self.pending).into_iter().enumerate() {
                 self.backend.send(Command::SendFile {
@@ -921,6 +963,7 @@ view.reload(cx);
                     path,
                     caption: if index == 0 { caption.clone() } else { None },
                     reply_to: if index == 0 { reply.clone() } else { None },
+                    mentions: if index == 0 { mentions.clone() } else { Vec::new() },
                 });
             }
             self.input.update(cx, |input, cx| input.set_value("", window, cx));
@@ -939,15 +982,12 @@ view.reload(cx);
             cx.notify();
             return;
         }
-        let (resolved, mentions) = {
-            let typed = text.to_string();
-            self.resolve_mentions(&typed)
-        };
         match self.editing.take() {
             Some(id) => self.backend.send(Command::Edit {
                 chat: self.chat.jid.clone(),
                 id,
-                text: text.to_string(),
+                text: resolved,
+                mentions,
             }),
             None => self.backend.send(Command::SendText {
                 chat: self.chat.jid.clone(),
@@ -1261,6 +1301,20 @@ view.reload(cx);
     }
 
     // ---- overlays --------------------------------------------------------------------------
+
+    /// Lays a viewer over the whole window below the title bar (which stays usable for
+    /// moving and closing the window), whatever part of the window this chat occupies.
+    fn window_layer(window: &Window, content: gpui::Stateful<gpui::Div>) -> AnyElement {
+        let size = window.viewport_size();
+        let bar = super::theme::TITLE_BAR_H;
+        deferred(
+            anchored()
+                .position(point(px(0.), bar))
+                .child(content.w(size.width).h((size.height - bar).max(px(0.)))),
+        )
+        .with_priority(5)
+        .into_any_element()
+    }
 
     /// A floating panel at a point, with a window-sized backdrop that closes it.
     fn overlay(
@@ -1655,16 +1709,14 @@ view.reload(cx);
         Some(self.overlay(at, panel, window, cx))
     }
 
-    fn viewer_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn viewer_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let path = self.viewer.clone()?;
         let external = path.clone();
-        Some(
+        Some(Self::window_layer(
+            window,
             div()
                 .id("viewer")
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
+                .relative()
                 .occlude()
                 .bg(gpui::hsla(0., 0., 0., 0.88))
                 .flex()
@@ -1698,9 +1750,8 @@ view.reload(cx);
                                 })),
                         )
                         .child(icon_button("viewer-close", "x", cx).tooltip(tip("Close"))),
-                )
-                .into_any_element(),
-        )
+                ),
+        ))
     }
 
     // ---- header and composer ---------------------------------------------------------------
@@ -1904,7 +1955,33 @@ view.reload(cx);
                                 .flex_1()
                                 .min_w_0()
                                 .py(px(1.))
-                                .child(Textarea::new(&self.input).appearance(false).bordered(false).on_paste({
+                                .capture_action(cx.listener(|this, _: &gpui_component::input::MoveUp, _, cx| {
+                                    if this.move_mention_pick(false, cx) {
+                                        cx.stop_propagation();
+                                    }
+                                }))
+                                .capture_action(cx.listener(|this, _: &gpui_component::input::MoveDown, _, cx| {
+                                    if this.move_mention_pick(true, cx) {
+                                        cx.stop_propagation();
+                                    }
+                                }))
+                                .capture_action(cx.listener(
+                                    |this, _: &gpui_component::input::IndentInline, window, cx| {
+                                        if this.pick_highlighted_mention(window, cx) {
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
+                                .child(Textarea::new(&self.input).appearance(false).bordered(false).token({
+                                    let (color, selected) = (t.mention_text(), t.tint(0.3));
+                                    move |token, _window, _cx| {
+                                        div()
+                                            .rounded(px(4.))
+                                            .text_color(color)
+                                            .when(token.is_selected(), |this| this.bg(selected))
+                                            .child(token.token().label().clone())
+                                    }
+                                }).on_paste({
                                     let entity = cx.entity().downgrade();
                                     move |item, _window, cx| {
                                         entity
@@ -1971,6 +2048,7 @@ view.reload(cx);
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _perf = crate::perf::scope("chat.render");
+        self.pump_video(window);
         if self.recorder.is_some() {
             // The timer and the level meter move while recording.
             window.request_animation_frame();
@@ -1998,7 +2076,7 @@ impl Render for ChatView {
         if let Some((id, path, looping)) = self.pending_video.take() {
             self.start_video(&id, path, looping, window, cx);
         }
-        let viewer = self.viewer_overlay(cx);
+        let viewer = self.viewer_overlay(window, cx);
         div()
             .size_full()
             .relative()
@@ -2058,7 +2136,7 @@ impl Render for ChatView {
                     .children(self.info_panel(cx)),
             )
             .children(viewer)
-            .children(self.video_overlay(cx))
+            .children(self.video_overlay(window, cx))
             .children(self.forward_overlay(window, cx))
             .children(self.info_overlay(window, cx))
             .children(self.sticker_overlay(window, cx))
@@ -3499,62 +3577,124 @@ impl ChatView {
 }
 
 impl ChatView {
-    /// The `@query` being typed at the end of the message box, if any.
-    fn mention_query(&self, cx: &App) -> Option<String> {
-        if self.chat.kind == ChatKind::User {
+    /// The `@query` being typed just before the cursor, if any: where its `@` is in the
+    /// text, and the query in lower case.
+    fn mention_query(&self, cx: &App) -> Option<(usize, String)> {
+        if !matches!(self.chat.kind, ChatKind::Group) {
             return None;
         }
-        let text = self.input.read(cx).value().to_string();
-        let at = text.rfind('@')?;
-        let before_ok = text[..at].chars().last().is_none_or(char::is_whitespace);
-        let query = &text[at + 1..];
-        (before_ok && !query.contains(char::is_whitespace)).then(|| query.to_lowercase())
+        let input = self.input.read(cx);
+        let text = input.value();
+        let cursor = input.cursor().min(text.len());
+        if !text.is_char_boundary(cursor) {
+            return None;
+        }
+        let before = &text[..cursor];
+        let at = before.rfind('@')?;
+        // Not the `@` of a mention that is already made.
+        if input.tokens().iter().any(|span| span.range().contains(&at)) {
+            return None;
+        }
+        let before_ok = before[..at].chars().last().is_none_or(char::is_whitespace);
+        let query = &before[at + 1..];
+        (before_ok && !query.contains(char::is_whitespace)).then(|| (at, fold(query)))
     }
 
-    /// Members matching the `@query`, best first.
+    /// Members matching the `@query`: names that start with it first, then names or
+    /// numbers that contain it.
     fn mention_candidates(&self, cx: &App) -> Vec<(String, String)> {
-        let Some(query) = self.mention_query(cx) else {
+        let Some((_, query)) = self.mention_query(cx) else {
             return Vec::new();
         };
-        self.members
-            .iter()
-            .filter(|(jid, name, _)| {
-                self.me_jid.as_deref() != Some(jid.as_str()) && name.to_lowercase().contains(&query)
-            })
-            .take(6)
-            .map(|(jid, name, _)| (jid.clone(), name.clone()))
-            .collect()
+        let mut starts = Vec::new();
+        let mut contains = Vec::new();
+        for (jid, name, _) in &self.members {
+            if self.me_jid.as_deref() == Some(jid.as_str()) {
+                continue;
+            }
+            let lower = fold(name);
+            let number = jid.split('@').next().unwrap_or_default();
+            if lower.starts_with(&query) || lower.split_whitespace().any(|word| word.starts_with(&query)) {
+                starts.push((jid.clone(), name.clone()));
+            } else if lower.contains(&query) || (!query.is_empty() && number.contains(&query)) {
+                contains.push((jid.clone(), name.clone()));
+            }
+        }
+        starts.extend(contains);
+        starts.truncate(8);
+        starts
     }
 
-    /// Replaces the `@query` being typed with the chosen person's name.
+    /// Replaces the `@query` being typed with a mention of the chosen person. The
+    /// mention is one unit in the message box: it is coloured, and deleted whole.
     fn pick_mention(&mut self, jid: &str, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.input.read(cx).value().to_string();
-        let Some(at) = text.rfind('@') else {
+        let Some((at, _)) = self.mention_query(cx) else {
             return;
         };
-        let completed = format!("{}@{name} ", &text[..at]);
-        self.input.update(cx, |input, cx| input.set_value(completed, window, cx));
-        if !self.mention_map.iter().any(|(_, known)| known == jid) {
-            self.mention_map.push((name.to_string(), jid.to_string()));
-        }
+        let token = gpui_component::input::InlineToken::new(jid.to_string(), format!("@{name}"));
+        self.input.update(cx, |input, cx| {
+            let cursor = input.cursor();
+            if input.replace_range_with_token(at..cursor, token, window, cx).is_ok() {
+                input.insert(" ", window, cx);
+            }
+        });
+        self.mention_pick = 0;
         self.focus_input(window, cx);
         cx.notify();
     }
 
-    /// Turns the `@Name` texts picked from the list into the `@number` form the protocol
-    /// uses, and returns who was mentioned.
-    fn resolve_mentions(&mut self, text: &str) -> (String, Vec<String>) {
-        let mut out = text.to_string();
-        let mut mentioned = Vec::new();
-        for (name, jid) in std::mem::take(&mut self.mention_map) {
-            let shown = format!("@{name}");
-            if out.contains(&shown) {
-                let user = jid.split('@').next().unwrap_or_default();
-                out = out.replace(&shown, &format!("@{user}"));
+    /// Enter or Tab while the mention list is open: picks the highlighted person.
+    /// Returns false when the list is not open.
+    fn pick_highlighted_mention(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let candidates = self.mention_candidates(cx);
+        if candidates.is_empty() {
+            return false;
+        }
+        let (jid, name) = candidates[self.mention_pick.min(candidates.len() - 1)].clone();
+        self.pick_mention(&jid, &name, window, cx);
+        true
+    }
+
+    /// Moves the highlight in the mention list. Returns false when the list is not open.
+    fn move_mention_pick(&mut self, down: bool, cx: &mut Context<Self>) -> bool {
+        let count = self.mention_candidates(cx).len();
+        if count == 0 {
+            return false;
+        }
+        let pick = self.mention_pick.min(count - 1);
+        self.mention_pick = if down { (pick + 1) % count } else { (pick + count - 1) % count };
+        cx.notify();
+        true
+    }
+
+    /// The typed text as it travels, and who it mentions: every mention in the message
+    /// box becomes `@number`, which is how the protocol writes one.
+    fn wire_text(&self, cx: &App) -> (String, Vec<String>) {
+        let content = self.input.read(cx).content();
+        let text = content.text().to_string();
+        let mut spans: Vec<(std::ops::Range<usize>, String)> = content
+            .tokens()
+            .iter()
+            .map(|span| (span.range(), span.token().id().to_string()))
+            .collect();
+        spans.sort_by_key(|(range, _)| range.start);
+        let mut out = String::with_capacity(text.len());
+        let mut mentioned: Vec<String> = Vec::new();
+        let mut done = 0;
+        for (range, jid) in spans {
+            if range.start < done || range.end > text.len() {
+                continue;
+            }
+            out.push_str(&text[done..range.start]);
+            out.push('@');
+            out.push_str(jid.split('@').next().unwrap_or_default());
+            done = range.end;
+            if !mentioned.contains(&jid) {
                 mentioned.push(jid);
             }
         }
-        (out, mentioned)
+        out.push_str(&text[done..]);
+        (out.trim().to_string(), mentioned)
     }
 
     /// The list of people shown above the message box while typing `@`.
@@ -3585,6 +3725,7 @@ impl ChatView {
                     .text_color(t.muted_foreground)
                     .child("Members"),
             );
+        let pick = self.mention_pick.min(candidates.len() - 1);
         for (slot, (jid, name)) in candidates.into_iter().enumerate() {
             let hover = t.accent;
             let picked_jid = jid.clone();
@@ -3592,6 +3733,7 @@ impl ChatView {
             panel = panel.child(
                 div()
                     .id(("mention", slot))
+                    .when(slot == pick, |this| this.bg(t.accent))
                     .h(px(32.))
                     .px(px(8.))
                     .rounded(R_MD)
@@ -3641,6 +3783,7 @@ impl ChatView {
                             kind: crate::events::Attach::Sticker,
                             caption: None,
                             reply_to: this.reply_to.take().map(|r| r.id),
+                            mentions: Vec::new(),
                         });
                         this.stickers_at = None;
                         cx.notify();
@@ -3887,10 +4030,13 @@ impl ChatView {
 struct VideoPlay {
     /// The picture currently on screen.
     frame: Option<Arc<gpui::RenderImage>>,
-    /// The newest decoded picture, handed over from the decoding thread: (BGRA, width, height).
-    latest: Arc<std::sync::Mutex<Option<(Vec<u8>, u32, u32)>>>,
+    /// The newest decoded picture, handed over from the decoding thread: (BGRA, width,
+    /// height, width of a pixel over its height).
+    latest: Arc<std::sync::Mutex<Option<(Vec<u8>, u32, u32, f32)>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     size: (u32, u32),
+    /// Width of a pixel over its height; 1 unless the video has oblong pixels.
+    shape: f32,
     error: Arc<std::sync::Mutex<Option<String>>>,
     /// Pause, jump and position, shared with the decoding thread.
     control: Arc<VideoControl>,
@@ -3912,8 +4058,16 @@ struct VideoControl {
 }
 
 impl ChatView {
+    /// The largest a video is shown: the window less its margins and the controls.
+    fn video_box(window: &Window) -> (f32, f32) {
+        let size = window.viewport_size();
+        let bar = super::theme::TITLE_BAR_H / px(1.);
+        ((size.width / px(1.) - 48.).max(120.), (size.height / px(1.) - bar - 48. - 64.).max(120.))
+    }
+
     /// Starts playing a video file in the viewer. GIFs loop and have no sound.
     fn start_video(&mut self, id: &str, path: PathBuf, looping: bool, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::audio::SoundState;
         use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
         self.stop_video(window);
@@ -3927,6 +4081,26 @@ impl ChatView {
             seek_ms: (-1).into(),
             position_ms: 0.into(),
         });
+
+        // The sound track plays through the audio player. The pictures follow its clock,
+        // so the two stay together however long either takes to start.
+        let mut sound = None;
+        if !looping {
+            if self.audio.is_none() {
+                self.audio = crate::audio::AudioPlayer::new().ok();
+            }
+            if let Some(player) = self.audio.as_mut()
+                && player.play(id, &path).is_ok()
+            {
+                sound = Some(player.clock());
+            }
+        }
+
+        // The largest the picture is shown, in screen pixels: larger videos are averaged
+        // down while decoding instead of being squeezed on screen, which looks jagged.
+        let (box_width, box_height) = Self::video_box(window);
+        let scale = window.scale_factor();
+        let fit = ((box_width * scale) as u32, (box_height * scale) as u32);
         {
             let (latest, stop, error, path, control) =
                 (latest.clone(), stop.clone(), error.clone(), path.clone(), control.clone());
@@ -3934,7 +4108,10 @@ impl ChatView {
                 .name("video-decode".into())
                 .spawn(move || {
                     let open = |error: &Arc<std::sync::Mutex<Option<String>>>| match crate::video::VideoReader::open(&path) {
-                        Ok(reader) => Some(reader),
+                        Ok(mut reader) => {
+                            reader.fit_within(fit.0, fit.1);
+                            Some(reader)
+                        }
                         Err(problem) => {
                             if let Ok(mut slot) = error.lock() {
                                 *slot = Some(format!("{problem:#}"));
@@ -3945,22 +4122,14 @@ impl ChatView {
                     let Some(mut reader) = open(&error) else {
                         return;
                     };
-                    let (width, height) = (reader.width, reader.height);
-                    let step = Duration::from_millis(15);
-                    // `base` is the moment the video time `offset` was on screen.
+                    let step = Duration::from_millis(4);
+                    // The video's own clock: `base` is the moment the video time `offset`
+                    // was on screen. It is corrected against the sound whenever the two
+                    // drift apart, and runs alone when there is no sound.
                     let mut base = Instant::now();
                     let mut offset = 0f64;
-                    // Sits out a pause; returns how long it lasted.
-                    let wait_while_paused = |control: &VideoControl, stop: &std::sync::atomic::AtomicBool| {
-                        let began = Instant::now();
-                        while control.paused.load(Ordering::Relaxed)
-                            && !stop.load(Ordering::Relaxed)
-                            && control.seek_ms.load(Ordering::Relaxed) < 0
-                        {
-                            std::thread::sleep(step);
-                        }
-                        began.elapsed()
-                    };
+                    // Since when the sound has not been moving although the video should.
+                    let mut held: Option<Instant> = None;
                     loop {
                         if stop.load(Ordering::Relaxed) {
                             return;
@@ -3977,6 +4146,7 @@ impl ChatView {
                             }
                             base = Instant::now();
                             offset = to;
+                            held = None;
                             control.ended.store(false, Ordering::Relaxed);
                         }
                         if control.ended.load(Ordering::Relaxed) {
@@ -3984,7 +4154,9 @@ impl ChatView {
                             continue;
                         }
                         if control.paused.load(Ordering::Relaxed) {
-                            base += wait_while_paused(&control, &stop);
+                            let began = Instant::now();
+                            std::thread::sleep(step);
+                            base += began.elapsed();
                             continue;
                         }
                         let Ok(Some(frame)) = reader.next_frame() else {
@@ -4004,11 +4176,6 @@ impl ChatView {
                         // and jumps are noticed at once.
                         let mut interrupted = false;
                         loop {
-                            let due = base + Duration::from_secs_f64((frame.at_secs - offset).max(0.));
-                            let now = Instant::now();
-                            if now >= due {
-                                break;
-                            }
                             if stop.load(Ordering::Relaxed) {
                                 return;
                             }
@@ -4017,10 +4184,46 @@ impl ChatView {
                                 break;
                             }
                             if control.paused.load(Ordering::Relaxed) {
-                                base += wait_while_paused(&control, &stop);
+                                let began = Instant::now();
+                                std::thread::sleep(step);
+                                base += began.elapsed();
+                                held = None;
                                 continue;
                             }
-                            std::thread::sleep((due - now).min(step));
+                            let own = offset + base.elapsed().as_secs_f64();
+                            let now = match sound.as_ref().map(|clock| clock.state()) {
+                                Some(SoundState::Playing(at)) => {
+                                    held = None;
+                                    // The sound's position is read in steps; follow the
+                                    // video's own smooth clock and correct it only when
+                                    // the two are audibly apart.
+                                    if (at - own).abs() > 0.08 {
+                                        base = Instant::now();
+                                        offset = at;
+                                        at
+                                    } else {
+                                        own
+                                    }
+                                }
+                                Some(state @ (SoundState::Starting | SoundState::Paused(_))) => {
+                                    // The sound is not moving: it is still opening, or is
+                                    // resuming. Hold the picture for it; if it stays
+                                    // still (it ended, or cannot play), go on without it.
+                                    let since = *held.get_or_insert_with(Instant::now);
+                                    let patience = if state == SoundState::Starting { 3. } else { 0.4 };
+                                    if since.elapsed().as_secs_f64() < patience {
+                                        offset = own;
+                                        base = Instant::now();
+                                    }
+                                    own
+                                }
+                                _ => own,
+                            };
+                            let wait = frame.at_secs - now;
+                            if wait <= 0. {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_secs_f64(wait).min(step));
                         }
                         if interrupted {
                             continue;
@@ -4029,21 +4232,11 @@ impl ChatView {
                             .position_ms
                             .store((frame.at_secs.max(0.) * 1000.) as u64, Ordering::Relaxed);
                         if let Ok(mut slot) = latest.lock() {
-                            *slot = Some((frame.bgra, width, height));
+                            *slot = Some((frame.bgra, reader.width, reader.height, reader.pixel_aspect));
                         }
                     }
                 })
                 .ok();
-        }
-
-        // The sound track plays through the audio player, started at the same moment.
-        if !looping {
-            if self.audio.is_none() {
-                self.audio = crate::audio::AudioPlayer::new().ok();
-            }
-            if let Some(player) = self.audio.as_mut() {
-                let _ = player.play(id, &path);
-            }
         }
 
         let stated_secs = self
@@ -4059,41 +4252,34 @@ impl ChatView {
             latest,
             stop,
             size: (0, 0),
+            shape: 1.,
             error,
             control,
             looping,
             stated_secs,
         });
-        cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_millis(30)).await;
-                let alive = this
-                    .update_in(cx, |this, window, cx| {
-                        let Some(play) = this.video.as_mut() else {
-                            return false;
-                        };
-                        let newest = play.latest.lock().ok().and_then(|mut slot| slot.take());
-                        if let Some((bgra, width, height)) = newest
-                            && let Some(buffer) = image::RgbaImage::from_raw(width, height, bgra)
-                        {
-                            let picture = Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buffer)]));
-                            play.size = (width, height);
-                            // Each picture is its own texture; release the one it replaces.
-                            if let Some(old) = play.frame.replace(picture) {
-                                let _ = window.drop_image(old);
-                            }
-                            cx.notify();
-                        }
-                        true
-                    })
-                    .unwrap_or(false);
-                if !alive {
-                    break;
-                }
-            }
-        })
-        .detach();
         cx.notify();
+    }
+
+    /// Puts the newest decoded picture on screen. Called from every render while a video
+    /// plays, and asks for the next frame, so pictures appear on the screen's own beat.
+    fn pump_video(&mut self, window: &mut Window) {
+        let Some(play) = self.video.as_mut() else {
+            return;
+        };
+        let newest = play.latest.lock().ok().and_then(|mut slot| slot.take());
+        if let Some((bgra, width, height, shape)) = newest
+            && let Some(buffer) = image::RgbaImage::from_raw(width, height, bgra)
+        {
+            let picture = Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buffer)]));
+            play.size = (width, height);
+            play.shape = shape;
+            // Each picture is its own texture; release the one it replaces.
+            if let Some(old) = play.frame.replace(picture) {
+                let _ = window.drop_image(old);
+            }
+        }
+        window.request_animation_frame();
     }
 
     fn stop_video(&mut self, window: &mut Window) {
@@ -4109,14 +4295,16 @@ impl ChatView {
     }
 
     /// The video viewer: the playing picture on a dark backdrop; a click closes it.
-    fn video_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn video_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let play = self.video.as_ref()?;
         let problem = play.error.lock().ok().and_then(|slot| slot.clone());
         let body: AnyElement = match (&play.frame, problem) {
             (Some(frame), _) => {
-                // Small clips are enlarged, large ones fitted, both keeping their shape.
-                let (width, height) = (play.size.0.max(1) as f32, play.size.1.max(1) as f32);
-                let scale = (760. / width).min(560. / height).min(4.);
+                // Small clips are enlarged, large ones fitted to the window, both keeping
+                // their shape.
+                let (width, height) = (play.size.0.max(1) as f32 * play.shape, play.size.1.max(1) as f32);
+                let (box_width, box_height) = Self::video_box(window);
+                let scale = (box_width / width).min(box_height / height).min(4.);
                 gpui::img(frame.clone())
                     .w(px(width * scale))
                     .h(px(height * scale))
@@ -4131,13 +4319,10 @@ impl ChatView {
                 .into_any_element(),
             (None, None) => div().text_color(gpui::white()).child("Loading…").into_any_element(),
         };
-        Some(
+        Some(Self::window_layer(
+            window,
             div()
                 .id("video-viewer")
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
                 .occlude()
                 .bg(gpui::hsla(0., 0., 0., 0.92))
                 .flex()
@@ -4151,9 +4336,8 @@ impl ChatView {
                     cx.notify();
                 }))
                 .child(body)
-                .children(self.video_controls(cx))
-                .into_any_element(),
-        )
+                .children(self.video_controls(cx)),
+        ))
     }
 
     /// Length of the playing video in seconds: what the player reports, or failing that
@@ -4495,6 +4679,7 @@ impl ChatView {
                         kind: crate::events::Attach::Voice,
                         caption: None,
                         reply_to,
+                        mentions: Vec::new(),
                     }),
                     Err(error) => this.notice = Some(format!("Voice message: {error:#}")),
                 }

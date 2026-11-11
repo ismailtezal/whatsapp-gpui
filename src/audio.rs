@@ -25,6 +25,44 @@ pub struct Playback {
     pub duration_secs: f64,
 }
 
+/// Where the sound of the current clip stands, readable from another thread, so that a
+/// video can keep its pictures in step with it.
+#[derive(Clone)]
+pub struct SoundClock {
+    player: MediaPlayer,
+}
+
+/// What a [`SoundClock`] reports.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SoundState {
+    /// The clip is being opened; nothing is heard yet.
+    Starting,
+    /// Playing, at this many seconds.
+    Playing(f64),
+    /// Not moving (paused, or at its end), at this many seconds.
+    Paused(f64),
+    /// There is no sound to follow.
+    Absent,
+}
+
+impl SoundClock {
+    pub fn state(&self) -> SoundState {
+        let Ok(session) = self.player.PlaybackSession() else {
+            return SoundState::Absent;
+        };
+        let at = session
+            .Position()
+            .map(|span| span.Duration as f64 / 10_000_000.)
+            .unwrap_or(0.);
+        match session.PlaybackState() {
+            Ok(MediaPlaybackState::Playing) => SoundState::Playing(at),
+            Ok(MediaPlaybackState::Paused) => SoundState::Paused(at),
+            Ok(MediaPlaybackState::Opening) | Ok(MediaPlaybackState::Buffering) => SoundState::Starting,
+            _ => SoundState::Absent,
+        }
+    }
+}
+
 /// Whether this run must stay silent (`WA_MUTE` is set).
 fn silenced() -> bool {
     std::env::var("WA_MUTE").is_ok_and(|value| !value.is_empty())
@@ -65,6 +103,13 @@ impl AudioPlayer {
         self.player.Play()?;
         self.current = Some(id.to_string());
         Ok(())
+    }
+
+    /// A handle another thread can read this player's position through.
+    pub fn clock(&self) -> SoundClock {
+        SoundClock {
+            player: self.player.clone(),
+        }
     }
 
     /// Pauses or resumes the current clip. Returns whether it is now playing.

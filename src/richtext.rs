@@ -177,6 +177,37 @@ fn find_links(text: &str, spans: &mut Vec<Span>) {
     }
 }
 
+/// The numbers written as `@number` in a text, in order, without repeats. A mention
+/// travels as the person's number; only numbers of five digits or more count.
+pub fn mention_numbers(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find('@') {
+        let before_is_word = rest[..at].chars().last().is_some_and(|c| c.is_alphanumeric());
+        let digits: String = rest[at + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !before_is_word && digits.len() >= 5 && !found.contains(&digits) {
+            found.push(digits.clone());
+        }
+        rest = &rest[at + 1 + digits.len()..];
+    }
+    found
+}
+
+/// Replaces every `@number` whose number `name_of` knows with `@Name`, for one-line
+/// previews. Text without an `@` comes back untouched.
+pub fn name_mentions(text: &str, mut name_of: impl FnMut(&str) -> Option<String>) -> String {
+    if !text.contains('@') {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    for digits in mention_numbers(text) {
+        if let Some(name) = name_of(&digits) {
+            out = out.replace(&format!("@{digits}"), &format!("@{name}"));
+        }
+    }
+    out
+}
+
 /// Parses message text into display text and styled ranges.
 pub fn parse(input: &str, mentions: &[Mention]) -> Rich {
     let chars: Vec<char> = input.chars().collect();
@@ -196,6 +227,16 @@ mod tests {
             .iter()
             .map(|s| (&rich.text[s.range.clone()], s.style.clone()))
             .collect()
+    }
+
+    #[test]
+    fn numbers_after_an_at_are_found_and_named() {
+        assert_eq!(mention_numbers("hi @905551112233 and @12345, not a@99999 or @12"), vec!["905551112233", "12345"]);
+        let named = name_mentions("ask @905551112233 or @4477000", |digits| {
+            (digits == "905551112233").then(|| "Ada".to_string())
+        });
+        assert_eq!(named, "ask @Ada or @4477000");
+        assert_eq!(name_mentions("no mentions", |_| unreachable!()), "no mentions");
     }
 
     #[test]

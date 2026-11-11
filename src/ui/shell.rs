@@ -189,6 +189,8 @@ pub struct Shell {
     status_viewer_cache: std::cell::RefCell<Option<(String, Vec<(String, i64)>)>>,
     /// Names already looked up for rows (calls, search hits); cleared when chats change.
     titles: std::cell::RefCell<std::collections::HashMap<String, String>>,
+    /// Names for the `@number` texts in previews, looked up once each (None: unknown).
+    mention_names: std::cell::RefCell<std::collections::HashMap<String, Option<String>>>,
     privacy: Vec<(String, String)>,
     blocked: Vec<String>,
     /// Picking several contacts for a new group instead of one to chat with.
@@ -341,6 +343,7 @@ impl Shell {
             status_viewers: false,
             status_viewer_cache: Default::default(),
             titles: Default::default(),
+            mention_names: Default::default(),
             privacy: Vec::new(),
             blocked: Vec::new(),
             group_mode: false,
@@ -721,6 +724,20 @@ impl Shell {
 
     /// The name shown for a chat or person. Rows are rebuilt on every frame they are on
     /// screen, so the answer is remembered rather than read from the database each time.
+    /// The one-line preview of a message, with the people it mentions shown by name
+    /// instead of by number.
+    fn preview_of(&self, kind: MsgKind, text: Option<&str>) -> String {
+        let label = preview_label(kind, text);
+        crate::richtext::name_mentions(&label, |digits| {
+            if let Some(known) = self.mention_names.borrow().get(digits) {
+                return known.clone();
+            }
+            let name = self.store.mention_name(digits);
+            self.mention_names.borrow_mut().insert(digits.to_string(), name.clone());
+            name
+        })
+    }
+
     fn title_of(&self, jid: &str) -> String {
         if let Some(title) = self.titles.borrow().get(jid) {
             return title.clone();
@@ -1021,7 +1038,7 @@ impl Shell {
                 .child(div().truncate().child(draft.to_string()))
                 .into_any_element()
         } else if let Some(preview) = &chat.preview {
-            let text = preview_label(preview.kind, preview.text.as_deref());
+            let text = self.preview_of(preview.kind, preview.text.as_deref());
             let prefix = if preview.from_me || chat.kind == ChatKind::User {
                 None
             } else {
@@ -1095,7 +1112,7 @@ impl Shell {
             .truncate()
             .child(SharedString::from(format!(
                 "{who}{}",
-                preview_label(row.kind, row.text.as_deref())
+                self.preview_of(row.kind, row.text.as_deref())
             )))
             .into_any_element();
         let jid = row.chat.clone();

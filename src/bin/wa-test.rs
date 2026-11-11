@@ -137,6 +137,7 @@ fn main() -> Result<()> {
                 path,
                 caption: args.get(3).cloned(),
                 reply_to: None,
+                mentions: Vec::new(),
             });
             let deadline = Instant::now() + Duration::from_secs(60);
             let sent = loop {
@@ -175,6 +176,7 @@ fn main() -> Result<()> {
                 chat: chat.clone(),
                 id: target.id.clone(),
                 text: args[2..].join(" "),
+                mentions: Vec::new(),
             });
             std::thread::sleep(Duration::from_secs(3));
             let after = store.message(&chat, &target.id)?.ok_or_else(|| anyhow!("gone"))?;
@@ -809,6 +811,7 @@ fn main() -> Result<()> {
                 path,
                 caption: None,
                 reply_to: None,
+                mentions: Vec::new(),
             });
             let deadline = Instant::now() + Duration::from_secs(60);
             let sent = loop {
@@ -863,6 +866,7 @@ fn main() -> Result<()> {
                 path,
                 caption: None,
                 reply_to: None,
+                mentions: Vec::new(),
             });
             let deadline = Instant::now() + Duration::from_secs(60);
             let sent = loop {

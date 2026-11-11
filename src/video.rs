@@ -51,6 +51,9 @@ pub struct VideoReader {
     pub pixel_aspect: f32,
     /// The rotation the file states, in degrees, for reports.
     stated_rotation: u32,
+    /// Pictures are averaged down by this whole factor before they are handed over, so
+    /// a large video shown small is neither jagged nor costly. 1 leaves them as decoded.
+    shrink: u32,
 }
 
 // The reader is used from one decoding thread at a time; Media Foundation objects created
@@ -151,6 +154,7 @@ impl VideoReader {
                 turns,
                 pixel_aspect,
                 stated_rotation,
+                shrink: 1,
             };
             video.apply_layout(layout);
             Ok(video)
@@ -160,7 +164,19 @@ impl VideoReader {
     fn apply_layout(&mut self, layout: Layout) {
         self.layout = layout;
         let (_, _, width, height) = layout.visible;
+        let (width, height) = ((width / self.shrink).max(1), (height / self.shrink).max(1));
         (self.width, self.height) = if self.turns % 2 == 1 { (height, width) } else { (width, height) };
+    }
+
+    /// Tells the reader how large the video is shown at most, in screen pixels. Pictures
+    /// much larger than that are averaged down by a whole factor as they are decoded:
+    /// the screen then scales them by less than two, which stays smooth.
+    pub fn fit_within(&mut self, max_width: u32, max_height: u32) {
+        let (_, _, width, height) = self.layout.visible;
+        let (width, height) = if self.turns % 2 == 1 { (height, width) } else { (width, height) };
+        let factor = (width / max_width.max(1)).max(height / max_height.max(1));
+        self.shrink = factor.clamp(1, 8);
+        self.apply_layout(self.layout);
     }
 
     /// A line for reports: what the file and the decoder state.
@@ -215,8 +231,9 @@ impl VideoReader {
                     continue;
                 };
                 let buffer = sample.ConvertToContiguousBuffer()?;
-                let upright = self.copy_visible(&buffer)?;
-                let bgra = self.turned(upright);
+                let visible = self.copy_visible(&buffer)?;
+                let (small, width, height) = self.shrunk(visible);
+                let bgra = self.turned(small, width, height);
                 return Ok(Some(Frame {
                     // Media Foundation counts time in units of 100 nanoseconds.
                     at_secs: timestamp as f64 / 10_000_000.,
@@ -287,10 +304,42 @@ impl VideoReader {
         Ok(out)
     }
 
-    /// Turns a picture clockwise by this reader's quarter turns.
-    fn turned(&self, source: Vec<u8>) -> Vec<u8> {
+    /// Averages a picture down by this reader's whole factor. Returns it with its size.
+    fn shrunk(&self, source: Vec<u8>) -> (Vec<u8>, usize, usize) {
         let (_, _, width, height) = self.layout.visible;
         let (width, height) = (width as usize, height as usize);
+        let factor = self.shrink as usize;
+        if factor <= 1 {
+            return (source, width, height);
+        }
+        let (small_width, small_height) = ((width / factor).max(1), (height / factor).max(1));
+        let mut out = vec![255u8; small_width * small_height * 4];
+        let mut sums = vec![[0u32; 3]; small_width];
+        let area = (factor * factor) as u32;
+        for y in 0..small_height.min(height / factor) {
+            sums.fill([0; 3]);
+            for line in 0..factor {
+                let row = &source[(y * factor + line) * width * 4..];
+                for (x, sum) in sums.iter_mut().enumerate().take(width / factor) {
+                    for pixel in row[x * factor * 4..(x * factor + factor) * 4].chunks_exact(4) {
+                        sum[0] += pixel[0] as u32;
+                        sum[1] += pixel[1] as u32;
+                        sum[2] += pixel[2] as u32;
+                    }
+                }
+            }
+            let target = &mut out[y * small_width * 4..];
+            for (x, sum) in sums.iter().enumerate() {
+                target[x * 4] = (sum[0] / area) as u8;
+                target[x * 4 + 1] = (sum[1] / area) as u8;
+                target[x * 4 + 2] = (sum[2] / area) as u8;
+            }
+        }
+        (out, small_width, small_height)
+    }
+
+    /// Turns a picture of the given size clockwise by this reader's quarter turns.
+    fn turned(&self, source: Vec<u8>, width: usize, height: usize) -> Vec<u8> {
         let pixels: &[[u8; 4]] = bytemuck_cast(&source);
         match self.turns % 4 {
             0 => source,

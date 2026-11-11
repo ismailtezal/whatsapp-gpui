@@ -361,3 +361,23 @@ impl Store {
         })
     }
 }
+
+impl Store {
+    /// The name known for a person (address book, business or the name they chose),
+    /// without falling back to their number.
+    pub fn known_name(&self, jid: &str) -> Option<String> {
+        let canonical = self.canonical(jid).ok()?;
+        self.contact(&canonical)
+            .ok()
+            .flatten()
+            .and_then(|contact| contact.name.or(contact.verified_name).or(contact.push_name))
+            .filter(|name| !name.trim().is_empty())
+    }
+
+    /// The name of the person a `@number` in a message stands for. The number is a phone
+    /// number or, in newer groups, the person's hidden-number ID.
+    pub fn mention_name(&self, digits: &str) -> Option<String> {
+        self.known_name(&format!("{digits}@s.whatsapp.net"))
+            .or_else(|| self.known_name(&format!("{digits}@lid")))
+    }
+}

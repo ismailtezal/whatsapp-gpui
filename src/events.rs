@@ -292,6 +292,8 @@ pub enum Command {
         kind: Attach,
         caption: Option<String>,
         reply_to: Option<String>,
+        /// People mentioned in the caption.
+        mentions: Vec<String>,
     },
     React {
         chat: String,
@@ -384,6 +386,8 @@ pub enum Command {
         chat: String,
         id: String,
         text: String,
+        /// People mentioned in the new text.
+        mentions: Vec<String>,
     },
     /// Delete for everyone.
     Revoke { chat: String, id: String },

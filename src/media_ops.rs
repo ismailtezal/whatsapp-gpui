@@ -365,8 +365,9 @@ pub async fn send_file(
     kind: Attach,
     caption: Option<String>,
     reply_to: Option<String>,
+    mentions: Vec<String>,
 ) -> Result<String> {
-    let message = build_file_message(client, store, chat, path, kind, caption, reply_to).await?;
+    let message = build_file_message(client, store, chat, path, kind, caption, reply_to, mentions).await?;
     let id = send_prepared(client, store, events, chat, message).await?;
     // Our own copy is already on disk: point the message at it so it shows without a download.
     let local = path.to_string_lossy().to_string();
@@ -384,6 +385,7 @@ pub(crate) async fn build_file_message(
     kind: Attach,
     caption: Option<String>,
     reply_to: Option<String>,
+    mentions: Vec<String>,
 ) -> Result<crate::wa::Message> {
     use whatsapp_rust::media::{self, AudioOptions, DocumentOptions, ImageOptions, VideoOptions};
     use whatsapp_rust::wacore::download::MediaType;
@@ -397,13 +399,17 @@ pub(crate) async fn build_file_message(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
     let caption = caption.filter(|c| !c.trim().is_empty());
-    let context = match reply_to {
+    let mut context = match reply_to {
         Some(id) => store
             .record(chat, &id)?
             .and_then(|r| quote_context(&r, chat))
             .map(Box::new),
         None => None,
     };
+    // People mentioned in the caption ride in the same block as the reply.
+    if !mentions.is_empty() {
+        context.get_or_insert_with(Default::default).mentioned_jid = mentions;
+    }
 
     let message = match kind {
         Attach::Image => {
@@ -519,7 +525,8 @@ pub(crate) async fn execute(
             kind,
             caption,
             reply_to,
-        } => send_file(client, store, events, &chat, &path, kind, caption, reply_to)
+            mentions,
+        } => send_file(client, store, events, &chat, &path, kind, caption, reply_to, mentions)
             .await
             .map(|_| ()),
         other => Err(anyhow!("not a media command: {other:?}")),
